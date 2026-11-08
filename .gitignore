@@ -1,0 +1,6 @@
+target/
+.venv/
+__pycache__/
+*.py[cod]
+*.pp.recovery
+.DS_Store
