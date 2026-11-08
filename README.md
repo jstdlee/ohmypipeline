@@ -12,6 +12,7 @@ Pipelines are UTF-8 JSON files, `*.pp`.
 | --- | --- |
 | [DESIGN.md](DESIGN.md) | The product. |
 | [PRD.md](PRD.md) | What to build, and in what order. |
+| [REVIEW.md](REVIEW.md) | Open conflicts and gaps to settle in the TRD and module design. |
 
 When the two disagree about sequence or about the first build, `PRD.md` wins.
 

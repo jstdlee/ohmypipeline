@@ -303,6 +303,7 @@ Example mode plots the example and says so in the chart's own status, the same w
     { "id": "m1", "kind": "note", "text": "Preview reads at most 10,000 rows.", "position": [48, 200], "size": [220, 72], "swatch": "c3" }
   ],
   "camera": { "x": 0, "y": 0, "zoom": 1 }
+}
 ```
 
 A chart node adds `presentation`:
