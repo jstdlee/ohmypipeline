@@ -4,20 +4,26 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use canvas::{CanvasEvent, CanvasModel, Dot, Tool};
+use canvas::{CanvasEvent, CanvasModel, Dot, Side, Tool, port_slots};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::chart::BarChart;
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockSkin, Panel, PanelEvent, panel_handle,
 };
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::DropdownMenu as _;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::table::{
     Column, ColumnFixed, ColumnSort, DataTable, TableDelegate, TableState,
 };
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
+use gpui_kit::component::toolbar::{Toolbar, ToolbarGroup};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _};
 use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext as _, Context, Corners, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, Window, actions, div, px,
 };
@@ -37,6 +43,7 @@ actions!(
         SaveFile,
         SaveFileAs,
         RunPreview,
+        RunFull,
         UndoEdit,
         RedoEdit,
         DeleteSelection,
@@ -44,6 +51,7 @@ actions!(
         FitView,
         ReduceMotion,
         ToggleTheme,
+        OpenModelSettings,
         QuitApp
     ]
 );
@@ -68,6 +76,7 @@ pub struct Session {
     pub preview_fp: Option<u64>,
     pub generation: u64,
     pub running: bool,
+    pub ran_node: Option<String>,
     pub error: Option<String>,
     pub search: String,
     #[allow(dead_code)]
@@ -75,6 +84,9 @@ pub struct Session {
     pub reduced_motion: bool,
     pub worker: Worker,
     pub path_prompt: Option<PathKind>,
+    pub assist_note: Option<String>,
+    pub assist_fill: Option<(String, String, String)>,
+    pub assist_rx: Option<std::sync::mpsc::Receiver<crate::assist::AssistReply>>,
 }
 
 pub enum PathKind {
@@ -100,15 +112,21 @@ impl Session {
         let canvas = self.canvas.read(cx);
         let graph = canvas.editor().graph();
         let mut dots = BTreeMap::new();
+        let live = self
+            .ran_node
+            .as_deref()
+            .and_then(|id| ancestors(graph, id).ok())
+            .unwrap_or_default();
+        let done = !self.running && self.error.is_none() && self.preview_fp.is_some();
         for node in &graph.nodes {
             let dot = if node.unknown {
                 Dot::Danger
-            } else if self.running && self.target_node(cx).as_deref() == Some(node.id.as_str()) {
+            } else if self.running && live.iter().any(|id| id == &node.id) {
                 Dot::Running
-            } else if self.error.is_some()
-                && self.target_node(cx).as_deref() == Some(node.id.as_str())
-            {
+            } else if self.error.is_some() && self.ran_node.as_deref() == Some(node.id.as_str()) {
                 Dot::Danger
+            } else if done && live.iter().any(|id| id == &node.id) {
+                Dot::Success
             } else {
                 Dot::Muted
             };
@@ -128,6 +146,10 @@ pub struct Workspace {
     focus: FocusHandle,
     polling: bool,
     path_input: Entity<InputState>,
+    model_endpoint: Entity<InputState>,
+    model_name: Entity<InputState>,
+    model_key: Entity<InputState>,
+    model_open: bool,
     #[allow(dead_code)]
     search_input: Entity<InputState>,
     _subs: Vec<Subscription>,
@@ -140,7 +162,11 @@ impl Workspace {
             canvas.update(cx, |canvas, cx| canvas.load_document(doc, cx));
         }
         load_demo(&options.demo, &canvas, window, cx);
-        let reduced = load_reduced_motion();
+        let stored_motion = load_reduced_motion();
+        let reduced = stored_motion.unwrap_or_else(|| cx.reduce_motion());
+        if stored_motion.is_some() {
+            cx.set_reduce_motion(reduced);
+        }
         canvas.update(cx, |canvas, cx| canvas.set_reduced_motion(reduced, cx));
         let worker = Worker::spawn();
         let session = cx.new(|_cx| Session {
@@ -156,16 +182,33 @@ impl Workspace {
             preview_fp: None,
             generation: 0,
             running: false,
+            ran_node: None,
             error: None,
             search: String::new(),
             sort: None,
             reduced_motion: reduced,
             worker,
             path_prompt: None,
+            assist_note: None,
+            assist_fill: None,
+            assist_rx: None,
         });
         let path_input = cx.new(|cx| InputState::new(window, cx));
+        let stored_model = load_model_settings();
+        let model_endpoint = cx.new(|cx| InputState::new(window, cx));
+        let model_name = cx.new(|cx| InputState::new(window, cx));
+        let model_key = cx.new(|cx| InputState::new(window, cx));
+        model_endpoint.update(cx, |state, cx| {
+            state.set_value(stored_model.endpoint, window, cx);
+        });
+        model_name.update(cx, |state, cx| {
+            state.set_value(stored_model.model, window, cx);
+        });
+        model_key.update(cx, |state, cx| {
+            state.set_value(stored_model.key, window, cx);
+        });
         let search_input = cx.new(|cx| InputState::new(window, cx));
-        let palette = cx.new(|cx| PalettePanel::new(session.clone(), cx));
+        let palette = cx.new(|cx| PalettePanel::new(session.clone(), window, cx));
         let graph_panel = cx.new(|cx| GraphPanel::new(canvas.clone(), cx));
         let chart = cx.new(|cx| ChartPanel::new(session.clone(), cx));
         let inspector = cx.new(|cx| InspectorPanel::new(session.clone(), window, cx));
@@ -250,6 +293,10 @@ impl Workspace {
             focus,
             polling: false,
             path_input,
+            model_endpoint,
+            model_name,
+            model_key,
+            model_open: options.demo.as_deref() == Some("assist"),
             search_input,
             _subs: subs,
         };
@@ -269,6 +316,37 @@ impl Workspace {
             Some("preview") | Some("chart") | Some("dark") | Some("light")
         ) {
             workspace.run(RunMode::Preview, window, cx);
+        }
+        let session = workspace.session.clone();
+        window.on_next_frame(move |window, _cx| {
+            window.on_next_frame(move |_window, cx| {
+                session.update(cx, |session, cx| {
+                    let empty = session.canvas.read(cx).editor().graph().nodes.is_empty();
+                    if !empty {
+                        session.canvas.update(cx, |canvas, cx| canvas.fit_all(cx));
+                    }
+                });
+            });
+        });
+        if options.demo.as_deref() == Some("assist") {
+            workspace.session.update(cx, |session, cx| {
+                session.assist_note = Some(
+                    "Add a model endpoint and key in Settings. They stay on this computer and are not saved in the pipeline."
+                        .into(),
+                );
+                cx.notify();
+            });
+        }
+        if matches!(
+            options.demo.as_deref(),
+            Some("reel-link" | "reel-run" | "reel-python")
+        ) {
+            let session = workspace.session.clone();
+            let demo = options.demo.clone().unwrap_or_default();
+            let started = std::time::Instant::now();
+            window.on_next_frame(move |window, cx| {
+                play_reel(demo, session, started, window, cx);
+            });
         }
         workspace
     }
@@ -325,6 +403,7 @@ impl Workspace {
         } else {
             PREVIEW_ROW_CAP
         };
+        let ran = node.clone();
         let job = Job {
             generation,
             mode,
@@ -340,6 +419,7 @@ impl Workspace {
             session.generation = generation;
             session.mode = mode;
             session.running = true;
+            session.ran_node = Some(ran);
             session.error = None;
             session.worker.submit(job);
             session.recompute_dots(cx);
@@ -362,10 +442,11 @@ impl Workspace {
             .update(cx, |this, cx| {
                 this.poll_worker(cx);
                 let running = this.session.read(cx).running;
-                if !running {
+                let waiting = this.session.read(cx).assist_rx.is_some();
+                if !running && !waiting {
                     this.polling = false;
                 }
-                running
+                running || waiting
             })
             .unwrap_or(false);
         if again {
@@ -407,6 +488,7 @@ impl Workspace {
                     session.recompute_dots(cx);
                     cx.notify();
                 });
+                cx.notify();
             }
             Err(err) => {
                 self.session.update(cx, |session, cx| {
@@ -418,6 +500,7 @@ impl Workspace {
                     session.recompute_dots(cx);
                     cx.notify();
                 });
+                cx.notify();
             }
         }
     }
@@ -502,7 +585,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_worker(cx);
-        let (title, dirty, readonly, full_enabled, prompt, narrow) = {
+        let (title, dirty, readonly, full_enabled, prompt, narrow, running, mode, tool, reduced) = {
             let session = self.session.read(cx);
             let canvas = session.canvas.read(cx);
             let title = canvas
@@ -530,6 +613,10 @@ impl Render for Workspace {
                 session.full_enabled,
                 session.path_prompt.is_some(),
                 window.viewport_size().width < px(960.0),
+                session.running,
+                session.mode,
+                canvas.tool(),
+                session.reduced_motion,
             )
         };
 
@@ -539,6 +626,7 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &RunPreview, win, cx| this.run(RunMode::Preview, win, cx)),
             )
+            .on_action(cx.listener(|this, _: &RunFull, win, cx| this.run(RunMode::Full, win, cx)))
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &OpenFile, _, cx| {
                 this.session.update(cx, |session, cx| {
@@ -591,12 +679,17 @@ impl Render for Workspace {
                 this.session.update(cx, |session, cx| {
                     session.reduced_motion = !session.reduced_motion;
                     let reduced = session.reduced_motion;
+                    cx.set_reduce_motion(reduced);
                     session
                         .canvas
                         .update(cx, |canvas, cx| canvas.set_reduced_motion(reduced, cx));
                     save_reduced_motion(reduced);
                     cx.notify();
                 });
+            }))
+            .on_action(cx.listener(|this, _: &OpenModelSettings, _, cx| {
+                this.model_open = !this.model_open;
+                cx.notify();
             }))
             .on_action(cx.listener(|_this, _: &ToggleTheme, window, cx| {
                 let dark = cx.theme().mode.is_dark();
@@ -653,47 +746,18 @@ impl Render for Workspace {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .w_full()
-                        .px_3()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(format!("Ohmypipeline — {title}{dirty}{readonly}")),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap_2()
-                                .child(
-                                    Button::new("run")
-                                        .small()
-                                        .primary()
-                                        .label("Preview")
-                                        .on_click(cx.listener(|this, _, win, cx| {
-                                            this.run(RunMode::Preview, win, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("full")
-                                        .small()
-                                        .label("Full dataset")
-                                        .disabled(!full_enabled)
-                                        .on_click(cx.listener(|this, _, win, cx| {
-                                            this.run(RunMode::Full, win, cx)
-                                        })),
-                                ),
-                        ),
-                ),
-            )
-            .child(self.menu_row(narrow, cx))
+            .child(TitleBar::new().child(self.command_bar(
+                &title,
+                dirty,
+                readonly,
+                full_enabled,
+                running,
+                mode,
+                tool,
+                reduced,
+                narrow,
+                cx,
+            )))
             .child(div().flex_1().min_h(px(0.)).child(self.dock.clone()))
             .when(prompt, |this| {
                 this.child(
@@ -724,157 +788,483 @@ impl Render for Workspace {
                         ),
                 )
             })
+            .when(self.model_open, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(64.))
+                        .left(px(248.))
+                        .w(px(320.))
+                        .p_4()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child("Model")
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Endpoint, model name, and key stay on this computer."),
+                        )
+                        .child(div().text_xs().child("Endpoint"))
+                        .child(Input::new(&self.model_endpoint).small())
+                        .child(div().text_xs().child("Model"))
+                        .child(Input::new(&self.model_name).small())
+                        .child(div().text_xs().child("Key"))
+                        .child(Input::new(&self.model_key).small())
+                        .child(
+                            Button::new("save-model")
+                                .primary()
+                                .small()
+                                .label("Save")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    save_model_settings(&crate::assist::ModelSettings {
+                                        endpoint: this.model_endpoint.read(cx).value().to_string(),
+                                        model: this.model_name.read(cx).value().to_string(),
+                                        key: this.model_key.read(cx).value().to_string(),
+                                    });
+                                    this.model_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
     }
 }
 
 impl Workspace {
-    fn menu_row(&self, narrow: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let _ = narrow;
-        div()
-            .flex()
-            .flex_row()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
+    #[allow(clippy::too_many_arguments)]
+    fn command_bar(
+        &self,
+        title: &str,
+        dirty: &str,
+        readonly: &str,
+        full_enabled: bool,
+        running: bool,
+        mode: RunMode,
+        tool: Tool,
+        reduced: bool,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dark = cx.theme().mode.is_dark();
+        let preview_label = if running && mode == RunMode::Preview {
+            "Running"
+        } else {
+            "Preview"
+        };
+        let file_label = format!("{title}{dirty}{readonly}");
+        Toolbar::new("command-bar")
+            .w_full()
             .child(
-                Button::new("file-open")
-                    .ghost()
-                    .small()
-                    .label("Open")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("file-open", IconName::FolderOpen, "Open", &OpenFile, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
                             session.path_prompt = Some(PathKind::Open);
                             cx.notify();
                         });
-                    })),
+                    }),
+                ),
             )
             .child(
-                Button::new("file-save")
-                    .ghost()
-                    .small()
-                    .label("Save")
+                icon_button("file-save", IconName::Save, "Save", &SaveFile, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
             .child(
-                Button::new("edit-undo")
-                    .ghost()
-                    .small()
-                    .label("Undo")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("edit-undo", IconName::Undo2, "Undo", &UndoEdit, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
-                            session.canvas.update(cx, |canvas, cx| canvas.undo(cx))
+                            session.canvas.update(cx, |canvas, cx| canvas.undo(cx));
                         });
-                    })),
+                    }),
+                ),
             )
             .child(
-                Button::new("edit-redo")
-                    .ghost()
-                    .small()
-                    .label("Redo")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("edit-redo", IconName::Redo2, "Redo", &RedoEdit, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
-                            session.canvas.update(cx, |canvas, cx| canvas.redo(cx))
+                            session.canvas.update(cx, |canvas, cx| canvas.redo(cx));
                         });
-                    })),
+                    }),
+                ),
             )
-            .child(
-                Button::new("node-dup")
-                    .ghost()
-                    .small()
-                    .label("Duplicate")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.session.update(cx, |session, cx| {
-                            session
-                                .canvas
-                                .update(cx, |canvas, cx| canvas.duplicate_selection(cx))
-                        });
-                    })),
-            )
-            .child(
-                Button::new("node-del")
-                    .ghost()
-                    .small()
-                    .label("Delete")
+            .content(
+                ToolbarGroup::new("edit").child(
+                    icon_button(
+                        "node-dup",
+                        IconName::Copy,
+                        "Duplicate",
+                        &DuplicateSelection,
+                        cx,
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
                             session
                                 .canvas
-                                .update(cx, |canvas, cx| canvas.delete_selection(cx))
+                                .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
                         });
                     })),
+                ),
             )
             .child(
-                Button::new("view-fit")
-                    .ghost()
-                    .small()
-                    .label("Fit")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.session.update(cx, |session, cx| {
-                            session.canvas.update(cx, |canvas, cx| canvas.fit(cx))
-                        });
-                    })),
-            )
-            .child(
-                Button::new("view-motion")
-                    .ghost()
-                    .small()
-                    .label("Reduce motion")
-                    .on_click(cx.listener(|_this, _, _, cx| {
-                        cx.dispatch_action(&ReduceMotion);
-                    })),
-            )
-            .child(
-                Button::new("view-theme")
-                    .ghost()
-                    .small()
-                    .label("Theme")
-                    .on_click(cx.listener(|_this, _, window, cx| {
-                        cx.dispatch_action(&ToggleTheme);
-                        let _ = window;
-                    })),
-            )
-            .child(
-                Button::new("tool-select")
-                    .ghost()
-                    .small()
-                    .label("Select")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("node-del", IconName::Trash, "Delete", &DeleteSelection, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
                             session
                                 .canvas
-                                .update(cx, |canvas, cx| canvas.set_tool(Tool::Select, cx))
+                                .update(cx, |canvas, cx| canvas.delete_selection(cx));
                         });
-                    })),
+                    }),
+                ),
             )
             .child(
-                Button::new("tool-hand")
-                    .ghost()
-                    .small()
-                    .label("Hand")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                icon_button("view-fit", IconName::Focus, "Fit", &FitView, cx).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.session.update(cx, |session, cx| {
-                            session
-                                .canvas
-                                .update(cx, |canvas, cx| canvas.set_tool(Tool::Hand, cx))
+                            session.canvas.update(cx, |canvas, cx| canvas.fit(cx));
                         });
-                    })),
+                    }),
+                ),
             )
-            .child(
-                Button::new("tool-note")
+            .content(
+                div()
+                    .ml_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .rounded(px(8.0))
+                    .bg(cx.theme().secondary)
+                    .child(tool_button(
+                        "tool-select",
+                        IconName::MousePointer2,
+                        "Select",
+                        tool == Tool::Select,
+                        Tool::Select,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        "tool-hand",
+                        IconName::Hand,
+                        "Hand",
+                        tool == Tool::Hand,
+                        Tool::Hand,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        "tool-note",
+                        IconName::StickyNote,
+                        "Note",
+                        tool == Tool::Note,
+                        Tool::Note,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        "tool-rect",
+                        IconName::Square,
+                        "Rectangle",
+                        tool == Tool::Rectangle,
+                        Tool::Rectangle,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        "tool-circle",
+                        IconName::Circle,
+                        "Circle",
+                        tool == Tool::Circle,
+                        Tool::Circle,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        "tool-label",
+                        IconName::Type,
+                        "Label",
+                        tool == Tool::Label,
+                        Tool::Label,
+                        cx,
+                    )),
+            )
+            .content(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px_3()
+                    .overflow_hidden()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(if narrow {
+                        title.to_string()
+                    } else {
+                        file_label
+                    }),
+            )
+            .content(
+                Button::new("settings")
                     .ghost()
-                    .small()
-                    .label("Note")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.session.update(cx, |session, cx| {
-                            session
-                                .canvas
-                                .update(cx, |canvas, cx| canvas.set_tool(Tool::Note, cx))
-                        });
-                    })),
+                    .compact()
+                    .icon(IconName::Settings)
+                    .tooltip("Settings")
+                    .accessibility_label("Settings")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.menu_with_check("Dark theme", dark, Box::new(ToggleTheme))
+                            .menu_with_check("Reduce motion", reduced, Box::new(ReduceMotion))
+                            .separator()
+                            .menu("Model settings", Box::new(OpenModelSettings))
+                    }),
             )
-            .into_any_element()
+            .content(
+                Button::new("run")
+                    .small()
+                    .primary()
+                    .compact()
+                    .icon(IconName::Play)
+                    .label(preview_label)
+                    .loading(running && mode == RunMode::Preview)
+                    .tooltip_with_action("Run preview", &RunPreview, None)
+                    .on_click(cx.listener(|this, _, win, cx| this.run(RunMode::Preview, win, cx))),
+            )
+            .content(
+                Button::new("full")
+                    .small()
+                    .compact()
+                    .label(if running && mode == RunMode::Full {
+                        "Running"
+                    } else {
+                        "Full dataset"
+                    })
+                    .loading(running && mode == RunMode::Full)
+                    .disabled(!full_enabled || running)
+                    .tooltip("Run the full file. Enabled after a preview of this graph.")
+                    .on_click(cx.listener(|this, _, win, cx| this.run(RunMode::Full, win, cx))),
+            )
+    }
+}
+
+fn icon_button(
+    id: &str,
+    icon: IconName,
+    label: &str,
+    action: &dyn gpui_kit::Action,
+    _cx: &mut gpui_kit::App,
+) -> Button {
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .compact()
+        .icon(icon)
+        .tooltip_with_action(label.to_string(), action, None)
+        .accessibility_label(label.to_string())
+}
+
+fn tool_button(
+    id: &str,
+    icon: IconName,
+    label: &str,
+    selected: bool,
+    tool: Tool,
+    cx: &mut gpui_kit::Context<Workspace>,
+) -> Button {
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .compact()
+        .icon(icon)
+        .selected(selected)
+        .tooltip(label.to_string())
+        .accessibility_label(label.to_string())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.session.update(cx, |session, cx| {
+                session
+                    .canvas
+                    .update(cx, |canvas, cx| canvas.set_tool(tool, cx));
+            });
+        }))
+}
+
+fn play_reel(
+    demo: String,
+    session: Entity<Session>,
+    started: std::time::Instant,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let t = started.elapsed().as_secs_f32();
+    let keep = if demo == "reel-link" {
+        session.update(cx, |session, cx| reel_link(session, t, cx));
+        t < 3.8
+    } else if demo == "reel-python" {
+        let ready = session.update(cx, |session, cx| {
+            reel_python(session, t, cx);
+            t > 2.2
+                && !session.running
+                && session.ran_node.is_none()
+                && session
+                    .canvas
+                    .read(cx)
+                    .editor()
+                    .graph()
+                    .nodes
+                    .iter()
+                    .any(|node| node.feature == "python")
+        });
+        if ready {
+            window.dispatch_action(Box::new(RunPreview), cx);
+        }
+        t < 6.5
+    } else {
+        let ready = session.update(cx, |session, cx| {
+            reel_run(session, t, cx);
+            t > 1.9
+                && !session.running
+                && session.ran_node.is_none()
+                && session.canvas.read(cx).editor().graph().nodes.len() >= 3
+        });
+        if ready {
+            window.dispatch_action(Box::new(RunPreview), cx);
+        }
+        t < 5.2
+    };
+    if keep {
+        let session = session.clone();
+        let demo = demo.clone();
+        window.on_next_frame(move |window, cx| play_reel(demo, session, started, window, cx));
+    }
+}
+
+fn node_id(graph: &graph::Graph, feature: &str) -> Option<String> {
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.feature == feature)
+        .map(|node| node.id.clone())
+}
+
+fn slot_at(graph: &graph::Graph, id: &str, name: &str, side: Side) -> Option<graph::Point> {
+    let node = graph.node(id)?;
+    port_slots(node)
+        .into_iter()
+        .find(|slot| slot.name == name && slot.side == side)
+        .map(|slot| slot.center)
+}
+
+fn mix(from: graph::Point, to: graph::Point, t: f32) -> graph::Point {
+    let t = t.clamp(0.0, 1.0);
+    graph::Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+}
+
+fn reel_link(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) {
+    session.canvas.update(cx, |canvas, cx| {
+        let graph = canvas.editor().graph().clone();
+        let Some(read) = node_id(&graph, "read_csv") else {
+            return;
+        };
+        let Some(head) = node_id(&graph, "head") else {
+            return;
+        };
+        let Some(column) = node_id(&graph, "column") else {
+            return;
+        };
+        let Some(headers) = node_id(&graph, "change_headers") else {
+            return;
+        };
+        if t < 1.8 {
+            let Some(from) = slot_at(&graph, &read, "out", Side::Out) else {
+                return;
+            };
+            let Some(to) = slot_at(&graph, &head, "in", Side::In) else {
+                return;
+            };
+            canvas.show_link(&read, "out", mix(from, to, t / 1.8), cx);
+        } else {
+            let Some(from) = slot_at(&graph, &column, "out", Side::Out) else {
+                return;
+            };
+            let Some(to) = slot_at(&graph, &headers, "in", Side::In) else {
+                return;
+            };
+            canvas.show_link(&column, "out", mix(from, to, (t - 1.8) / 1.5), cx);
+        }
+    });
+}
+
+fn reel_python(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) {
+    let has = session
+        .canvas
+        .read(cx)
+        .editor()
+        .graph()
+        .nodes
+        .iter()
+        .any(|node| node.feature == "python");
+    if t > 0.4 && !has {
+        session.canvas.update(cx, |canvas, cx| {
+            if let Some(id) = canvas.add_feature("python", cx) {
+                canvas.set_label(&id, "Keep the north rows".into(), cx);
+                canvas.set_param(
+                    &id,
+                    "code",
+                    json!("def run(frame):\n    return frame.head(4)\n"),
+                    cx,
+                );
+                canvas.set_python_inputs(
+                    &id,
+                    vec![graph::PortRecord {
+                        name: "frame".into(),
+                        accepts: vec![graph::TypeName::Dataframe],
+                        multi: false,
+                    }],
+                    cx,
+                );
+                if let Some(read) = canvas
+                    .editor()
+                    .graph()
+                    .nodes
+                    .iter()
+                    .find(|node| node.feature == "read_csv")
+                    .map(|node| node.id.clone())
+                {
+                    let _ = canvas.editor_mut().connect(&read, "out", &id, "frame");
+                }
+                canvas.fit_all(cx);
+            }
+        });
+    }
+}
+
+fn reel_run(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) {
+    let has = |session: &Session, cx: &mut gpui_kit::Context<Session>, feature: &str| {
+        session
+            .canvas
+            .read(cx)
+            .editor()
+            .graph()
+            .nodes
+            .iter()
+            .any(|node| node.feature == feature)
+    };
+    if t > 0.45 && !has(session, cx, "head") {
+        session.canvas.update(cx, |canvas, cx| {
+            if let Some(id) = canvas.add_feature("head", cx) {
+                canvas.set_param(&id, "n", json!(5), cx);
+                canvas.fit_all(cx);
+            }
+        });
+    }
+    if t > 1.15 && !has(session, cx, "change_headers") {
+        session.canvas.update(cx, |canvas, cx| {
+            if let Some(id) = canvas.add_feature("change_headers", cx) {
+                canvas.set_param(
+                    &id,
+                    "mapping",
+                    json!([{"from": "amount", "to": "revenue"}]),
+                    cx,
+                );
+                canvas.fit_all(cx);
+            }
+        });
     }
 }
 
@@ -918,7 +1308,7 @@ fn load_demo(
             .add_node("head", graph::Point::new(320.0, 64.0))
             .unwrap();
         doc.set_param(&head, "n", json!(5));
-        if demo != "link-snap" {
+        if demo != "link-snap" && demo != "reel-link" {
             let _ = doc.connect(&read, "out", &head, "in");
         }
         let headers = doc
@@ -930,6 +1320,57 @@ fn load_demo(
             json!([{"from": "amount", "to": "revenue"}, {"from": "region", "to": ""}]),
         );
         let _ = doc.connect(&head, "out", &headers, "in");
+        if demo == "marks" {
+            let mut doc = graph::Document::new();
+            let _ = doc.add_mark(
+                graph::MarkKind::Rectangle,
+                graph::Point::new(48.0, 48.0),
+                Some([180.0, 100.0]),
+            );
+            let _ = doc.add_mark(
+                graph::MarkKind::Circle,
+                graph::Point::new(280.0, 64.0),
+                Some([96.0, 96.0]),
+            );
+            if let Some(id) = doc.add_mark(
+                graph::MarkKind::Label,
+                graph::Point::new(48.0, 180.0),
+                Some([200.0, 36.0]),
+            ) {
+                doc.set_mark_text(&id, "Revenue is the amount column".into());
+            }
+            canvas.load_document(doc, cx);
+            return;
+        }
+        if demo == "python" || demo == "textarea" {
+            let mut doc = graph::Document::new();
+            let read = doc
+                .add_node("read_csv", graph::Point::new(48.0, 48.0))
+                .unwrap();
+            doc.set_param(&read, "path", json!(csv.display().to_string()));
+            doc.set_label(&read, "orders.csv".into());
+            let code = doc
+                .add_node("python", graph::Point::new(320.0, 48.0))
+                .unwrap();
+            doc.set_label(&code, "Keep the north rows".into());
+            doc.set_param(
+                &code,
+                "code",
+                json!("def run(frame):\n    return frame.head(4)\n"),
+            );
+            doc.set_python_inputs(
+                &code,
+                vec![graph::PortRecord {
+                    name: "frame".into(),
+                    accepts: vec![graph::TypeName::Dataframe],
+                    multi: false,
+                }],
+            );
+            let _ = doc.connect(&read, "out", &code, "frame");
+            canvas.load_document(doc, cx);
+            canvas.select_only(&code, cx);
+            return;
+        }
         if demo == "chart" || demo == "dark" || demo == "light" {
             let chart = doc
                 .add_node("chart", graph::Point::new(48.0, 280.0))
@@ -946,14 +1387,25 @@ fn load_demo(
         } else if demo == "link-snap" {
             canvas.load_document(doc, cx);
             canvas.seed_link_drag(&read, "out", (300.0, 130.0), cx);
-        } else if demo == "link-reject" {
+        } else if demo == "reel-run" {
+            let mut doc = graph::Document::new();
+            let read = doc
+                .add_node("read_csv", graph::Point::new(80.0, 80.0))
+                .unwrap();
+            doc.set_param(&read, "path", json!(csv.display().to_string()));
+            doc.set_label(&read, "orders.csv".into());
+            canvas.load_document(doc, cx);
+            canvas.select_only(read, cx);
+        } else if demo == "link-reject" || demo == "reel-link" {
             let column = doc
                 .add_node("column", graph::Point::new(48.0, 280.0))
                 .unwrap();
             doc.set_param(&column, "name", json!("amount"));
             let _ = doc.connect(&read, "out", &column, "in");
             canvas.load_document(doc, cx);
-            canvas.seed_link_drag(&column, "out", (592.0, 140.0), cx);
+            if demo != "reel-link" {
+                canvas.seed_link_drag(&column, "out", (592.0, 140.0), cx);
+            }
         } else {
             canvas.load_document(doc, cx);
             canvas.select_only(&headers, cx);
@@ -972,34 +1424,90 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("ohmypipeline")
 }
 
-fn load_reduced_motion() -> bool {
+fn load_reduced_motion() -> Option<bool> {
     let path = config_dir().join("settings.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| value.get("reduced_motion").and_then(|v| v.as_bool()))
-        .unwrap_or(false)
+}
+
+fn read_settings() -> Value {
+    let path = config_dir().join("settings.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_settings(mut body: impl FnMut(&mut serde_json::Map<String, Value>)) {
+    let dir = config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let mut value = read_settings();
+    if let Some(map) = value.as_object_mut() {
+        body(map);
+    }
+    let _ = std::fs::write(dir.join("settings.json"), value.to_string());
 }
 
 fn save_reduced_motion(reduced: bool) {
-    let dir = config_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(
-        dir.join("settings.json"),
-        json!({"reduced_motion": reduced}).to_string(),
-    );
+    write_settings(|map| {
+        map.insert("reduced_motion".into(), json!(reduced));
+    });
+}
+
+fn load_model_settings() -> crate::assist::ModelSettings {
+    let value = read_settings();
+    crate::assist::ModelSettings {
+        endpoint: value
+            .get("model_endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: value
+            .get("model_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        key: value
+            .get("model_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn save_model_settings(settings: &crate::assist::ModelSettings) {
+    write_settings(|map| {
+        map.insert("model_endpoint".into(), json!(settings.endpoint));
+        map.insert("model_name".into(), json!(settings.model));
+        map.insert("model_key".into(), json!(settings.key));
+    });
 }
 
 struct PalettePanel {
     focus: FocusHandle,
     session: Entity<Session>,
+    search: Entity<InputState>,
+    query: String,
+    _sub: Subscription,
 }
 
 impl PalettePanel {
-    fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
+    fn new(session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx));
+        let sub = cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.query = input.read(cx).value().to_string();
+                cx.notify();
+            }
+        });
         Self {
             focus: cx.focus_handle(),
             session,
+            search,
+            query: String::new(),
+            _sub: sub,
         }
     }
 }
@@ -1025,36 +1533,83 @@ impl Panel for PalettePanel {
 }
 impl Render for PalettePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let narrow = window.viewport_size().width < px(960.0);
+        let narrow = window.viewport_size().width < px(1100.0);
+        let query = self.query.to_lowercase();
         let mut column = div()
             .id("palette")
             .size_full()
             .flex()
             .flex_col()
-            .p_2()
-            .gap_2()
             .overflow_hidden();
+        column = column.child(
+            div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Search"),
+                )
+                .child(Input::new(&self.search).small()),
+        );
+        let mut list = div()
+            .id("palette-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .px_2()
+            .pb_2()
+            .gap_1()
+            .overflow_y_scrollbar();
         for group in graph::groups() {
-            column = column.child(
+            let features: Vec<_> = graph::features_in(group)
+                .filter(|feature| query.is_empty() || feature.title.to_lowercase().contains(&query))
+                .collect();
+            if features.is_empty() {
+                continue;
+            }
+            list = list.child(
                 div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(*group),
             );
-            for feature in graph::features_in(group) {
+            let row_hover = cx.theme().secondary;
+            for feature in features {
                 let id = feature.id.to_string();
                 let title = if narrow {
-                    feature.title.chars().next().unwrap_or('·').to_string()
+                    feature.title.chars().take(14).collect::<String>()
                 } else {
                     feature.title.to_string()
                 };
                 let session = self.session.clone();
-                column = column.child(
-                    Button::new(SharedString::from(format!("feature-{id}")))
-                        .ghost()
-                        .small()
-                        .label(title)
-                        .on_click(move |_, _, cx| {
+                let icon = feature_icon(feature.id);
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("feature-{id}")))
+                        .h(px(36.0))
+                        .w_full()
+                        .px_2()
+                        .rounded(px(6.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(row_hover))
+                        .child(icon)
+                        .child(title)
+                        .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
                             session.update(cx, |session, cx| {
                                 session.canvas.update(cx, |canvas, cx| {
                                     let _ = canvas.add_feature(&id, cx);
@@ -1064,7 +1619,26 @@ impl Render for PalettePanel {
                 );
             }
         }
-        column
+        column.child(list)
+    }
+}
+
+fn feature_icon(id: &str) -> IconName {
+    match id {
+        "read_csv" | "read_excel" => IconName::FileSpreadsheet,
+        "read_sql" => IconName::Database,
+        "head" => IconName::ListFilter,
+        "change_headers" => IconName::Type,
+        "query" => IconName::Search,
+        "column" => IconName::Columns3,
+        "to_frame" => IconName::Table,
+        "sort_values" => IconName::ArrowDownWideNarrow,
+        "merge" => IconName::GitMerge,
+        "concat" => IconName::Layers,
+        "literal" => IconName::Hash,
+        "python" => IconName::Code,
+        "chart" => IconName::ChartColumn,
+        _ => IconName::Square,
     }
 }
 
@@ -1215,19 +1789,38 @@ impl Render for ChartPanel {
             "preview · the chart draws this window".into()
         };
         let _ = self.drag;
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_3()
-            .gap_2()
-            .child(div().text_sm().child(title))
-            .child(div().flex_1().min_h(px(0.)).child(FeaturePlot {
+        let y_label = y_name.clone();
+        let plot = if matches!(mark.as_str(), "bar" | "histogram") {
+            BarChart::new(data)
+                .id("feature-bars")
+                .band(|datum: &Datum| datum.x.clone())
+                .value(|datum: &Datum| datum.y)
+                .value_axis(true)
+                .value_tick_count(4)
+                .grid(true)
+                .padding_inner(0.32)
+                .corner_radii(Corners::all(px(3.0)))
+                .name(y_label)
+                .fill(move |_, _, _, _| color)
+                .appear(!reduced)
+                .into_any_element()
+        } else {
+            FeaturePlot {
                 mark,
                 data,
                 color,
                 reduced_motion: reduced,
-            }))
+            }
+            .into_any_element()
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p_4()
+            .gap_2()
+            .child(div().text_sm().child(title))
+            .child(div().flex_1().min_h(px(160.)).child(plot))
             .child(
                 div()
                     .text_xs()
@@ -1242,12 +1835,25 @@ struct InspectorPanel {
     focus: FocusHandle,
     session: Entity<Session>,
     fields: Vec<InspectorField>,
+    mapping: Vec<MapRow>,
+    python_rows: Vec<PyRow>,
+    python_count: usize,
     bound: Option<String>,
+}
+struct PyRow {
+    input: Entity<InputState>,
+    _sub: Subscription,
 }
 struct InspectorField {
     name: String,
-    input: Entity<InputState>,
+    line: Option<Entity<InputState>>,
+    area: Option<Entity<TextareaState>>,
     _sub: Subscription,
+}
+struct MapRow {
+    from: Entity<InputState>,
+    to: Entity<InputState>,
+    _subs: Vec<Subscription>,
 }
 impl InspectorPanel {
     fn new(session: Entity<Session>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1255,6 +1861,9 @@ impl InspectorPanel {
             focus: cx.focus_handle(),
             session,
             fields: Vec::new(),
+            mapping: Vec::new(),
+            python_rows: Vec::new(),
+            python_count: 0,
             bound: None,
         }
     }
@@ -1273,6 +1882,9 @@ impl InspectorPanel {
         }
         self.bound = id.clone();
         self.fields.clear();
+        self.mapping.clear();
+        self.python_rows.clear();
+        self.python_count = 0;
         let Some(node) = node else {
             return;
         };
@@ -1280,43 +1892,494 @@ impl InspectorPanel {
             return;
         };
         for param in def.params {
+            if param.name == "mapping" {
+                self.bind_mapping(&node, window, cx);
+                continue;
+            }
             let name = param.name.to_string();
             let text = node.param_str(&name);
-            let input = cx.new(|cx| InputState::new(window, cx));
-            input.update(cx, |state, cx| state.set_value(text, window, cx));
-            let session = self.session.clone();
-            let node_id = node.id.clone();
-            let param_name = name.clone();
-            let sub = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Focus) {
-                    this.session.update(cx, |session, cx| {
-                        session.canvas.update(cx, |canvas, _| canvas.begin_edit());
-                    });
-                }
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().to_string();
-                    let value = coerce(&param_name, &text);
-                    session.update(cx, |session, cx| {
-                        session.canvas.update(cx, |canvas, cx| {
-                            canvas.set_param(&node_id, &param_name, value, cx);
+            let long = matches!(name.as_str(), "code" | "expr" | "value");
+            let (line, area, sub) = if long {
+                let area = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 12));
+                area.update(cx, |state, cx| state.set_value(text, window, cx));
+                let session = self.session.clone();
+                let node_id = node.id.clone();
+                let param_name = name.clone();
+                let sub = cx.subscribe(&area, move |this, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Focus) {
+                        this.session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, _| canvas.begin_edit());
                         });
-                    });
-                }
-                if matches!(event, InputEvent::Blur) {
-                    this.session.update(cx, |session, cx| {
-                        session
-                            .canvas
-                            .update(cx, |canvas, cx| canvas.commit_edit(cx));
-                    });
-                }
-            });
+                    }
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value().to_string();
+                        let value = coerce(&param_name, &text);
+                        session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, cx| {
+                                canvas.set_param(&node_id, &param_name, value, cx);
+                            });
+                        });
+                    }
+                    if matches!(event, InputEvent::Blur) {
+                        let mut text = input.read(cx).value().to_string();
+                        let mut rewrite = false;
+                        if param_name == "code" {
+                            let pretty = crate::assist::pretty_python(&text);
+                            if pretty != text {
+                                text = pretty;
+                                rewrite = true;
+                            }
+                        } else if let Some(pretty) = crate::assist::pretty_json(&text) {
+                            if pretty.trim() != text.trim() {
+                                text = pretty;
+                                rewrite = true;
+                            }
+                        } else if text.trim().starts_with('{') || text.trim().starts_with('[') {
+                            this.session.update(cx, |session, cx| {
+                                session.assist_note =
+                                    Some("Not valid JSON. The text was left as typed.".into());
+                                cx.notify();
+                            });
+                        }
+                        let value = coerce(&param_name, &text);
+                        let show = if rewrite { Some(text.clone()) } else { None };
+                        session.update(cx, |session, cx| {
+                            if let Some(text) = show {
+                                session.assist_fill =
+                                    Some((node_id.clone(), param_name.clone(), text));
+                            }
+                            session.canvas.update(cx, |canvas, cx| {
+                                canvas.set_param(&node_id, &param_name, value, cx);
+                                canvas.commit_edit(cx);
+                            });
+                        });
+                    }
+                });
+                (None, Some(area), sub)
+            } else {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                input.update(cx, |state, cx| state.set_value(text, window, cx));
+                let session = self.session.clone();
+                let node_id = node.id.clone();
+                let param_name = name.clone();
+                let sub = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Focus) {
+                        this.session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, _| canvas.begin_edit());
+                        });
+                    }
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value().to_string();
+                        let value = coerce(&param_name, &text);
+                        session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, cx| {
+                                canvas.set_param(&node_id, &param_name, value, cx);
+                            });
+                        });
+                    }
+                    if matches!(event, InputEvent::Blur) {
+                        this.session.update(cx, |session, cx| {
+                            session
+                                .canvas
+                                .update(cx, |canvas, cx| canvas.commit_edit(cx));
+                        });
+                    }
+                });
+                (Some(input), None, sub)
+            };
             self.fields.push(InspectorField {
                 name,
-                input,
+                line,
+                area,
                 _sub: sub,
             });
         }
         cx.notify();
+    }
+
+    fn bind_mapping(&mut self, node: &graph::Node, window: &mut Window, cx: &mut Context<Self>) {
+        let pairs = node
+            .params
+            .get(graph::HEADER_PAIRS)
+            .map(header_pairs)
+            .unwrap_or_default();
+        let pairs = if pairs.is_empty() {
+            vec![("".into(), "".into())]
+        } else {
+            pairs
+        };
+        for (from_text, to_text) in pairs {
+            let from = cx.new(|cx| InputState::new(window, cx));
+            let to = cx.new(|cx| InputState::new(window, cx));
+            from.update(cx, |state, cx| state.set_value(from_text, window, cx));
+            to.update(cx, |state, cx| state.set_value(to_text, window, cx));
+            let mut subs = Vec::new();
+            for input in [&from, &to] {
+                let session = self.session.clone();
+                let node_id = node.id.clone();
+                subs.push(cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Focus) {
+                        this.session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, _| canvas.begin_edit());
+                        });
+                    }
+                    if matches!(event, InputEvent::Change) {
+                        this.write_mapping(&node_id, &session, cx);
+                    }
+                    if matches!(event, InputEvent::Blur) {
+                        this.session.update(cx, |session, cx| {
+                            session
+                                .canvas
+                                .update(cx, |canvas, cx| canvas.commit_edit(cx));
+                        });
+                    }
+                }));
+            }
+            self.mapping.push(MapRow {
+                from,
+                to,
+                _subs: subs,
+            });
+        }
+    }
+
+    fn write_mapping(&self, node_id: &str, session: &Entity<Session>, cx: &mut Context<Self>) {
+        let pairs: Vec<Value> = self
+            .mapping
+            .iter()
+            .map(|row| {
+                json!({
+                    "from": row.from.read(cx).value().to_string(),
+                    "to": row.to.read(cx).value().to_string(),
+                })
+            })
+            .collect();
+        let node_id = node_id.to_string();
+        session.update(cx, |session, cx| {
+            session.canvas.update(cx, |canvas, cx| {
+                canvas.set_param(&node_id, "mapping", json!(pairs), cx);
+            });
+        });
+    }
+
+    fn sync_python(&mut self, node: &graph::Node, window: &mut Window, cx: &mut Context<Self>) {
+        let ports = node.input_ports();
+        if ports.len() == self.python_count && self.python_rows.len() == ports.len() {
+            return;
+        }
+        self.python_rows.clear();
+        let node_id = node.id.clone();
+        for port in &ports {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            input.update(cx, |state, cx| {
+                state.set_value(port.name.clone(), window, cx)
+            });
+            let node_id = node_id.clone();
+            let original = port.name.clone();
+            let sub = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Blur) {
+                    return;
+                }
+                let renamed = input.read(cx).value().to_string();
+                if renamed.trim().is_empty() || renamed == original {
+                    return;
+                }
+                let ports = this.session.update(cx, |session, cx| {
+                    session
+                        .canvas
+                        .read(cx)
+                        .editor()
+                        .graph()
+                        .node(&node_id)
+                        .map(|node| node.input_ports())
+                        .unwrap_or_default()
+                });
+                let mut next = ports;
+                if let Some(found) = next.iter_mut().find(|port| port.name == original) {
+                    found.name = renamed.trim().to_string();
+                }
+                this.session.update(cx, |session, cx| {
+                    session.canvas.update(cx, |canvas, cx| {
+                        canvas.set_python_inputs(&node_id, next, cx);
+                    });
+                });
+                this.python_count = 0;
+            });
+            self.python_rows.push(PyRow { input, _sub: sub });
+        }
+        self.python_count = self.python_rows.len();
+    }
+
+    fn python_block(&mut self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let node_id = self.bound.clone().unwrap_or_default();
+        let ports = self.session.update(cx, |session, cx| {
+            session
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .node(&node_id)
+                .map(|node| node.input_ports())
+                .unwrap_or_default()
+        });
+        let mut column = div().flex().flex_col().gap_2().child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Inputs. Each name is an argument of run."),
+        );
+        for (index, row) in self.python_rows.iter().enumerate() {
+            let accepts = ports
+                .get(index)
+                .map(|port| {
+                    port.accepts
+                        .first()
+                        .copied()
+                        .unwrap_or(graph::TypeName::Dataframe)
+                })
+                .unwrap_or(graph::TypeName::Dataframe);
+            let mut types = div().flex().flex_row().gap_1().flex_wrap();
+            for (label, ty) in [
+                ("table", graph::TypeName::Dataframe),
+                ("column", graph::TypeName::Series),
+                ("value", graph::TypeName::Scalar),
+                ("list", graph::TypeName::List),
+                ("map", graph::TypeName::Dict),
+                ("code", graph::TypeName::Code),
+            ] {
+                let session = self.session.clone();
+                let node_id = node_id.clone();
+                let selected = accepts == ty;
+                types = types.child(
+                    Button::new(SharedString::from(format!("py-type-{index}-{label}")))
+                        .small()
+                        .compact()
+                        .selected(selected)
+                        .label(label)
+                        .on_click(move |_, _, cx| {
+                            let mut next = session.update(cx, |session, cx| {
+                                session
+                                    .canvas
+                                    .read(cx)
+                                    .editor()
+                                    .graph()
+                                    .node(&node_id)
+                                    .map(|node| node.input_ports())
+                                    .unwrap_or_default()
+                            });
+                            if let Some(port) = next.get_mut(index) {
+                                port.accepts = vec![ty];
+                            }
+                            session.update(cx, |session, cx| {
+                                session.canvas.update(cx, |canvas, cx| {
+                                    canvas.set_python_inputs(&node_id, next, cx);
+                                });
+                            });
+                        }),
+                );
+            }
+            let session = self.session.clone();
+            let node_id_remove = node_id.clone();
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(Input::new(&row.input).small())
+                    .child(types)
+                    .child(
+                        Button::new(SharedString::from(format!("py-remove-{index}")))
+                            .ghost()
+                            .small()
+                            .label("Remove")
+                            .on_click(move |_, _, cx| {
+                                let mut next = session.update(cx, |session, cx| {
+                                    session
+                                        .canvas
+                                        .read(cx)
+                                        .editor()
+                                        .graph()
+                                        .node(&node_id_remove)
+                                        .map(|node| node.input_ports())
+                                        .unwrap_or_default()
+                                });
+                                if index < next.len() {
+                                    next.remove(index);
+                                }
+                                session.update(cx, |session, cx| {
+                                    session.canvas.update(cx, |canvas, cx| {
+                                        canvas.set_python_inputs(&node_id_remove, next, cx);
+                                    });
+                                });
+                            }),
+                    ),
+            );
+        }
+        let session = self.session.clone();
+        let node_id_add = node_id.clone();
+        column
+            .child(
+                Button::new("py-add")
+                    .small()
+                    .label("Add input")
+                    .on_click(move |_, _, cx| {
+                        let mut next = session.update(cx, |session, cx| {
+                            session
+                                .canvas
+                                .read(cx)
+                                .editor()
+                                .graph()
+                                .node(&node_id_add)
+                                .map(|node| node.input_ports())
+                                .unwrap_or_default()
+                        });
+                        let name = format!("in{}", next.len() + 1);
+                        next.push(graph::PortRecord {
+                            name,
+                            accepts: vec![graph::TypeName::Dataframe],
+                            multi: false,
+                        });
+                        session.update(cx, |session, cx| {
+                            session.canvas.update(cx, |canvas, cx| {
+                                canvas.set_python_inputs(&node_id_add, next, cx);
+                            });
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn apply_fill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fill = self.session.read(cx).assist_fill.clone();
+        let Some((node, field, text)) = fill else {
+            return;
+        };
+        if self.bound.as_deref() != Some(node.as_str()) {
+            return;
+        }
+        for item in &self.fields {
+            if item.name != field {
+                continue;
+            }
+            if let Some(area) = &item.area {
+                area.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+            }
+            if let Some(line) = &item.line {
+                line.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+            }
+        }
+        self.session.update(cx, |session, _| {
+            session.assist_fill = None;
+        });
+    }
+
+    fn ask_model(
+        &mut self,
+        node_id: &str,
+        field: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = load_model_settings();
+        let (feature, purpose, current, neighbors) = self.session.update(cx, |session, cx| {
+            let canvas = session.canvas.read(cx);
+            let node = canvas.editor().graph().node(node_id);
+            let feature = node.map(|node| node.feature.clone()).unwrap_or_default();
+            let purpose = node
+                .and_then(|node| node.def())
+                .map(|def| def.title.to_string())
+                .unwrap_or_else(|| feature.clone());
+            let current = node.map(|node| node.param_str(field)).unwrap_or_default();
+            let mut neighbors = std::collections::BTreeMap::new();
+            if let Some(node) = node {
+                for (key, value) in &node.params {
+                    neighbors.insert(key.clone(), value.to_string());
+                }
+            }
+            (feature, purpose, current, neighbors)
+        });
+        let columns = self.session.update(cx, |session, cx| {
+            column_choices(
+                session.canvas.read(cx).editor().graph(),
+                node_id,
+                &session.columns,
+            )
+        });
+        let sample = self
+            .session
+            .read(cx)
+            .rows
+            .iter()
+            .take(3)
+            .map(|row| row.iter().map(cell_text).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let job = crate::assist::AssistJob {
+            endpoint: settings.endpoint,
+            model: settings.model,
+            key: settings.key,
+            field: field.to_string(),
+            feature,
+            purpose,
+            current,
+            columns,
+            sample,
+            neighbors,
+        };
+        if let Some(question) = crate::assist::local_question(&job) {
+            self.session.update(cx, |session, cx| {
+                session.assist_note = Some(question);
+                cx.notify();
+            });
+            cx.notify();
+            return;
+        }
+        let rx = crate::assist::spawn(job);
+        let node_id = node_id.to_string();
+        let field = field.to_string();
+        self.session.update(cx, |session, cx| {
+            session.assist_note = Some("Asking the model…".into());
+            session.assist_fill = Some((node_id, field, String::new()));
+            session.assist_rx = Some(rx);
+            cx.notify();
+        });
+        let session = self.session.clone();
+        window.on_next_frame(move |window, cx| watch_assist(session, window, cx));
+        cx.notify();
+    }
+}
+
+fn watch_assist(session: Entity<Session>, window: &mut Window, cx: &mut App) {
+    let reply = session.update(cx, |session, _| {
+        let ready = session.assist_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if ready.is_some() {
+            session.assist_rx = None;
+        }
+        ready
+    });
+    if let Some(reply) = reply {
+        session.update(cx, |session, cx| {
+            let target = session.assist_fill.clone();
+            match reply {
+                crate::assist::AssistReply::Value(text) => {
+                    if let Some((node, field, _)) = target {
+                        session.canvas.update(cx, |canvas, cx| {
+                            canvas.set_param(&node, &field, json!(text.clone()), cx);
+                        });
+                        session.assist_fill = Some((node, field, text));
+                        session.assist_note = None;
+                    }
+                }
+                crate::assist::AssistReply::Ask(text)
+                | crate::assist::AssistReply::Failed(text) => {
+                    session.assist_note = Some(text);
+                    session.assist_fill = None;
+                }
+            }
+            cx.notify();
+        });
+    } else if session.read(cx).assist_rx.is_some() {
+        let session = session.clone();
+        window.on_next_frame(move |window, cx| watch_assist(session, window, cx));
     }
 }
 impl EventEmitter<PanelEvent> for InspectorPanel {}
@@ -1341,6 +2404,7 @@ impl Panel for InspectorPanel {
 impl Render for InspectorPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(window, cx);
+        self.apply_fill(window, cx);
         let node = self
             .session
             .read(cx)
@@ -1362,7 +2426,7 @@ impl Render for InspectorPanel {
             .flex_col()
             .p_3()
             .gap_2()
-            .overflow_hidden();
+            .overflow_y_scrollbar();
         body = body.child(div().text_sm().child(node.label.clone()));
         body = body.child(
             div()
@@ -1371,16 +2435,237 @@ impl Render for InspectorPanel {
                 .child(node.feature.clone()),
         );
         if node.feature == "python" {
-            body = body.child(div().text_xs().child("This block runs with the pipeline."));
-        }
-        for field in &self.fields {
             body = body.child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(field.name.clone()),
+                    .child("This block runs with the pipeline."),
             );
-            body = body.child(Input::new(&field.input).small());
+        }
+        let choices = column_choices(
+            self.session.read(cx).canvas.read(cx).editor().graph(),
+            &node.id,
+            &self.session.read(cx).columns,
+        );
+        let def = node.def();
+        for field in &self.fields {
+            let kind = def
+                .and_then(|def| def.params.iter().find(|param| param.name == field.name))
+                .map(|param| param.kind);
+            let options = def
+                .and_then(|def| def.params.iter().find(|param| param.name == field.name))
+                .map(|param| param.options)
+                .unwrap_or(&[]);
+            let label = field_label(&field.name);
+            let help = field_help(&field.name);
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            );
+            if matches!(kind, Some(graph::ParamKind::Enum)) {
+                let mut row = div().flex().flex_row().flex_wrap().gap_1();
+                for option in options {
+                    let option = (*option).to_string();
+                    let current = field
+                        .line
+                        .as_ref()
+                        .map(|input| input.read(cx).value().to_string())
+                        .unwrap_or_default();
+                    let selected = current == option;
+                    let Some(input) = field.line.clone() else {
+                        continue;
+                    };
+                    let session = self.session.clone();
+                    let node_id = node.id.clone();
+                    let param = field.name.clone();
+                    row = row.child(
+                        Button::new(SharedString::from(format!("opt-{}-{option}", field.name)))
+                            .small()
+                            .compact()
+                            .selected(selected)
+                            .label(option.clone())
+                            .on_click(move |_, window, cx| {
+                                input.update(cx, |state, cx| {
+                                    state.set_value(option.clone(), window, cx);
+                                });
+                                session.update(cx, |session, cx| {
+                                    session.canvas.update(cx, |canvas, cx| {
+                                        canvas.set_param(&node_id, &param, json!(option), cx);
+                                    });
+                                });
+                            }),
+                    );
+                }
+                body = body.child(row);
+            } else if let Some(area) = &field.area {
+                body = body.child(Textarea::new(area));
+                let session = self.session.clone();
+                let node_id = node.id.clone();
+                let param = field.name.clone();
+                let area = area.clone();
+                body = body.child(
+                    Button::new(SharedString::from(format!("pretty-{}", field.name)))
+                        .ghost()
+                        .small()
+                        .label("Pretty")
+                        .on_click(move |_, window, cx| {
+                            let text = area.read(cx).value().to_string();
+                            let pretty = if param == "code" {
+                                Some(crate::assist::pretty_python(&text))
+                            } else {
+                                crate::assist::pretty_json(&text)
+                            };
+                            let Some(pretty) = pretty else {
+                                session.update(cx, |session, cx| {
+                                    session.assist_note =
+                                        Some("Not valid JSON. The text was left as typed.".into());
+                                    cx.notify();
+                                });
+                                return;
+                            };
+                            area.update(cx, |state, cx| {
+                                state.set_value(pretty.clone(), window, cx);
+                            });
+                            session.update(cx, |session, cx| {
+                                session.canvas.update(cx, |canvas, cx| {
+                                    canvas.set_param(&node_id, &param, json!(pretty), cx);
+                                });
+                            });
+                        }),
+                );
+            } else if let Some(input) = &field.line {
+                body = body.child(Input::new(input).small());
+                if matches!(kind, Some(graph::ParamKind::Column)) && !choices.is_empty() {
+                    let mut chips = div().flex().flex_row().flex_wrap().gap_1();
+                    for choice in &choices {
+                        let choice = choice.clone();
+                        let input = input.clone();
+                        let session = self.session.clone();
+                        let node_id = node.id.clone();
+                        let param = field.name.clone();
+                        chips = chips.child(
+                            Button::new(SharedString::from(format!("col-{}-{choice}", field.name)))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .label(choice.clone())
+                                .on_click(move |_, window, cx| {
+                                    input.update(cx, |state, cx| {
+                                        state.set_value(choice.clone(), window, cx);
+                                    });
+                                    session.update(cx, |session, cx| {
+                                        session.canvas.update(cx, |canvas, cx| {
+                                            canvas.set_param(&node_id, &param, json!(choice), cx);
+                                        });
+                                    });
+                                }),
+                        );
+                    }
+                    body = body.child(chips);
+                }
+            }
+            if !help.is_empty() {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(help),
+                );
+            }
+            let node_id = node.id.clone();
+            let param = field.name.clone();
+            body = body.child(
+                Button::new(SharedString::from(format!("assist-{param}")))
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Pencil)
+                    .tooltip("Fill from context")
+                    .accessibility_label(format!("Fill {param} from context"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ask_model(&node_id, &param, window, cx);
+                    })),
+            );
+        }
+        if node.feature == "python" {
+            self.sync_python(&node, window, cx);
+            body = body.child(self.python_block(cx));
+        }
+        if let Some(note) = self.session.read(cx).assist_note.clone() {
+            body = body.child(
+                div()
+                    .p_2()
+                    .rounded(px(8.0))
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .child(note),
+            );
+        }
+        if node.feature == "change_headers" {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Rename"),
+            );
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Each row renames a column. Leave the new name empty to drop it."),
+            );
+            for (index, row) in self.mapping.iter().enumerate() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(88.)).child(Input::new(&row.from).small()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("to"),
+                        )
+                        .child(div().flex_1().child(Input::new(&row.to).small())),
+                );
+                let _ = index;
+            }
+            if !choices.is_empty() {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Columns in the file"),
+                );
+                let mut chips = div().flex().flex_row().flex_wrap().gap_1();
+                for choice in &choices {
+                    let choice = choice.clone();
+                    chips = chips.child(
+                        Button::new(SharedString::from(format!("map-col-{choice}")))
+                            .ghost()
+                            .small()
+                            .label(choice.clone())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                for row in &this.mapping {
+                                    if row.from.read(cx).value().is_empty() {
+                                        row.from.update(cx, |state, cx| {
+                                            state.set_value(choice.clone(), window, cx);
+                                        });
+                                        break;
+                                    }
+                                }
+                                if let Some(node_id) = this.bound.clone() {
+                                    let session = this.session.clone();
+                                    this.write_mapping(&node_id, &session, cx);
+                                }
+                            })),
+                    );
+                }
+                body = body.child(chips);
+            }
         }
         if node.feature == "change_headers"
             && let Some(dup) = node
@@ -1407,6 +2692,55 @@ impl Render for InspectorPanel {
         }
         let _ = node.summary();
         body.into_any_element()
+    }
+}
+
+fn column_choices(graph: &graph::Graph, node: &str, preview: &[String]) -> Vec<String> {
+    if let Ok(order) = ancestors(graph, node) {
+        for id in &order {
+            let Some(node) = graph.node(id) else {
+                continue;
+            };
+            if node.feature == "read_csv" {
+                let path = node.param_str("path");
+                if let Ok(headers) = graph::csv_headers(std::path::Path::new(&path)) {
+                    return headers;
+                }
+            }
+        }
+    }
+    preview.to_vec()
+}
+
+fn field_label(name: &str) -> String {
+    match name {
+        "n" => "Rows".into(),
+        "path" => "File".into(),
+        "expr" => "Expression".into(),
+        "name" => "Column".into(),
+        "mark" => "Mark".into(),
+        "x" => "X".into(),
+        "y" => "Y".into(),
+        "series" => "Series".into(),
+        "bins" => "Bins".into(),
+        "by" => "Sort by".into(),
+        "ascending" => "Ascending".into(),
+        "how" => "Join".into(),
+        "on" => "Key".into(),
+        "kind" => "Kind".into(),
+        "value" => "Value".into(),
+        "code" => "Code".into(),
+        other => other.into(),
+    }
+}
+
+fn field_help(name: &str) -> &'static str {
+    match name {
+        "n" => "How many rows to keep.",
+        "expr" => "A pandas query expression.",
+        "code" => "def run(...) is the block the pipeline calls.",
+        "bins" => "Histogram bins.",
+        _ => "",
     }
 }
 
@@ -1440,6 +2774,7 @@ impl PreviewPanel {
             TableState::new(
                 PreviewTable {
                     columns: Vec::new(),
+                    dtypes: Vec::new(),
                     rows: Vec::new(),
                     index: Vec::new(),
                 },
@@ -1451,12 +2786,14 @@ impl PreviewPanel {
         let sub = cx.observe(&session, move |_, session, cx| {
             let session = session.read(cx);
             let columns = session.columns.clone();
+            let dtypes = session.dtypes.clone();
             let rows = session.rows.clone();
             let index = session.index.clone();
             let search = session.search.to_lowercase();
             table_for_sub.update(cx, |table, cx| {
                 let delegate = table.delegate_mut();
                 delegate.columns = columns;
+                delegate.dtypes = dtypes;
                 delegate.index = index;
                 delegate.rows = if search.is_empty() {
                     rows
@@ -1470,6 +2807,7 @@ impl PreviewPanel {
                 };
                 table.refresh(cx);
             });
+            cx.notify();
         });
         Self {
             focus: cx.focus_handle(),
@@ -1502,6 +2840,8 @@ impl Panel for PreviewPanel {
 impl Render for PreviewPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.session.read(cx).status.clone();
+        let running = self.session.read(cx).running;
+        let has_rows = !self.session.read(cx).rows.is_empty();
         let session = self.session.clone();
         div()
             .size_full()
@@ -1544,17 +2884,55 @@ impl Render for PreviewPanel {
                             }),
                     ),
             )
-            .child(
+            .child(if has_rows {
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(DataTable::new(&self.table)),
-            )
+                    .child(DataTable::new(&self.table))
+                    .into_any_element()
+            } else if running {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Running preview")
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .p_3()
+                    .child(
+                        Empty::new()
+                            .header(
+                                EmptyHeader::new()
+                                    .title(EmptyTitle::new().child("No preview yet"))
+                                    .description(
+                                        EmptyDescription::new().child(
+                                            "Wire a reader, then run Preview. The table shows at most 10,000 source rows, not the whole file.",
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                Button::new("empty-preview")
+                                    .primary()
+                                    .small()
+                                    .label("Run preview")
+                                    .on_click(|_, _, cx| {
+                                        cx.dispatch_action(&RunPreview);
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            })
     }
 }
 
 struct PreviewTable {
     columns: Vec<String>,
+    dtypes: Vec<String>,
     rows: Vec<Vec<Value>>,
     index: Vec<String>,
 }
@@ -1585,6 +2963,32 @@ impl TableDelegate for PreviewTable {
             let column = Column::new(name, name).width(140.).sortable();
             if numeric { column.text_right() } else { column }
         }
+    }
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let (name, dtype) = if col_ix == 0 {
+            ("index".to_string(), "row".to_string())
+        } else {
+            (
+                self.columns.get(col_ix - 1).cloned().unwrap_or_default(),
+                self.dtypes.get(col_ix - 1).cloned().unwrap_or_default(),
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(div().text_xs().child(name))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(dtype),
+            )
     }
     fn render_td(
         &mut self,
@@ -1638,6 +3042,7 @@ pub fn run_gui(options: GuiOptions) {
                 gpui_kit::KeyBinding::new("ctrl-o", OpenFile, None),
                 gpui_kit::KeyBinding::new("ctrl-s", SaveFile, None),
                 gpui_kit::KeyBinding::new("ctrl-enter", RunPreview, None),
+                gpui_kit::KeyBinding::new("ctrl-shift-enter", RunFull, None),
                 gpui_kit::KeyBinding::new("ctrl-z", UndoEdit, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-z", RedoEdit, None),
                 gpui_kit::KeyBinding::new("backspace", DeleteSelection, None),

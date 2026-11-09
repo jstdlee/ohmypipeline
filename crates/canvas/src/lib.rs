@@ -5,6 +5,7 @@
 
 mod layout;
 mod model;
+mod motion;
 
 pub use layout::{
     Cubic, PortSlot, Side, card_height, card_rect, cubic_point, port_slots, to_local, wire_cubic,

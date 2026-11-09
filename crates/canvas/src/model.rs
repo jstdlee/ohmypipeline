@@ -12,15 +12,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point as GPoint, Render, SharedString, Styled as _,
-    Task, Window, canvas, div, point, px,
+    MouseUpEvent, ParentElement as _, Pixels, Point as GPoint, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px,
 };
 use graph::{
     CARD_WIDTH, Camera, Document, Edge, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX,
-    SnapCandidate, TypeName, pick_snap, reject_message, try_connect, type_pair_label,
+    SnapCandidate, TypeName, output_types, pick_snap, reject_message, try_connect, type_pair_label,
 };
 
 use crate::layout::{self, Side, card_height, port_slots};
+use crate::motion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -56,6 +57,12 @@ struct Settle {
     duration: Duration,
 }
 
+struct CameraAnim {
+    from: Camera,
+    to: Camera,
+    started: Instant,
+}
+
 #[derive(Clone)]
 enum Drag {
     Move {
@@ -69,7 +76,8 @@ enum Drag {
         from: String,
         from_port: String,
         detached: Option<Edge>,
-        pointer: GPoint<Pixels>,
+        /// Canvas point under the pointer.
+        pointer: Point,
     },
     Marquee {
         start: GPoint<Pixels>,
@@ -80,6 +88,11 @@ enum Drag {
         kind: MarkKind,
         start: Point,
         current: Point,
+    },
+    Resize {
+        id: String,
+        origin_local: GPoint<Pixels>,
+        start_size: [f32; 2],
     },
     Pan {
         last: GPoint<Pixels>,
@@ -104,10 +117,13 @@ pub struct CanvasModel {
     space_hand: bool,
     drag: Option<Drag>,
     settle: Option<Settle>,
+    camera_anim: Option<CameraAnim>,
+    frame_armed: bool,
+    hovered: Option<String>,
+    flow: f32,
     reduced_motion: bool,
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    _anim: Option<Task<()>>,
 }
 
 impl CanvasModel {
@@ -121,10 +137,13 @@ impl CanvasModel {
             space_hand: false,
             drag: None,
             settle: None,
+            camera_anim: None,
+            frame_armed: false,
+            hovered: None,
+            flow: 0.0,
             reduced_motion: false,
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
-            _anim: None,
         }
         .with_focus(window)
     }
@@ -160,6 +179,32 @@ impl CanvasModel {
         if self.editor.set_param(node, name, value) {
             self.changed(cx);
         }
+    }
+
+    pub fn set_python_inputs(
+        &mut self,
+        node: &str,
+        inputs: Vec<graph::PortRecord>,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.set_python_inputs(node, inputs);
+        self.changed(cx);
+    }
+
+    pub fn set_mark_text(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
+        self.editor.set_mark_text(id, text);
+        self.changed(cx);
+    }
+
+    pub fn set_mark_focus(&mut self, id: &str, focus: Option<String>, cx: &mut Context<Self>) {
+        self.editor.set_mark_focus(id, focus);
+        self.changed(cx);
+    }
+
+    pub fn selected_mark(&self) -> Option<&graph::Mark> {
+        self.selection
+            .iter()
+            .find_map(|id| self.editor.graph().mark(id))
     }
 
     pub fn set_label(&mut self, node: &str, label: String, cx: &mut Context<Self>) {
@@ -215,9 +260,7 @@ impl CanvasModel {
     pub fn set_dots(&mut self, dots: BTreeMap<String, Dot>, cx: &mut Context<Self>) {
         let running = dots.values().any(|dot| *dot == Dot::Running);
         self.dots = dots;
-        if running && !self.reduced_motion {
-            self.kick_animation(cx);
-        }
+        let _ = running;
         cx.notify();
     }
 
@@ -225,6 +268,9 @@ impl CanvasModel {
         self.reduced_motion = reduced;
         if reduced {
             self.settle = None;
+            if let Some(anim) = self.camera_anim.take() {
+                self.editor.set_camera(anim.to);
+            }
         }
         cx.notify();
     }
@@ -238,6 +284,7 @@ impl CanvasModel {
         self.selection.clear();
         self.drag = None;
         self.settle = None;
+        self.camera_anim = None;
         cx.emit(CanvasEvent::Edited);
         cx.emit(CanvasEvent::SelectionChanged);
         cx.notify();
@@ -272,6 +319,7 @@ impl CanvasModel {
             self.editor.add_node(feature, at)
         }?;
         self.selection = vec![id.clone()];
+        self.enter_node(&id);
         self.changed(cx);
         cx.emit(CanvasEvent::FocusInspector);
         cx.emit(CanvasEvent::SelectionChanged);
@@ -314,7 +362,15 @@ impl CanvasModel {
         }
     }
 
+    pub fn fit_all(&mut self, cx: &mut Context<Self>) {
+        self.fit_ids(false, cx);
+    }
+
     pub fn fit(&mut self, cx: &mut Context<Self>) {
+        self.fit_ids(true, cx);
+    }
+
+    fn fit_ids(&mut self, selection_only: bool, cx: &mut Context<Self>) {
         let bounds = self
             .viewport
             .borrow()
@@ -322,7 +378,7 @@ impl CanvasModel {
         let Some((w, h)) = bounds else {
             return;
         };
-        let ids: Vec<String> = if self.selection.is_empty() {
+        let ids: Vec<String> = if self.selection.is_empty() || !selection_only {
             self.editor
                 .graph()
                 .nodes
@@ -336,9 +392,7 @@ impl CanvasModel {
         let Some(rect) = graph::bounds_of(self.editor.graph(), &ids, card_height) else {
             return;
         };
-        self.editor.set_camera(graph::fit_camera(w, h, rect, 32.0));
-        cx.emit(CanvasEvent::Edited);
-        cx.notify();
+        self.animate_camera(graph::fit_camera(w, h, rect, 72.0), cx);
     }
 
     pub fn zoom_by(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -357,6 +411,18 @@ impl CanvasModel {
         cx.notify();
     }
 
+    /// Move an in-progress link drag. Used by the screenshot reel.
+    pub fn show_link(&mut self, from: &str, from_port: &str, at: Point, cx: &mut Context<Self>) {
+        self.drag = Some(Drag::Link {
+            from: from.to_string(),
+            from_port: from_port.to_string(),
+            detached: None,
+            pointer: at,
+        });
+        self.refresh_link_status();
+        cx.notify();
+    }
+
     /// Seed a link drag so a screenshot can show snap or reject without a pointer.
     pub fn seed_link_drag(
         &mut self,
@@ -369,7 +435,7 @@ impl CanvasModel {
             from: from.to_string(),
             from_port: from_port.to_string(),
             detached: None,
-            pointer: point(px(local.0), px(local.1)),
+            pointer: self.canvas_of(point(px(local.0), px(local.1))),
         });
         self.refresh_link_status();
         cx.notify();
@@ -478,7 +544,7 @@ impl CanvasModel {
                 from: node.to_string(),
                 from_port: port.to_string(),
                 detached: None,
-                pointer: local,
+                pointer: self.canvas_of(local),
             });
         } else if let Some(edge) = self
             .editor
@@ -495,7 +561,7 @@ impl CanvasModel {
                     from: detached.from.clone(),
                     from_port: detached.from_port.clone(),
                     detached: Some(detached.clone()),
-                    pointer: local,
+                    pointer: self.canvas_of(local),
                 });
             }
         }
@@ -583,6 +649,7 @@ impl CanvasModel {
         let mut refresh_link = false;
         match &mut drag {
             Drag::Pan { last } => {
+                self.camera_anim = None;
                 let dx = local.x.as_f32() - last.x.as_f32();
                 let dy = local.y.as_f32() - last.y.as_f32();
                 let camera = self.editor.graph().camera;
@@ -614,7 +681,7 @@ impl CanvasModel {
                 self.editor.place(&placed_nodes, &placed_marks, false);
             }
             Drag::Link { pointer, .. } => {
-                *pointer = local;
+                *pointer = self.canvas_of(local);
                 refresh_link = true;
             }
             Drag::Marquee { current, .. } => {
@@ -622,6 +689,21 @@ impl CanvasModel {
             }
             Drag::Mark { current, .. } => {
                 *current = self.canvas_of(local);
+            }
+            Drag::Resize {
+                id,
+                origin_local,
+                start_size,
+            } => {
+                let zoom = self.editor.graph().camera.zoom.max(0.05);
+                let dx = (local.x.as_f32() - origin_local.x.as_f32()) / zoom;
+                let dy = (local.y.as_f32() - origin_local.y.as_f32()) / zoom;
+                let id = id.clone();
+                let size = [
+                    ((start_size[0] + dx).max(24.0)),
+                    ((start_size[1] + dy).max(24.0)),
+                ];
+                self.editor.resize_mark(&id, size);
             }
         }
         self.drag = Some(drag);
@@ -663,6 +745,17 @@ impl CanvasModel {
                     })
                     .collect();
                 self.editor.place(&placed_nodes, &placed_marks, false);
+                if dx.abs() + dy.abs() < 4.0
+                    && nodes.is_empty()
+                    && marks.len() == 1
+                    && let Some((id, _)) = marks.iter().next()
+                    && let Some(mark) = self.editor.graph().mark(id).cloned()
+                    && mark.kind == MarkKind::Button
+                    && let Some(focus) = mark.focus.clone()
+                {
+                    self.selection = vec![focus];
+                    cx.emit(CanvasEvent::SelectionChanged);
+                }
                 self.editor.commit_gesture();
                 if !self.reduced_motion
                     && offsets
@@ -672,9 +765,8 @@ impl CanvasModel {
                     self.settle = Some(Settle {
                         offsets,
                         started: Instant::now(),
-                        duration: Duration::from_millis(160),
+                        duration: motion::SETTLE,
                     });
-                    self.kick_animation(cx);
                 }
                 self.changed(cx);
             }
@@ -682,9 +774,9 @@ impl CanvasModel {
                 from,
                 from_port,
                 detached,
-                ..
+                pointer,
             }) => {
-                let snap = self.snap_at(local, &from, &from_port);
+                let snap = self.snap_at(pointer, &from, &from_port);
                 if let Some((to, to_port)) = snap {
                     let _ = self.editor.connect(&from, &from_port, &to, &to_port);
                     self.status.clear();
@@ -744,6 +836,10 @@ impl CanvasModel {
                 }
                 cx.notify();
             }
+            Some(Drag::Resize { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
             Some(Drag::Mark {
                 kind,
                 start,
@@ -764,13 +860,8 @@ impl CanvasModel {
         }
     }
 
-    fn snap_at(
-        &self,
-        local: GPoint<Pixels>,
-        from: &str,
-        from_port: &str,
-    ) -> Option<(String, String)> {
-        let pointer = Point::new(local.x.as_f32(), local.y.as_f32());
+    fn snap_at(&self, pointer: Point, from: &str, from_port: &str) -> Option<(String, String)> {
+        let zoom = self.editor.graph().camera.zoom.max(0.05);
         let mut candidates = Vec::new();
         for node in &self.editor.graph().nodes {
             if node.id == from {
@@ -780,9 +871,8 @@ impl CanvasModel {
                 if slot.side != Side::In {
                     continue;
                 }
-                let window = self.editor.graph().camera.to_window(slot.center);
-                let dx = window.x - pointer.x;
-                let dy = window.y - pointer.y;
+                let dx = (slot.center.x - pointer.x) * zoom;
+                let dy = (slot.center.y - pointer.y) * zoom;
                 let distance = (dx * dx + dy * dy).sqrt();
                 let compatible =
                     try_connect(self.editor.graph(), from, from_port, &node.id, &slot.name).is_ok();
@@ -814,16 +904,15 @@ impl CanvasModel {
         let from = from.clone();
         let from_port = from_port.clone();
         let pointer = *pointer;
-        // Temporarily clear so snap_at does not recurse on drag_from_port... it reads drag.
         let snap = self.snap_at(pointer, &from, &from_port);
         if let Some((to, to_port)) = snap {
             let (left, right) = type_pair_label(self.editor.graph(), &from, &to, &to_port);
-            self.status = format!("{left} → {right}");
+            self.status = format!("{} → {}", shorten_types(&left), shorten_types(&right));
             return;
         }
         if let Some((node, port, reason)) = self.nearest_reject(pointer, &from, &from_port) {
             let (left, right) = type_pair_label(self.editor.graph(), &from, &node, &port);
-            self.status = reject_message(reason, &left, &right);
+            self.status = reject_message(reason, &shorten_types(&left), &shorten_types(&right));
         } else {
             self.status.clear();
         }
@@ -831,11 +920,11 @@ impl CanvasModel {
 
     fn nearest_reject(
         &self,
-        local: GPoint<Pixels>,
+        pointer: Point,
         from: &str,
         from_port: &str,
     ) -> Option<(String, String, Reject)> {
-        let pointer = Point::new(local.x.as_f32(), local.y.as_f32());
+        let zoom = self.editor.graph().camera.zoom.max(0.05);
         let mut best: Option<(f32, String, String, Reject)> = None;
         for node in &self.editor.graph().nodes {
             if node.id == from {
@@ -845,9 +934,9 @@ impl CanvasModel {
                 if slot.side != Side::In {
                     continue;
                 }
-                let window = self.editor.graph().camera.to_window(slot.center);
-                let distance =
-                    ((window.x - pointer.x).powi(2) + (window.y - pointer.y).powi(2)).sqrt();
+                let distance = (((slot.center.x - pointer.x) * zoom).powi(2)
+                    + ((slot.center.y - pointer.y) * zoom).powi(2))
+                .sqrt();
                 if distance > SNAP_RADIUS_PX {
                     continue;
                 }
@@ -865,43 +954,67 @@ impl CanvasModel {
         best.map(|(_, node, port, reason)| (node, port, reason))
     }
 
-    fn kick_animation(&mut self, cx: &mut Context<Self>) {
-        if self._anim.is_some() {
+    fn enter_node(&mut self, id: &str) {
+        if self.reduced_motion {
             return;
         }
-        self._anim = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let done = this
-                    .update(cx, |this, cx| {
-                        let finished = this.tick_settle();
-                        cx.notify();
-                        finished
-                    })
-                    .unwrap_or(true);
-                if done {
-                    break;
-                }
-            }
-            let _ = this.update(cx, |this, _| {
-                this._anim = None;
-            });
-        }));
+        let mut offsets = BTreeMap::new();
+        offsets.insert(id.to_string(), Point::new(0.0, 12.0));
+        self.settle = Some(Settle {
+            offsets,
+            started: Instant::now(),
+            duration: motion::ENTER,
+        });
     }
 
-    fn tick_settle(&mut self) -> bool {
-        let settle_done = match &self.settle {
-            Some(settle) if settle.started.elapsed() >= settle.duration => {
-                self.settle = None;
-                true
+    fn animate_camera(&mut self, to: Camera, cx: &mut Context<Self>) {
+        let from = self.editor.graph().camera;
+        if self.reduced_motion
+            || ((from.x - to.x).abs() < 0.5
+                && (from.y - to.y).abs() < 0.5
+                && (from.zoom - to.zoom).abs() < 0.001)
+        {
+            self.camera_anim = None;
+            self.editor.set_camera(to);
+            cx.emit(CanvasEvent::Edited);
+            cx.notify();
+            return;
+        }
+        self.camera_anim = Some(CameraAnim {
+            from,
+            to,
+            started: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    fn motion_active(&self) -> bool {
+        self.settle.is_some()
+            || self.camera_anim.is_some()
+            || (self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion)
+    }
+
+    fn tick_motion(&mut self) {
+        if let Some(settle) = &self.settle
+            && settle.started.elapsed() >= settle.duration
+        {
+            self.settle = None;
+        }
+        if let Some(anim) = &self.camera_anim {
+            let t = (anim.started.elapsed().as_secs_f32() / motion::CAMERA.as_secs_f32())
+                .clamp(0.0, 1.0);
+            self.editor.set_camera(Camera {
+                x: motion::lerp(anim.from.x, anim.to.x, t),
+                y: motion::lerp(anim.from.y, anim.to.y, t),
+                zoom: motion::lerp(anim.from.zoom, anim.to.zoom, t),
+            });
+            if t >= 1.0 {
+                self.camera_anim = None;
             }
-            Some(_) => false,
-            None => true,
-        };
-        let running = self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion;
-        settle_done && !running
+        }
+        if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
+            self.flow = (self.flow + 0.02) % 1.0;
+        }
     }
 
     fn settle_offset(&self, id: &str) -> Point {
@@ -947,24 +1060,27 @@ impl CanvasModel {
                         .find(|slot| slot.name == *to_port && slot.side == Side::In)
                         .map(|slot| slot.center)
                 })
-                .unwrap_or_else(|| self.canvas_of(*pointer))
+                .unwrap_or(*pointer)
         } else {
-            self.canvas_of(*pointer)
+            *pointer
         };
         Some(LinkVisual {
             from: slot.center,
             to: end,
             snapped: snap,
             reject: reject.map(|(_, _, reason)| reason),
+            message: self.status.clone(),
         })
     }
 }
 
+#[derive(Clone)]
 struct LinkVisual {
     from: Point,
     to: Point,
     snapped: Option<(String, String)>,
     reject: Option<Reject>,
+    message: String,
 }
 
 impl EventEmitter<CanvasEvent> for CanvasModel {}
@@ -976,7 +1092,18 @@ impl Focusable for CanvasModel {
 }
 
 impl Render for CanvasModel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.motion_active() && !self.frame_armed {
+            self.frame_armed = true;
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.frame_armed = false;
+                    this.tick_motion();
+                    cx.notify();
+                });
+            });
+        }
         let viewport = self.viewport.clone();
         let theme_border = cx.theme().border;
         let theme_muted = cx.theme().muted_foreground;
@@ -984,9 +1111,18 @@ impl Render for CanvasModel {
         let theme_danger = cx.theme().danger;
         let theme_bg = cx.theme().background;
         let theme_fg = cx.theme().foreground;
-        let theme_card = cx.theme().secondary;
+        let theme_card = cx.theme().background;
+        let theme_raised = cx.theme().secondary;
         let theme_success = cx.theme().success;
         let theme_warning = cx.theme().warning;
+        let chart = [
+            cx.theme().chart_1,
+            cx.theme().chart_2,
+            cx.theme().chart_3,
+            cx.theme().chart_4,
+            cx.theme().chart_5,
+            cx.theme().chart_5,
+        ];
         let radius = cx.theme().radius;
         let mono = cx.theme().mono_font_family.clone();
 
@@ -994,16 +1130,41 @@ impl Render for CanvasModel {
         let nodes = self.editor.graph().nodes.clone();
         let edges = self.editor.graph().edges.clone();
         let marks = self.editor.graph().marks.clone();
+        let mark_views = marks.clone();
         let selection = self.selection.clone();
         let link = self.link_visual();
         let marquee = match &self.drag {
             Some(Drag::Marquee { start, current, .. }) => Some((*start, *current)),
             _ => None,
         };
+        let dragging: Vec<String> = match &self.drag {
+            Some(Drag::Move { nodes, .. }) => nodes.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
         let settle_ids: Vec<(String, Point)> = nodes
             .iter()
-            .map(|node| (node.id.clone(), self.settle_offset(&node.id)))
+            .map(|node| {
+                let mut offset = self.settle_offset(&node.id);
+                if dragging.iter().any(|id| id == &node.id) && !self.reduced_motion {
+                    offset.y -= 3.0 / camera.zoom.max(0.05);
+                }
+                (node.id.clone(), offset)
+            })
             .collect();
+        let link_from = match &self.drag {
+            Some(Drag::Link {
+                from, from_port, ..
+            }) => Some((from.clone(), from_port.clone())),
+            _ => None,
+        };
+        let snap_target = link.as_ref().and_then(|item| item.snapped.clone());
+        let flow = if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
+            Some(self.flow)
+        } else {
+            None
+        };
+        let graph = self.editor.graph().clone();
+        let hovered = self.hovered.clone();
 
         let entity = cx.entity();
         div()
@@ -1063,6 +1224,7 @@ impl Render for CanvasModel {
                         1.0 / 1.08
                     };
                     let local = this.local_of(event.position);
+                    this.camera_anim = None;
                     let camera = graph::zoom_toward(
                         this.editor.graph().camera,
                         Point::new(local.x.as_f32(), local.y.as_f32()),
@@ -1072,6 +1234,7 @@ impl Render for CanvasModel {
                     cx.emit(CanvasEvent::Edited);
                     cx.notify();
                 } else {
+                    this.camera_anim = None;
                     let camera = this.editor.graph().camera;
                     this.editor.set_camera(Camera {
                         x: camera.x - delta.x.as_f32(),
@@ -1082,24 +1245,11 @@ impl Render for CanvasModel {
                     cx.notify();
                 }
             }))
-            .when(!self.status.is_empty(), |this| {
-                let text = self.status.clone();
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom(px(8.0))
-                        .left(px(12.0))
-                        .text_xs()
-                        .text_color(if link.as_ref().and_then(|item| item.reject).is_some() {
-                            theme_danger
-                        } else {
-                            theme_muted
-                        })
-                        .child(text),
-                )
-            })
             .child({
                 let painted_selection = selection.clone();
+                let painted_chart = chart;
+                let painted_settle = settle_ids.clone();
+                let painted_link = link.clone();
                 canvas(
                     move |bounds, _, _| {
                         *viewport.borrow_mut() = Some(bounds);
@@ -1112,11 +1262,13 @@ impl Render for CanvasModel {
                             &edges,
                             &marks,
                             &painted_selection,
-                            &settle_ids,
-                            link.as_ref(),
+                            &painted_settle,
+                            painted_link.as_ref(),
+                            flow,
                             theme_muted,
                             theme_primary,
                             theme_danger,
+                            &painted_chart,
                             window,
                             cx,
                         );
@@ -1126,9 +1278,15 @@ impl Render for CanvasModel {
                 .size_full()
             })
             .children(self.editor.graph().nodes.iter().map(|node| {
+                let offset = settle_ids
+                    .iter()
+                    .find(|(id, _)| id == &node.id)
+                    .map(|(_, offset)| *offset)
+                    .unwrap_or_else(|| Point::new(0.0, 0.0));
                 card_element(
                     entity.clone(),
                     node,
+                    &graph,
                     self.dots.get(&node.id).copied().unwrap_or(if node.unknown {
                         Dot::Danger
                     } else {
@@ -1136,18 +1294,39 @@ impl Render for CanvasModel {
                     }),
                     self.reduced_motion,
                     camera,
-                    self.settle_offset(&node.id),
+                    offset,
                     selection.iter().any(|id| id == &node.id),
-                    theme_card,
+                    hovered.as_deref() == Some(node.id.as_str()),
+                    dragging.iter().any(|id| id == &node.id),
+                    link_from.clone(),
+                    snap_target.clone(),
+                    CardPaint {
+                        card: theme_card,
+                        raised: theme_raised,
+                        fg: theme_fg,
+                        muted: theme_muted,
+                        primary: theme_primary,
+                        border: theme_border,
+                        success: theme_success,
+                        warning: theme_warning,
+                        danger: theme_danger,
+                        chart,
+                        radius,
+                        mono: mono.to_string(),
+                    },
+                )
+            }))
+            .children(mark_views.iter().map(|mark| {
+                mark_element(
+                    entity.clone(),
+                    mark,
+                    camera,
+                    selection.iter().any(|id| id == &mark.id),
                     theme_fg,
                     theme_muted,
-                    theme_primary,
                     theme_border,
-                    theme_success,
-                    theme_warning,
-                    theme_danger,
-                    radius,
-                    &mono,
+                    theme_card,
+                    theme_primary,
                 )
             }))
             .children(
@@ -1188,6 +1367,29 @@ impl Render for CanvasModel {
                         .bg(theme_primary.opacity(0.08)),
                 )
             })
+            .when(
+                link.as_ref()
+                    .is_some_and(|item| item.reject.is_some() && !item.message.is_empty()),
+                |this| {
+                    let item = link.clone().expect("link");
+                    let at = camera.to_window(item.to);
+                    let text = item.message;
+                    this.child(
+                        div()
+                            .absolute()
+                            .left(px(at.x + 10.0))
+                            .top(px((at.y - 28.0).max(8.0)))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.0))
+                            .bg(theme_fg)
+                            .text_color(theme_card)
+                            .shadow(card_shadow(false, theme_fg))
+                            .text_xs()
+                            .child(text),
+                    )
+                },
+            )
     }
 }
 
@@ -1214,29 +1416,103 @@ fn rects_overlap(a: graph::Rect, b: graph::Rect) -> bool {
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 }
 
+struct CardPaint {
+    card: gpui_kit::Hsla,
+    raised: gpui_kit::Hsla,
+    fg: gpui_kit::Hsla,
+    muted: gpui_kit::Hsla,
+    primary: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    success: gpui_kit::Hsla,
+    warning: gpui_kit::Hsla,
+    danger: gpui_kit::Hsla,
+    chart: [gpui_kit::Hsla; 6],
+    radius: Pixels,
+    mono: String,
+}
+
+fn type_color(ty: TypeName, chart: &[gpui_kit::Hsla; 6]) -> gpui_kit::Hsla {
+    match ty {
+        TypeName::Dataframe => chart[0],
+        TypeName::Series => chart[1],
+        TypeName::Scalar => chart[2],
+        TypeName::List | TypeName::Index => chart[3],
+        TypeName::Dict | TypeName::Ndarray => chart[4],
+        TypeName::Code => chart[5],
+    }
+}
+
+fn group_color(group: &str, chart: &[gpui_kit::Hsla; 6]) -> gpui_kit::Hsla {
+    match group {
+        "IO" => chart[0],
+        "Labels" => chart[1],
+        "Select" => chart[2],
+        "Shape" => chart[3],
+        "Code" => chart[4],
+        _ => chart[5],
+    }
+}
+
+fn shorten_types(label: &str) -> String {
+    label
+        .replace("dataframe", "table")
+        .replace("series", "column")
+        .replace("ndarray", "array")
+        .replace("scalar", "value")
+        .replace("dict", "map")
+}
+
+fn port_caption(name: &str, accepts: &[TypeName]) -> String {
+    let labels: Vec<&str> = accepts.iter().copied().map(TypeName::short_label).collect();
+    let kind = if labels.is_empty() {
+        "value".to_string()
+    } else if labels.contains(&"table") {
+        "table".to_string()
+    } else {
+        labels[0].to_string()
+    };
+    if name == "in" || name == "out" || name.is_empty() {
+        kind
+    } else {
+        format!("{name} · {kind}")
+    }
+}
+
+fn shifted(nodes: &[Node], offsets: &[(String, Point)]) -> Vec<Node> {
+    nodes
+        .iter()
+        .cloned()
+        .map(|mut node| {
+            if let Some((_, offset)) = offsets.iter().find(|(id, _)| id == &node.id) {
+                node.position[0] += offset.x;
+                node.position[1] += offset.y;
+            }
+            node
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_scene(
     bounds: Bounds<Pixels>,
     camera: Camera,
     nodes: &[Node],
     edges: &[Edge],
-    marks: &[graph::Mark],
+    _marks: &[graph::Mark],
     selection: &[String],
-    _settle: &[(String, Point)],
+    settle: &[(String, Point)],
     link: Option<&LinkVisual>,
-    muted: impl Into<gpui_kit::Hsla>,
-    primary: impl Into<gpui_kit::Hsla>,
-    danger: impl Into<gpui_kit::Hsla>,
+    flow: Option<f32>,
+    muted: gpui_kit::Hsla,
+    primary: gpui_kit::Hsla,
+    danger: gpui_kit::Hsla,
+    chart: &[gpui_kit::Hsla; 6],
     window: &mut Window,
     _cx: &mut App,
 ) {
-    let muted = muted.into();
-    let primary = primary.into();
-    let danger = danger.into();
     let origin = bounds.origin;
-    // Grid dots in the visible area.
     let zoom = camera.zoom;
-    if zoom > 0.3 {
+    if zoom > 0.35 {
         let step = graph::GRID_PX * zoom;
         let mut path = gpui_kit::PathBuilder::fill();
         let mut x = camera.x % step;
@@ -1259,48 +1535,95 @@ fn paint_scene(
             x += step;
         }
         if let Ok(path) = path.build() {
-            window.paint_path(path, muted.opacity(0.35));
+            window.paint_path(path, muted.opacity(0.45));
         }
     }
 
-    for mark in marks {
-        if !matches!(mark.kind, MarkKind::Rectangle | MarkKind::Circle) {
-            continue;
-        }
-        let _ = selection;
-        let _ = mark;
-    }
-
+    let placed = shifted(nodes, settle);
     for edge in edges {
-        let Some(cubic) = layout::edge_cubic(nodes, edge) else {
+        let Some(cubic) = layout::edge_cubic(&placed, edge) else {
             continue;
         };
         let selected = selection.iter().any(|id| id == &edge.id);
+        let ty = output_types_first(nodes, &edge.from);
+        let color = ty
+            .map(|ty| type_color(ty, chart))
+            .unwrap_or(muted)
+            .opacity(if selected { 1.0 } else { 0.85 });
         paint_cubic(
             origin,
             camera,
             cubic,
-            if selected { primary } else { muted },
-            if selected { px(2.0) } else { px(1.25) },
+            color,
+            px(if selected { 1.75 } else { 1.25 }),
             window,
         );
+        if let Some(phase) = flow {
+            let at = layout::cubic_point(cubic, phase);
+            paint_dot(origin, camera, at, 3.0, color, window);
+        }
     }
     if let Some(link) = link {
+        let cubic = layout::wire_cubic(link.from, link.to);
         let color = if link.reject.is_some() {
             danger
         } else if link.snapped.is_some() {
-            primary
+            link_source_color(nodes, link, chart, primary)
         } else {
             muted
         };
-        paint_cubic(
-            origin,
-            camera,
-            layout::wire_cubic(link.from, link.to),
-            color,
-            px(1.75),
-            window,
-        );
+        paint_cubic(origin, camera, cubic, color, px(1.5), window);
+    }
+}
+
+fn output_types_first(nodes: &[Node], id: &str) -> Option<TypeName> {
+    let graph = graph::Graph {
+        nodes: nodes.to_vec(),
+        ..graph::Graph::default()
+    };
+    output_types(&graph, id).into_iter().next()
+}
+
+fn link_source_color(
+    nodes: &[Node],
+    link: &LinkVisual,
+    chart: &[gpui_kit::Hsla; 6],
+    fallback: gpui_kit::Hsla,
+) -> gpui_kit::Hsla {
+    // The source id is not on LinkVisual. Color from the node whose output slot matches `from`.
+    for node in nodes {
+        for slot in port_slots(node) {
+            if slot.side == Side::Out
+                && (slot.center.x - link.from.x).abs() < 0.5
+                && (slot.center.y - link.from.y).abs() < 0.5
+            {
+                return output_types_first(nodes, &node.id)
+                    .map(|ty| type_color(ty, chart))
+                    .unwrap_or(fallback);
+            }
+        }
+    }
+    fallback
+}
+
+fn paint_dot(
+    origin: GPoint<Pixels>,
+    camera: Camera,
+    at: Point,
+    radius: f32,
+    color: gpui_kit::Hsla,
+    window: &mut Window,
+) {
+    let mapped = camera.to_window(at);
+    let center = origin + point(px(mapped.x), px(mapped.y));
+    let mut path = gpui_kit::PathBuilder::fill();
+    path.move_to(center + point(px(radius), px(0.0)));
+    // A small diamond reads as a bead without a full arc API.
+    path.line_to(center + point(px(0.0), px(radius)));
+    path.line_to(center + point(px(-radius), px(0.0)));
+    path.line_to(center + point(px(0.0), px(-radius)));
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
     }
 }
 
@@ -1324,25 +1647,35 @@ fn paint_cubic(
     }
 }
 
+fn card_shadow(dragging: bool, ink: gpui_kit::Hsla) -> Vec<gpui_kit::BoxShadow> {
+    if dragging {
+        vec![
+            gpui_kit::BoxShadow::new(px(0.), px(8.), ink.opacity(0.10)).blur_radius(px(16.)),
+            gpui_kit::BoxShadow::new(px(0.), px(1.), ink.opacity(0.08)).blur_radius(px(2.)),
+        ]
+    } else {
+        vec![
+            gpui_kit::BoxShadow::new(px(0.), px(1.), ink.opacity(0.06)).blur_radius(px(2.)),
+            gpui_kit::BoxShadow::new(px(0.), px(1.), ink.opacity(0.04)).blur_radius(px(1.)),
+        ]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn card_element(
     entity: Entity<CanvasModel>,
     node: &Node,
+    graph: &graph::Graph,
     dot_kind: Dot,
     reduced_motion: bool,
     camera: Camera,
     offset: Point,
     selected: bool,
-    card: gpui_kit::Hsla,
-    fg: gpui_kit::Hsla,
-    muted: gpui_kit::Hsla,
-    primary: gpui_kit::Hsla,
-    border: gpui_kit::Hsla,
-    success: gpui_kit::Hsla,
-    warning: gpui_kit::Hsla,
-    danger: gpui_kit::Hsla,
-    radius: Pixels,
-    mono: &str,
+    hovered: bool,
+    dragging: bool,
+    link_from: Option<(String, String)>,
+    snap_target: Option<(String, String)>,
+    paint: CardPaint,
 ) -> gpui_kit::AnyElement {
     let zoom = camera.zoom;
     let origin = node.position_point();
@@ -1353,26 +1686,39 @@ fn card_element(
     let summary = node.summary();
     let inputs = node.input_ports();
     let output = node.output_port();
+    let rows = inputs.len().max(usize::from(output.is_some())).max(1);
+    let accent = node
+        .def()
+        .map(|def| group_color(def.group, &paint.chart))
+        .unwrap_or(paint.muted);
     let pulse = if dot_kind == Dot::Running && !reduced_motion {
-        let wave = (Instant::now().elapsed().as_secs_f32() * 5.0).sin().abs();
-        0.35 + 0.65 * wave
+        let wave = (Instant::now().elapsed().as_secs_f32() * 4.0).sin().abs();
+        0.45 + 0.55 * wave
     } else {
         1.0
     };
     let dot = match dot_kind {
-        Dot::Success => success,
-        Dot::Warning => warning,
-        Dot::Danger => danger,
-        Dot::Running => primary,
-        Dot::Muted => muted,
+        Dot::Success => paint.success,
+        Dot::Warning => paint.warning,
+        Dot::Danger => paint.danger,
+        Dot::Running => paint.primary,
+        Dot::Muted => paint.muted.opacity(0.55),
     }
     .opacity(pulse);
-    let bg = if selected {
-        primary.opacity(0.12)
+    let border_color = if dot_kind == Dot::Danger {
+        paint.danger
+    } else if selected {
+        paint.primary
+    } else if hovered {
+        paint.fg.opacity(0.28)
     } else {
-        card
+        paint.border
     };
-    let border_color = if selected { primary } else { border };
+    let bg = if selected || hovered || dragging {
+        paint.raised
+    } else {
+        paint.card
+    };
 
     div()
         .id(SharedString::from(format!("card-{id}")))
@@ -1382,12 +1728,26 @@ fn card_element(
         .w(width)
         .flex()
         .flex_col()
-        .gap_0()
-        .p(px(8.0 * zoom))
-        .rounded(radius)
+        .rounded(paint.radius)
         .bg(bg)
         .border_1()
         .border_color(border_color)
+        .shadow(card_shadow(dragging, paint.fg))
+        .overflow_hidden()
+        .on_hover({
+            let entity = entity.clone();
+            let id = id.clone();
+            move |over, _, cx| {
+                entity.update(cx, |this, cx| {
+                    if *over {
+                        this.hovered = Some(id.clone());
+                    } else if this.hovered.as_deref() == Some(id.as_str()) {
+                        this.hovered = None;
+                    }
+                    cx.notify();
+                });
+            }
+        })
         .on_mouse_down(MouseButton::Left, {
             let entity = entity.clone();
             let id = id.clone();
@@ -1398,92 +1758,337 @@ fn card_element(
         })
         .child(
             div()
+                .h(px(layout::HEADER * zoom))
+                .mt(px(layout::PAD_Y * zoom))
+                .px(px(10.0 * zoom))
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .child(div().text_sm().text_color(fg).child(title))
-                .child(div().size(px(8.0 * zoom)).rounded_full().bg(dot)),
+                .gap(px(8.0 * zoom))
+                .child(
+                    div()
+                        .w(px(3.0 * zoom))
+                        .h(px(14.0 * zoom))
+                        .rounded(px(2.0))
+                        .bg(accent),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .text_sm()
+                        .text_color(paint.fg)
+                        .child(title),
+                )
+                .child(div().size(px(7.0 * zoom)).rounded_full().bg(dot)),
         )
         .child(
             div()
+                .h(px(layout::SUMMARY * zoom))
+                .px(px(10.0 * zoom))
+                .overflow_hidden()
                 .text_xs()
-                .text_color(muted)
-                .font_family(mono)
+                .text_color(paint.muted)
+                .font_family(paint.mono.clone())
                 .child(summary),
         )
         .child({
-            let mut row = div().flex().flex_row().justify_between().mt(px(6.0 * zoom));
-            let mut inputs_col = div().flex().flex_col().gap(px(2.0 * zoom));
-            for port in &inputs {
-                let name = port.name.clone();
-                let label = format!(
-                    "{} {}",
-                    port.name,
-                    port.accepts
-                        .iter()
-                        .map(|ty| ty.as_str())
-                        .collect::<Vec<_>>()
-                        .join("|")
-                );
-                let node_id = id.clone();
-                let entity = entity.clone();
-                inputs_col = inputs_col.child(
-                    div()
-                        .id(SharedString::from(format!("in-{node_id}-{name}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .h(px(layout::PORT_ROW * zoom))
-                        .child(
-                            div()
-                                .size(px(12.0 * zoom))
-                                .rounded_full()
-                                .bg(primary)
-                                .border_1()
-                                .border_color(border),
-                        )
-                        .child(div().text_xs().text_color(muted).child(label))
-                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                            cx.stop_propagation();
-                            entity.update(cx, |this, cx| {
-                                this.port_down(&node_id, &name, Side::In, event, window, cx);
-                            });
-                        }),
-                );
+            let block = layout::PORT_ROW * rows as f32;
+            let mut column = div()
+                .relative()
+                .mb(px(layout::PAD_Y * zoom))
+                .h(px(block * zoom));
+            if inputs.len() <= 1 {
+                column = column.child(port_pair(
+                    entity.clone(),
+                    &id,
+                    inputs.first(),
+                    output.as_ref(),
+                    0.0,
+                    zoom,
+                    graph,
+                    link_from.clone(),
+                    snap_target.clone(),
+                    &paint,
+                ));
+            } else {
+                for (index, port) in inputs.iter().enumerate() {
+                    column = column.child(port_pair(
+                        entity.clone(),
+                        &id,
+                        Some(port),
+                        None,
+                        layout::PORT_ROW * index as f32,
+                        zoom,
+                        graph,
+                        link_from.clone(),
+                        snap_target.clone(),
+                        &paint,
+                    ));
+                }
+                if let Some(port) = output.as_ref() {
+                    let top = (block - layout::PORT_ROW) * 0.5;
+                    column = column.child(port_pair(
+                        entity.clone(),
+                        &id,
+                        None,
+                        Some(port),
+                        top,
+                        zoom,
+                        graph,
+                        None,
+                        None,
+                        &paint,
+                    ));
+                }
             }
-            row = row.child(inputs_col);
-            if let Some(port) = output {
-                let name = port.name.clone();
-                let label = port
-                    .accepts
-                    .iter()
-                    .map(|ty| ty.as_str())
-                    .collect::<Vec<_>>()
-                    .join("|");
-                let node_id = id.clone();
-                let entity = entity.clone();
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!("out-{node_id}-{name}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .h(px(layout::PORT_ROW * zoom))
-                        .child(div().text_xs().text_color(muted).child(label))
-                        .child(div().size(px(12.0 * zoom)).rounded_full().bg(primary))
-                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                            cx.stop_propagation();
-                            entity.update(cx, |this, cx| {
-                                this.port_down(&node_id, &name, Side::Out, event, window, cx);
-                            });
-                        }),
-                );
-            }
-            let _ = (success, warning);
-            row
+            column
         })
         .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn port_pair(
+    entity: Entity<CanvasModel>,
+    node_id: &str,
+    input: Option<&graph::PortRecord>,
+    output: Option<&graph::PortRecord>,
+    top: f32,
+    zoom: f32,
+    graph: &graph::Graph,
+    link_from: Option<(String, String)>,
+    snap_target: Option<(String, String)>,
+    paint: &CardPaint,
+) -> gpui_kit::AnyElement {
+    let node_key = node_id.to_string();
+    let mut row = div()
+        .id(SharedString::from(format!(
+            "ports-{}-{}",
+            node_key, top as i32
+        )))
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .top(px(top * zoom))
+        .h(px(layout::PORT_ROW * zoom))
+        .px(px(8.0 * zoom))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between();
+    if let Some(port) = input {
+        row = row.child(port_hit(
+            entity.clone(),
+            node_id,
+            port,
+            Side::In,
+            zoom,
+            graph,
+            link_from.clone(),
+            snap_target.clone(),
+            paint,
+        ));
+    } else {
+        row = row.child(div());
+    }
+    if let Some(port) = output {
+        row = row.child(port_hit(
+            entity,
+            node_id,
+            port,
+            Side::Out,
+            zoom,
+            graph,
+            None,
+            None,
+            paint,
+        ));
+    }
+    row.into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn port_hit(
+    entity: Entity<CanvasModel>,
+    node_id: &str,
+    port: &graph::PortRecord,
+    side: Side,
+    zoom: f32,
+    graph: &graph::Graph,
+    link_from: Option<(String, String)>,
+    snap_target: Option<(String, String)>,
+    paint: &CardPaint,
+) -> gpui_kit::AnyElement {
+    let name = port.name.clone();
+    let caption = port_caption(&port.name, &port.accepts);
+    let ty = port.accepts.first().copied().unwrap_or(TypeName::Dataframe);
+    let color = type_color(ty, &paint.chart);
+    let compatible = match (&link_from, side) {
+        (Some((from, from_port)), Side::In) => {
+            try_connect(graph, from, from_port, node_id, &port.name).is_ok()
+        }
+        _ => true,
+    };
+    let snapped = snap_target
+        .as_ref()
+        .is_some_and(|(id, port_name)| id == node_id && port_name == &port.name);
+    let dim = link_from.is_some() && side == Side::In && !compatible;
+    let dot = div()
+        .size(px(if snapped { 11.0 } else { 8.0 } * zoom))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(if dim {
+            paint.muted.opacity(0.35)
+        } else {
+            color
+        })
+        .border_1()
+        .border_color(if snapped {
+            paint.primary
+        } else {
+            color.opacity(0.45)
+        });
+    let label = div()
+        .max_w(px(78.0 * zoom))
+        .overflow_hidden()
+        .text_xs()
+        .text_color(if dim {
+            paint.muted.opacity(0.4)
+        } else {
+            paint.muted
+        })
+        .child(caption);
+    let node_id = node_id.to_string();
+    let row = div()
+        .id(SharedString::from(format!(
+            "{}-{node_id}-{name}",
+            if side == Side::In { "in" } else { "out" }
+        )))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0 * zoom))
+        .h(px(layout::PORT_ROW * zoom));
+    let row = if side == Side::In {
+        row.child(dot).child(label)
+    } else {
+        row.child(label).child(dot)
+    };
+    row.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+        cx.stop_propagation();
+        entity.update(cx, |this, cx| {
+            this.port_down(&node_id, &name, side, event, window, cx);
+        });
+    })
+    .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_element(
+    entity: Entity<CanvasModel>,
+    mark: &graph::Mark,
+    camera: Camera,
+    selected: bool,
+    fg: gpui_kit::Hsla,
+    muted: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    card: gpui_kit::Hsla,
+    primary: gpui_kit::Hsla,
+) -> gpui_kit::AnyElement {
+    let zoom = camera.zoom;
+    let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+    let size = mark.size.unwrap_or(match mark.kind {
+        MarkKind::Label | MarkKind::Note | MarkKind::Button => [168.0, 36.0],
+        MarkKind::Rectangle | MarkKind::Circle => [140.0, 88.0],
+    });
+    let id = mark.id.clone();
+    let placeholder = mark.text.is_empty();
+    let text = if placeholder {
+        match mark.kind {
+            MarkKind::Label => "Label".to_string(),
+            MarkKind::Note => "Note".to_string(),
+            MarkKind::Button => "Button".to_string(),
+            _ => String::new(),
+        }
+    } else {
+        mark.text.clone()
+    };
+    let shape = matches!(mark.kind, MarkKind::Rectangle | MarkKind::Circle);
+    let mut body = div()
+        .id(SharedString::from(format!("mark-{id}")))
+        .absolute()
+        .left(px(at.x))
+        .top(px(at.y))
+        .w(px(size[0] * zoom))
+        .h(px(size[1] * zoom))
+        .px(px(8.0 * zoom))
+        .flex()
+        .items_center()
+        .text_sm()
+        .text_color(if placeholder { muted } else { fg })
+        .when(mark.kind == MarkKind::Circle, |el| el.rounded_full())
+        .when(mark.kind == MarkKind::Rectangle, |el| el.rounded(px(8.0)))
+        .when(shape, |el| {
+            el.border_1()
+                .border_color(if selected { primary } else { border })
+                .bg(card.opacity(0.35))
+        })
+        .when(mark.kind == MarkKind::Note, |el| {
+            el.rounded(px(8.0))
+                .border_1()
+                .border_color(if selected { primary } else { border })
+                .bg(card)
+                .items_start()
+                .py(px(6.0))
+        })
+        .when(mark.kind == MarkKind::Button, |el| {
+            el.rounded(px(8.0))
+                .border_1()
+                .border_color(if selected { primary } else { border })
+                .bg(primary.opacity(0.12))
+                .justify_center()
+        })
+        .when(!text.is_empty(), |el| el.child(text))
+        .on_mouse_down(MouseButton::Left, {
+            let entity = entity.clone();
+            let id = id.clone();
+            move |event, window, cx| {
+                cx.stop_propagation();
+                entity.update(cx, |this, cx| {
+                    this.editor.raise_mark(&id);
+                    this.card_down(&id, event, window, cx);
+                });
+            }
+        });
+    if selected && mark.kind != MarkKind::Label {
+        let start = size;
+        body = body.child(
+            div()
+                .absolute()
+                .right(px(-2.0))
+                .bottom(px(-2.0))
+                .size(px(14.0 * zoom.max(0.8)))
+                .rounded(px(2.0))
+                .bg(primary)
+                .on_mouse_down(MouseButton::Left, {
+                    let entity = entity.clone();
+                    let id = id.clone();
+                    move |event, _window, cx| {
+                        cx.stop_propagation();
+                        entity.update(cx, |this, cx| {
+                            this.editor.begin_gesture();
+                            let local = this.local_of(event.position);
+                            this.drag = Some(Drag::Resize {
+                                id: id.clone(),
+                                origin_local: local,
+                                start_size: start,
+                            });
+                            cx.notify();
+                        });
+                    }
+                }),
+        );
+    }
+    body.into_any_element()
 }

@@ -1,6 +1,7 @@
 //! The Ohmypipeline window. The graph crate decides what a wire means.
 //! This crate draws it, and asks the pandas worker to run it.
 
+mod assist;
 mod chart_plot;
 mod headless;
 mod worker;

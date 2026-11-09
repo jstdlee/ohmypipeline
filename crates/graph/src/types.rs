@@ -30,6 +30,20 @@ impl TypeName {
             Self::Code => "code",
         }
     }
+
+    /// Short name drawn on a port. The wire still checks the real type.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Dataframe => "table",
+            Self::Series => "column",
+            Self::Index => "index",
+            Self::Scalar => "value",
+            Self::List => "list",
+            Self::Dict => "map",
+            Self::Ndarray => "array",
+            Self::Code => "code",
+        }
+    }
 }
 
 impl std::fmt::Display for TypeName {

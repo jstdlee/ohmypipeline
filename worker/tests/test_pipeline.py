@@ -247,6 +247,27 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(reply["rows"][0][1])
         self.assertIsNone(reply["rows"][1][0])
 
+    def test_python_named_input_receives_the_frame(self):
+        csv_path = self.tmp / "named.csv"
+        csv_path.write_text("amount\n1\n2\n3\n", encoding="utf-8")
+        code = "def run(frame):\n    return frame.head(1)\n"
+        document = graph_of(
+            [
+                node("n1", "read_csv", {"path": str(csv_path)}),
+                node(
+                    "n2",
+                    "python",
+                    {"code": code},
+                    inputs=[{"name": "frame", "accepts": ["dataframe"], "multi": False}],
+                ),
+            ],
+            [edge("n1", "n2", dst_port="frame")],
+        )
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n2"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 1)
+        self.assertEqual(reply["rows"][0][0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,8 +7,8 @@ use graph::{CARD_WIDTH, Camera, Edge, Node, Point};
 
 pub const PORT_ROW: f32 = 22.0;
 pub const HEADER: f32 = 28.0;
-pub const SUMMARY: f32 = 18.0;
-pub const PAD_Y: f32 = 10.0;
+pub const SUMMARY: f32 = 16.0;
+pub const PAD_Y: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -76,14 +76,31 @@ pub struct Cubic {
     pub to: Point,
 }
 
-/// Leaves each port horizontally. The file does not store this curve.
+/// Leaves each port along its edge. The file does not store this curve.
+///
+/// A forward wire uses a short horizontal tangent. A wire whose target sits
+/// behind the source bows through the gap instead of swinging back across
+/// the source card.
 pub fn wire_cubic(from: Point, to: Point) -> Cubic {
-    let dx = ((to.x - from.x).abs() * 0.5).max(48.0);
-    Cubic {
-        from,
-        c1: Point::new(from.x + dx, from.y),
-        c2: Point::new(to.x - dx, to.y),
-        to,
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    if dx >= 32.0 {
+        let pull = (dx * 0.45).clamp(28.0, 120.0);
+        Cubic {
+            from,
+            c1: Point::new(from.x + pull, from.y),
+            c2: Point::new(to.x - pull, to.y),
+            to,
+        }
+    } else {
+        let bow = dy.abs().clamp(48.0, 140.0);
+        let side = if dy >= 0.0 { 1.0 } else { -1.0 };
+        Cubic {
+            from,
+            c1: Point::new(from.x + 36.0, from.y + bow * 0.65 * side),
+            c2: Point::new(to.x - 36.0, to.y - bow * 0.35 * side),
+            to,
+        }
     }
 }
 
@@ -140,6 +157,14 @@ mod tests {
         assert!((second.from.x - first.from.x - 32.0).abs() < 0.1);
         assert!((second.from.y - first.from.y - 32.0).abs() < 0.1);
         assert_eq!(second.to, first.to);
+    }
+
+    #[test]
+    fn a_backward_wire_does_not_swing_across_the_source() {
+        let cubic = wire_cubic(Point::new(268.0, 80.0), Point::new(48.0, 300.0));
+        assert!(cubic.c1.x - cubic.from.x < 48.0);
+        assert!(cubic.c1.x < 320.0);
+        assert!(cubic.c2.x < cubic.from.x);
     }
 
     #[test]

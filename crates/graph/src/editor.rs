@@ -564,6 +564,22 @@ impl Document {
         Some(name)
     }
 
+    /// Replace a code block's inputs. Wires to ports that no longer exist are removed.
+    pub fn set_python_inputs(&mut self, node_id: &str, inputs: Vec<PortRecord>) {
+        let Some(node) = self.graph.node(node_id) else {
+            return;
+        };
+        if node.feature != "python" {
+            return;
+        }
+        let output = node
+            .output
+            .as_ref()
+            .and_then(|port| port.accepts.first().copied())
+            .unwrap_or(TypeName::Dataframe);
+        self.set_python_ports(node_id, inputs, output);
+    }
+
     pub fn set_python_ports(&mut self, node_id: &str, inputs: Vec<PortRecord>, output: TypeName) {
         if self.readonly {
             return;
@@ -699,6 +715,18 @@ impl Document {
         self.mutate(|graph| {
             if let Some(mark) = graph.marks.iter_mut().find(|mark| mark.id == id) {
                 mark.focus = focus;
+            }
+        });
+    }
+
+    pub fn raise_mark(&mut self, id: &str) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            if let Some(index) = graph.marks.iter().position(|mark| mark.id == id) {
+                let mark = graph.marks.remove(index);
+                graph.marks.push(mark);
             }
         });
     }
@@ -977,5 +1005,41 @@ mod tests {
         assert_eq!(doc.graph().node(&id).unwrap().param_i64("n"), Some(3));
         assert!(doc.undo());
         assert_eq!(doc.graph().node(&id).unwrap().param_i64("n"), Some(5));
+    }
+
+    #[test]
+    fn python_inputs_replace_ports_and_drop_wires_that_no_longer_fit() {
+        let mut doc = Document::new();
+        let source = doc.add_node("read_csv", Point::new(0.0, 0.0)).unwrap();
+        let code = doc.add_node("python", Point::new(240.0, 0.0)).unwrap();
+        doc.set_python_inputs(
+            &code,
+            vec![PortRecord {
+                name: "frame".into(),
+                accepts: vec![TypeName::Dataframe],
+                multi: false,
+            }],
+        );
+        doc.connect(&source, "out", &code, "frame").unwrap();
+        doc.set_python_inputs(
+            &code,
+            vec![PortRecord {
+                name: "rows".into(),
+                accepts: vec![TypeName::Dataframe],
+                multi: false,
+            }],
+        );
+        assert!(doc.graph().edges.is_empty());
+        assert_eq!(
+            doc.graph().node(&code).unwrap().input_ports()[0].name,
+            "rows"
+        );
+    }
+
+    #[test]
+    fn a_typed_run_signature_keeps_the_argument_name() {
+        let names =
+            crate::model::python_arg_names("def run(amount: object, region):\n    return amount\n");
+        assert_eq!(names, vec!["amount".to_string(), "region".to_string()]);
     }
 }
