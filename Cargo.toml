@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/graph", "crates/canvas", "crates/app", "crates/ompp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+graph = { path = "crates/graph" }
+canvas = { path = "crates/canvas" }
+app = { path = "crates/app" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

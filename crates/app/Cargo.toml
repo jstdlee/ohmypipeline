@@ -1,0 +1,18 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Ohmypipeline window: dock, inspector, preview, and chart."
+
+[dependencies]
+graph.workspace = true
+canvas = { path = "../canvas" }
+gpui-kit = "0.9"
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

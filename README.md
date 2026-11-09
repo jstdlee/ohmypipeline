@@ -21,4 +21,13 @@ The default run is a preview. Each reader stops at 10,000 rows, then the pipelin
 
 ## Status
 
-Design only. No application code yet.
+The window, the worker, and the `*.pp` file are in the tree. The release build is `aarch64-unknown-linux-gnu`. An `x86_64` build is a development convenience on machines without an ARM runner: it is not a release target, and it is not cross-compiled.
+
+```text
+cargo run -p ompp
+cargo run -p ompp -- --pipeline examples/orders.pp --input examples/orders.csv
+```
+
+The pandas worker is the `pipeline` package under `worker/`. `pandas` is pinned to the 3.1 line. Point `PYTHONPATH` at `worker/`, or set `OMPP_WORKER` to that directory. A repo-local `.venv` is used when it is present.
+
+Linux needs a session and a Vulkan driver. A loader with no device is not a run. On a machine without a GPU, Mesa lavapipe (`mesa-vulkan-drivers`) under Xvfb is enough to open the window.

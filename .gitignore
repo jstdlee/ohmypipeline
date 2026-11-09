@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 *.pp.recovery
 .DS_Store
+worker/tests/_tmp/

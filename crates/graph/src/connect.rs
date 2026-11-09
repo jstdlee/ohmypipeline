@@ -1,0 +1,420 @@
+use crate::feature::feature;
+use crate::geom::SNAP_RADIUS_PX;
+use crate::model::{Graph, Node, literal_type};
+use crate::types::TypeName;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reject {
+    Type,
+    Full,
+    Duplicate,
+    Cycle,
+}
+
+impl std::fmt::Display for Reject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Type => "type",
+            Self::Full => "full",
+            Self::Duplicate => "duplicate",
+            Self::Cycle => "cycle",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkEnd {
+    pub node: String,
+    pub port: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapCandidate {
+    pub node: String,
+    pub port: String,
+    /// Window pixels, measured after the camera.
+    pub distance_px: f32,
+    pub compatible: bool,
+}
+
+/// Nearest compatible port inside the snap radius.
+/// An incompatible port inside the radius does not win, even when it is closer.
+pub fn pick_snap(candidates: &[SnapCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.compatible && candidate.distance_px <= SNAP_RADIUS_PX)
+        .min_by(|(_, a), (_, b)| {
+            a.distance_px
+                .partial_cmp(&b.distance_px)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
+pub fn reject_message(reason: Reject, from_type: &str, to_types: &str) -> String {
+    match reason {
+        Reject::Type => format!("{from_type} cannot connect to {to_types}"),
+        Reject::Full => "that input already has a wire".to_string(),
+        Reject::Duplicate => "those ports are already connected".to_string(),
+        Reject::Cycle => "that connection would cycle".to_string(),
+    }
+}
+
+/// Types this node's output can be right now.
+///
+/// A known upstream collapses `head` and `sort` to that type. With no upstream,
+/// every type the feature declares stays possible, so a wire is allowed when
+/// any of them fits. Once the upstream is known, a mismatch is a type error.
+pub fn output_types(graph: &Graph, node_id: &str) -> Vec<TypeName> {
+    let Some(node) = graph.node(node_id) else {
+        return Vec::new();
+    };
+    if node.unknown {
+        return Vec::new();
+    }
+    match node.feature.as_str() {
+        "chart" => Vec::new(),
+        "literal" => vec![literal_type(node)],
+        "python" => node
+            .output
+            .as_ref()
+            .map(|port| port.accepts.clone())
+            .unwrap_or_else(|| vec![TypeName::Dataframe]),
+        "head" | "sort_values" | "concat" => {
+            if let Some(concrete) = same_as_input(graph, node) {
+                vec![concrete]
+            } else {
+                feature(&node.feature)
+                    .map(|def| def.possible_outputs.to_vec())
+                    .unwrap_or_default()
+            }
+        }
+        _ => feature(&node.feature)
+            .map(|def| {
+                if let Some(output) = def.output {
+                    vec![output]
+                } else {
+                    def.possible_outputs.to_vec()
+                }
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn same_as_input(graph: &Graph, node: &Node) -> Option<TypeName> {
+    let ports = node.input_ports();
+    let port = ports.first()?;
+    let incoming: Vec<_> = graph.edges_into(&node.id, &port.name).collect();
+    if incoming.len() != 1 {
+        return None;
+    }
+    let parent = &incoming[0].from;
+    let types = output_types(graph, parent);
+    if types.len() == 1 {
+        Some(types[0])
+    } else {
+        None
+    }
+}
+
+/// The single type a wire believes, when the node has one.
+pub fn produced_type(graph: &Graph, node_id: &str) -> Option<TypeName> {
+    let types = output_types(graph, node_id);
+    if types.len() == 1 {
+        Some(types[0])
+    } else {
+        None
+    }
+}
+
+pub fn would_cycle(graph: &Graph, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    reaches(graph, to, from)
+}
+
+fn reaches(graph: &Graph, start: &str, goal: &str) -> bool {
+    let mut stack = vec![start.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == goal {
+            return true;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for edge in graph.edges.iter().filter(|edge| edge.from == id) {
+            stack.push(edge.to.clone());
+        }
+    }
+    false
+}
+
+pub fn try_connect(
+    graph: &Graph,
+    from: &str,
+    from_port: &str,
+    to: &str,
+    to_port: &str,
+) -> Result<(), Reject> {
+    if graph.node(from).is_none() || graph.node(to).is_none() {
+        return Err(Reject::Type);
+    }
+    let source = graph.node(from).expect("checked");
+    let target = graph.node(to).expect("checked");
+    if source.unknown || target.unknown {
+        return Err(Reject::Type);
+    }
+    let Some(output) = source.output_port() else {
+        return Err(Reject::Type);
+    };
+    if output.name != from_port {
+        return Err(Reject::Type);
+    }
+    let Some(input) = target
+        .input_ports()
+        .into_iter()
+        .find(|port| port.name == to_port)
+    else {
+        return Err(Reject::Type);
+    };
+    let produced = output_types(graph, from);
+    if produced.is_empty() || !produced.iter().any(|ty| input.accepts.contains(ty)) {
+        return Err(Reject::Type);
+    }
+    if graph.edges.iter().any(|edge| {
+        edge.from == from && edge.from_port == from_port && edge.to == to && edge.to_port == to_port
+    }) {
+        return Err(Reject::Duplicate);
+    }
+    if !input.multi && graph.edges_into(to, to_port).next().is_some() {
+        return Err(Reject::Full);
+    }
+    if would_cycle(graph, from, to) {
+        return Err(Reject::Cycle);
+    }
+    Ok(())
+}
+
+/// A problem with an edge that is already on the graph.
+/// Moving a card does not create one. A later, more specific upstream type can.
+pub fn edge_problem(graph: &Graph, edge: &crate::model::Edge) -> Option<Reject> {
+    // Duplicate and full are about adding. An edge that is already stored
+    // is rechecked for type and cycle only.
+    let source = graph.node(&edge.from)?;
+    let target = graph.node(&edge.to)?;
+    if source.unknown || target.unknown {
+        return Some(Reject::Type);
+    }
+    let input = target
+        .input_ports()
+        .into_iter()
+        .find(|port| port.name == edge.to_port)?;
+    let produced = output_types(graph, &edge.from);
+    if produced.is_empty() || !produced.iter().any(|ty| input.accepts.contains(ty)) {
+        return Some(Reject::Type);
+    }
+    if would_cycle_existing(graph, edge) {
+        return Some(Reject::Cycle);
+    }
+    None
+}
+
+fn would_cycle_existing(graph: &Graph, edge: &crate::model::Edge) -> bool {
+    // Ignore this edge, then ask if `to` already reaches `from`.
+    let mut stack = vec![edge.to.clone()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == edge.from {
+            return true;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for next in graph
+            .edges
+            .iter()
+            .filter(|other| other.from == id && other.id != edge.id)
+        {
+            stack.push(next.to.clone());
+        }
+    }
+    false
+}
+
+pub fn type_pair_label(graph: &Graph, from: &str, to: &str, to_port: &str) -> (String, String) {
+    let from_label = output_types(graph, from)
+        .into_iter()
+        .map(|ty| ty.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    let to_label = graph
+        .node(to)
+        .and_then(|node| {
+            node.input_ports()
+                .into_iter()
+                .find(|port| port.name == to_port)
+        })
+        .map(|port| {
+            port.accepts
+                .iter()
+                .map(|ty| ty.to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default();
+    (
+        if from_label.is_empty() {
+            "nothing".to_string()
+        } else {
+            from_label
+        },
+        if to_label.is_empty() {
+            "nothing".to_string()
+        } else {
+            to_label
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Point;
+    use crate::model::Node;
+
+    fn node(id: &str, feature: &str) -> Node {
+        Node::new(id, feature, Point::new(0.0, 0.0))
+    }
+
+    #[test]
+    fn series_into_change_headers_is_rejected() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "column"));
+        graph.nodes.push(node("n2", "change_headers"));
+        let err = try_connect(&graph, "n1", "out", "n2", "in").unwrap_err();
+        assert_eq!(err, Reject::Type);
+    }
+
+    #[test]
+    fn column_output_is_accepted_by_a_series_port() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "column"));
+        graph.nodes.push(node("n2", "to_frame"));
+        assert!(try_connect(&graph, "n1", "out", "n2", "in").is_ok());
+        assert_eq!(produced_type(&graph, "n1"), Some(TypeName::Series));
+    }
+
+    #[test]
+    fn a_second_wire_into_a_single_input_is_full() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "read_csv"));
+        graph.nodes.push(node("n2", "read_csv"));
+        graph.nodes.push(node("n3", "head"));
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n3", "in"));
+        assert_eq!(
+            try_connect(&graph, "n2", "out", "n3", "in").unwrap_err(),
+            Reject::Full
+        );
+    }
+
+    #[test]
+    fn the_same_ports_cannot_be_linked_twice() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "read_csv"));
+        graph.nodes.push(node("n2", "head"));
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n2", "in"));
+        assert_eq!(
+            try_connect(&graph, "n1", "out", "n2", "in").unwrap_err(),
+            Reject::Duplicate
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_rejected() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "head"));
+        graph.nodes.push(node("n2", "head"));
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n2", "in"));
+        assert_eq!(
+            try_connect(&graph, "n2", "out", "n1", "in").unwrap_err(),
+            Reject::Cycle
+        );
+        assert!(would_cycle(&graph, "n1", "n1"));
+    }
+
+    #[test]
+    fn concat_accepts_a_second_wire_on_its_multi_port() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "read_csv"));
+        graph.nodes.push(node("n2", "read_csv"));
+        graph.nodes.push(node("n3", "concat"));
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n3", "in"));
+        assert!(try_connect(&graph, "n2", "out", "n3", "in").is_ok());
+    }
+
+    #[test]
+    fn one_output_may_feed_two_inputs() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "read_csv"));
+        graph.nodes.push(node("n2", "head"));
+        graph.nodes.push(node("n3", "query"));
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n2", "in"));
+        assert!(try_connect(&graph, "n1", "out", "n3", "in").is_ok());
+    }
+
+    #[test]
+    fn snap_picks_the_nearer_compatible_port() {
+        let candidates = vec![
+            SnapCandidate {
+                node: "near-bad".into(),
+                port: "in".into(),
+                distance_px: 4.0,
+                compatible: false,
+            },
+            SnapCandidate {
+                node: "far-ok".into(),
+                port: "in".into(),
+                distance_px: 11.0,
+                compatible: true,
+            },
+            SnapCandidate {
+                node: "closer-ok".into(),
+                port: "left".into(),
+                distance_px: 9.0,
+                compatible: true,
+            },
+            SnapCandidate {
+                node: "outside".into(),
+                port: "in".into(),
+                distance_px: 12.1,
+                compatible: true,
+            },
+        ];
+        let index = pick_snap(&candidates).unwrap();
+        assert_eq!(candidates[index].node, "closer-ok");
+    }
+
+    #[test]
+    fn an_incompatible_port_does_not_snap_when_nothing_compatible_is_in_range() {
+        let candidates = vec![SnapCandidate {
+            node: "bad".into(),
+            port: "in".into(),
+            distance_px: 2.0,
+            compatible: false,
+        }];
+        assert!(pick_snap(&candidates).is_none());
+    }
+}

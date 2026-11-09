@@ -1,0 +1,18 @@
+[package]
+name = "ompp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Ohmypipeline binary."
+
+[[bin]]
+name = "ompp"
+path = "src/main.rs"
+
+[dependencies]
+graph.workspace = true
+app = { path = "../app" }
+
+[lints]
+workspace = true
