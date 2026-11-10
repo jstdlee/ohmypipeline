@@ -179,6 +179,34 @@ impl Session {
         label: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.run_prepared(mode, node, stats, label, BTreeMap::new(), cx);
+    }
+
+    /// One run with values that replace the pipeline variables for this job
+    /// only. The document is left as it is.
+    pub fn run_overridden(
+        &mut self,
+        mode: RunMode,
+        overrides: BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.target_node(cx) else {
+            self.status = "select a node to run".into();
+            cx.notify();
+            return;
+        };
+        self.run_prepared(mode, node, false, None, overrides, cx);
+    }
+
+    fn run_prepared(
+        &mut self,
+        mode: RunMode,
+        node: String,
+        stats: bool,
+        label: Option<String>,
+        overrides: BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
         let (graph, base) = {
             let canvas = self.canvas.read(cx);
             let graph = canvas.editor().graph().clone();
@@ -208,7 +236,7 @@ impl Session {
             window: Some(window),
             stats,
             nodes: Vec::new(),
-            overrides: BTreeMap::new(),
+            overrides,
         };
         self.generation = generation;
         self.mode = mode;
@@ -738,6 +766,8 @@ impl Workspace {
                 | Some("rename")
                 | Some("calc")
                 | Some("library")
+                | Some("loop")
+                | Some("branch")
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
@@ -746,12 +776,7 @@ impl Workspace {
         // first layers, big-out on the whole 400 node graph.
         let keep_camera = matches!(
             options.demo.as_deref(),
-            Some("zoom")
-                | Some("zoom-in")
-                | Some("toolbar")
-                | Some("minimap")
-                | Some("big")
-                | Some("big-out")
+            Some("zoom") | Some("zoom-in") | Some("toolbar") | Some("minimap") | Some("big")
         );
         let session = workspace.session.clone();
         window.on_next_frame(move |window, _cx| {
@@ -762,7 +787,9 @@ impl Workspace {
                 session.update(cx, |session, cx| {
                     let empty = session.canvas.read(cx).editor().graph().nodes.is_empty();
                     if !empty {
-                        session.canvas.update(cx, |canvas, cx| canvas.fit_all(cx));
+                        session
+                            .canvas
+                            .update(cx, |canvas, cx| canvas.fit_all_quiet(cx));
                     }
                 });
             });
@@ -799,6 +826,26 @@ impl Workspace {
         // The search demo opens the popover as if a wire from the last node's
         // output was dropped on empty canvas, two frames in so the camera
         // fit has already happened.
+        if options.demo.as_deref() == Some("zoom") {
+            let session = workspace.session.clone();
+            window.on_next_frame(move |window, _cx| {
+                window.on_next_frame(move |_window, cx| {
+                    session.update(cx, |session, cx| {
+                        session
+                            .canvas
+                            .update(cx, |canvas, cx| canvas.pin_zoom_centered(0.42, cx));
+                    });
+                });
+            });
+        }
+        if options.demo.as_deref() == Some("run-dialog") {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    crate::run_dialog::open(this.session.clone(), window, cx);
+                });
+            });
+        }
         if options.demo.as_deref() == Some("search") {
             let session = workspace.session.clone();
             window.on_next_frame(move |window, _cx| {
@@ -1478,6 +1525,17 @@ impl Workspace {
                     .loading(running && mode == RunMode::Preview)
                     .tooltip_with_action("Run preview", &RunPreview, None)
                     .on_click(cx.listener(|this, _, win, cx| this.run(RunMode::Preview, win, cx))),
+            )
+            .content(
+                Button::new("run-with")
+                    .small()
+                    .compact()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("Run with…")
+                    .accessibility_label("Run with…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        crate::run_dialog::open(this.session.clone(), window, cx);
+                    })),
             )
             .content(
                 Button::new("full")
@@ -2391,13 +2449,9 @@ fn load_big_demo(first: bool, canvas: &Entity<CanvasModel>, cx: &mut App) {
                 .panel_bounds()
                 .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()))
                 .unwrap_or((1400.0, 900.0));
-            let zoom = ((w - 144.0) / rect.w).min((h - 144.0) / rect.h).max(0.05);
-            let center = graph::Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
-            canvas.editor_mut().set_camera(graph::Camera {
-                x: w * 0.5 - center.x * zoom,
-                y: h * 0.5 - center.y * zoom,
-                zoom,
-            });
+            canvas
+                .editor_mut()
+                .set_camera_quiet(graph::fit_camera(w, h, rect, 72.0));
         }
         cx.notify();
     });
@@ -2457,6 +2511,43 @@ fn load_sales_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     });
 }
 
+fn load_flow_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let file = match demo {
+        "loop" => "loop.pp",
+        "branch" => "branch.pp",
+        _ => "vars.pp",
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(file);
+    let Ok(doc) = graph::Document::load(&path) else {
+        return;
+    };
+    canvas.update(cx, |canvas, cx| {
+        canvas.load_document(doc, cx);
+        let select = match demo {
+            "loop" => canvas
+                .editor()
+                .graph()
+                .nodes
+                .iter()
+                .find(|node| node.feature == "loop_end")
+                .map(|node| node.id.clone()),
+            "branch" => canvas
+                .editor()
+                .graph()
+                .nodes
+                .iter()
+                .find(|node| node.feature == "end_if")
+                .map(|node| node.id.clone()),
+            _ => None,
+        };
+        if let Some(id) = select {
+            canvas.select_only(id, cx);
+        }
+    });
+}
+
 fn load_demo(
     demo: &Option<String>,
     canvas: &Entity<CanvasModel>,
@@ -2468,6 +2559,13 @@ fn load_demo(
     };
     if demo == "states" {
         load_states_demo(canvas, cx);
+        return;
+    }
+    if matches!(
+        demo.as_str(),
+        "variables" | "run-dialog" | "loop" | "branch"
+    ) {
+        load_flow_demo(demo, canvas, cx);
         return;
     }
     if demo == "stats" {
@@ -3048,6 +3146,8 @@ fn feature_icon(id: &str) -> IconName {
         "stack" | "unstack" => IconName::Layers,
         "crosstab" | "join" | "merge_asof" => IconName::Table,
         "rolling" | "expanding" | "ewm" | "resample" | "asfreq" => IconName::Activity,
+        "loop_start" | "loop_end" => IconName::Repeat,
+        "if_switch" | "end_if" => IconName::GitBranch,
         "date_range" | "tz_localize" | "tz_convert" | "to_timedelta" => IconName::Clock,
         "cut" | "qcut" => IconName::Scissors,
         "get_dummies" | "factorize" | "wide_to_long" => IconName::Layers,
@@ -3241,6 +3341,14 @@ impl Render for GraphPanel {
                                 theme.accent,
                                 theme.accent_foreground,
                                 |canvas, cx| canvas.toggle_minimap(cx),
+                            ))
+                            .child(action_toolbar_button(
+                                &canvas,
+                                "tool-variables",
+                                IconName::Variable,
+                                "Variables",
+                                "Variables",
+                                |canvas, cx| canvas.clear_selection(cx),
                             ))
                             .child(action_toolbar_button(
                                 &canvas,
@@ -3541,6 +3649,7 @@ impl Render for ChartPanel {
                 true,
                 &node.id,
                 &log_note,
+                true,
             )
         };
         let theme_fg = cx.theme().foreground;
@@ -3889,29 +3998,21 @@ fn anchor_point(
     box_bounds: &Bounds<Pixels>,
     element: (f32, f32),
 ) -> (f32, f32) {
-    let width = box_bounds.size.width.as_f32();
-    let height = box_bounds.size.height.as_f32();
-    let (element_width, element_height) = element;
-    let point = match anchor {
-        graph::Anchor::TopStart => (x * width, y * height),
-        graph::Anchor::Top => (x * width - element_width * 0.5, y * height),
-        graph::Anchor::TopEnd => (x * width - element_width, y * height),
-        graph::Anchor::Start => (x * width, y * height - element_height * 0.5),
-        graph::Anchor::Center => (
-            x * width - element_width * 0.5,
-            y * height - element_height * 0.5,
-        ),
-        graph::Anchor::End => (x * width - element_width, y * height - element_height * 0.5),
-        graph::Anchor::BottomStart => (x * width, y * height - element_height),
-        graph::Anchor::Bottom => (x * width - element_width * 0.5, y * height - element_height),
-        graph::Anchor::BottomEnd => (x * width - element_width, y * height - element_height),
-    };
-    (point.0, point.1)
+    canvas::placed_origin(
+        anchor,
+        x,
+        y,
+        box_bounds.size.width.as_f32(),
+        box_bounds.size.height.as_f32(),
+        element.0,
+        element.1,
+    )
 }
 
 struct InspectorPanel {
     focus: FocusHandle,
     session: Entity<Session>,
+    variables: Entity<crate::variables_panel::VariablesPanel>,
     fields: Vec<InspectorField>,
     mapping: Vec<MapRow>,
     python_rows: Vec<PyRow>,
@@ -3938,9 +4039,14 @@ struct MapRow {
 impl InspectorPanel {
     fn new(session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
+        let variables = cx.new({
+            let session = session.clone();
+            |cx| crate::variables_panel::VariablesPanel::new(session, cx)
+        });
         Self {
             focus: cx.focus_handle(),
             session,
+            variables,
             fields: Vec::new(),
             mapping: Vec::new(),
             python_rows: Vec::new(),
@@ -4644,11 +4750,7 @@ impl Render for InspectorPanel {
             .selected_node()
             .cloned();
         let Some(node) = node else {
-            return div()
-                .p_3()
-                .text_color(cx.theme().muted_foreground)
-                .child("Nothing selected")
-                .into_any_element();
+            return self.variables.clone().into_any_element();
         };
         let mut body = div()
             .id("inspector")
@@ -4734,6 +4836,8 @@ impl Render for InspectorPanel {
                 "Rows".to_string()
             } else if node.feature == "isin" && field.name == "values" {
                 "Keep values".to_string()
+            } else if node.feature == "loop_start" && field.name == "name" {
+                "Variable".to_string()
             } else {
                 field_label(&field.name)
             };
@@ -4815,6 +4919,41 @@ impl Render for InspectorPanel {
                             });
                         }),
                 );
+            } else if matches!(kind, Some(graph::ParamKind::Bool)) && field.line.is_some() {
+                let current = field
+                    .line
+                    .as_ref()
+                    .map(|input| input.read(cx).value().to_string())
+                    .unwrap_or_else(|| "false".into());
+                let on = current != "false" && current != "0";
+                let mut row = div().flex().flex_row().gap_1();
+                for (label, value, picked) in [("On", "true", on), ("Off", "false", !on)] {
+                    let Some(input) = field.line.clone() else {
+                        continue;
+                    };
+                    let session = self.session.clone();
+                    let node_id = node.id.clone();
+                    let param = field.name.clone();
+                    row = row.child(
+                        Button::new(SharedString::from(format!("bool-{}-{label}", field.name)))
+                            .small()
+                            .compact()
+                            .selected(picked)
+                            .label(label.to_string())
+                            .on_click(move |_, window, cx| {
+                                input.update(cx, |state, cx| {
+                                    state.set_value(value.to_string(), window, cx);
+                                });
+                                let stored = value == "true";
+                                session.update(cx, |session, cx| {
+                                    session.canvas.update(cx, |canvas, cx| {
+                                        canvas.set_param(&node_id, &param, json!(stored), cx);
+                                    });
+                                });
+                            }),
+                    );
+                }
+                body = body.child(row);
             } else if let Some(input) = &field.line {
                 body = body.child(Input::new(input).small());
                 if matches!(kind, Some(graph::ParamKind::Column)) && !choices.is_empty() {
@@ -4860,6 +4999,44 @@ impl Render for InspectorPanel {
                         .child(help),
                 );
             }
+            let current = field
+                .line
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .or_else(|| {
+                    field
+                        .area
+                        .as_ref()
+                        .map(|area| area.read(cx).value().to_string())
+                })
+                .unwrap_or_else(|| node.param_str(&field.name));
+            if current.contains("${") {
+                let known =
+                    graph::bound_names(self.session.read(cx).canvas.read(cx).editor().graph());
+                body = body.child(crate::variables_panel::highlighted_refs(
+                    &current,
+                    &known,
+                    cx.theme().primary,
+                    cx.theme().danger,
+                    cx.theme().muted_foreground,
+                ));
+            }
+            if node.feature == "if_switch" && field.name == "condition" {
+                match graph::validate_condition(&current) {
+                    Ok(()) => {
+                        body = body.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Condition is valid."),
+                        );
+                    }
+                    Err(message) => {
+                        body = body
+                            .child(div().text_xs().text_color(cx.theme().danger).child(message));
+                    }
+                }
+            }
             let node_id = node.id.clone();
             let param = field.name.clone();
             body = body.child(
@@ -4873,6 +5050,65 @@ impl Render for InspectorPanel {
                         this.ask_model(&node_id, &param, window, cx);
                     })),
             );
+        }
+        if node.feature == "loop_start" {
+            let name = node.param_str("name");
+            let name = if name.is_empty() {
+                "loop_value".to_string()
+            } else {
+                name
+            };
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "Body: nodes between Loop start and Loop end, or nodes that use ${{{name}}}."
+                    )),
+            );
+        }
+        if node.feature == "loop_end" {
+            let pair = node.param_str("pair");
+            let label = self
+                .session
+                .read(cx)
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .node(&pair)
+                .map(|start| start.label.clone())
+                .filter(|label| !label.is_empty())
+                .unwrap_or(pair);
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Paired with"),
+                    )
+                    .child(div().text_sm().child(label)),
+            );
+        }
+        if node.feature == "if_switch" {
+            let graph = self
+                .session
+                .read(cx)
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .clone();
+            let exec = self.session.read(cx).exec.clone();
+            if let Some(branch) =
+                crate::variables_panel::active_branch(&graph, &node.id, |id| exec.is_inactive(id))
+            {
+                body = body.child(div().text_sm().child(format!("Active branch: {branch}")));
+            }
         }
         if node.feature == "python" {
             self.sync_python(&node, window, cx);
@@ -5163,6 +5399,13 @@ fn field_applies(node: &graph::Node, name: &str) -> bool {
         }
         ("apply" | "map", "code") => node.param_str("fn") == "code",
         ("apply", "axis") => node.param_str("fn") != "code",
+        ("loop_start", "pattern") => {
+            let mode = node.param_str("mode");
+            mode.is_empty() || mode == "files"
+        }
+        ("loop_start", "column") => node.param_str("mode") == "groups",
+        ("loop_start", "values") => node.param_str("mode") == "values",
+        ("loop_end", "pair") => false,
         _ => true,
     }
 }
@@ -5473,6 +5716,9 @@ fn field_label(name: &str) -> String {
         "op" => "Operation".into(),
         "axis" => "Axis".into(),
         "order" => "Order".into(),
+        "pattern" => "Pattern".into(),
+        "condition" => "Condition".into(),
+        "add_column" => "Add column".into(),
         "filter_op" => "Compare".into(),
         "filter_value" => "Threshold".into(),
         "end" => "End".into(),
@@ -5498,6 +5744,19 @@ fn field_help(feature: &str, name: &str) -> &'static str {
         ("pivot", "index") => "Row labels of the pivot.",
         ("pivot", "columns") => "The column that becomes the new headers.",
         ("pivot", "values") => "Numbers to aggregate.",
+        ("loop_start", "mode") => {
+            "files reads a glob, groups splits a column, values walks a list."
+        }
+        ("loop_start", "pattern") => "Glob relative to the pipeline, such as loop/*.csv.",
+        ("loop_start", "column") => "The column whose values the loop walks.",
+        ("loop_start", "values") => "A comma-separated list, or one ${variable}.",
+        ("loop_start", "name") => {
+            "The name the body reads, as ${name}. ${loop_index} counts from zero."
+        }
+        ("loop_end", "add_column") => "Add a column of the loop value on each collected row.",
+        ("if_switch", "condition") => {
+            "Compare variables, rows, or columns. For example ${mode} == \"full\"."
+        }
         (_, "skip_rows") => "Lines to discard before the header. For SQLite, rows to skip.",
         (_, "header_row") => "Which remaining row is the header. 0 is the first.",
         (_, "header") => "Use a header row, or treat every row as data.",

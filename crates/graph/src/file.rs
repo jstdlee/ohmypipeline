@@ -87,7 +87,7 @@ fn is_swatch(swatch: &str) -> bool {
 }
 
 /// Identifiers a `${name}` reference can use.
-pub(crate) fn is_variable_name(name: &str) -> bool {
+pub fn is_variable_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some('a'..='z') | Some('A'..='Z') | Some('_') => {}

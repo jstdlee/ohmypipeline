@@ -536,7 +536,14 @@ impl Node {
                         .unwrap_or(path)
                 }
             }
-            "head" => format!("n={}", self.param_i64("n").unwrap_or(5)),
+            "head" => {
+                let raw = self.param_str("n");
+                if raw.contains("${") {
+                    format!("n={raw}")
+                } else {
+                    format!("n={}", self.param_i64("n").unwrap_or(5))
+                }
+            }
             "change_headers" => mapping_summary(self.params.get(HEADER_PAIRS)),
             "query" => {
                 let expr = self.param_str("expr");

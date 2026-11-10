@@ -180,6 +180,12 @@ impl Document {
         self.dirty = true;
     }
 
+    /// A camera the window chose while opening. It is saved with the next
+    /// real edit, and it does not mark the document dirty by itself.
+    pub fn set_camera_quiet(&mut self, camera: crate::geom::Camera) {
+        self.graph.camera = camera;
+    }
+
     pub fn load(path: &Path) -> Result<Self, FileError> {
         let graph = file::load_path(path)?;
         Ok(Self {
@@ -1033,10 +1039,10 @@ impl Document {
         });
     }
 
-    /// Window layout only. It marks the document dirty but writes no undo step.
+    /// Window layout only. The view stays in memory for the next save and
+    /// writes no undo step. Resizing a dock does not mark the document dirty.
     pub fn set_view(&mut self, view: crate::model::View) {
         self.graph.view = view;
-        self.dirty = true;
     }
 
     pub fn paste_copies(
@@ -1540,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn set_view_marks_dirty_but_writes_no_undo_step() {
+    fn set_view_keeps_the_document_clean_and_writes_no_undo_step() {
         let mut doc = Document::from_graph(Graph::default());
         assert!(!doc.is_dirty());
         assert!(!doc.can_undo());
@@ -1548,7 +1554,7 @@ mod tests {
             minimap: true,
             ..crate::model::View::default()
         });
-        assert!(doc.is_dirty());
+        assert!(!doc.is_dirty(), "a dock change is not an edit");
         assert!(!doc.can_undo());
         doc.undo();
         assert!(doc.graph().view.minimap, "undo must not revert the view");

@@ -76,12 +76,95 @@ fn scan_refs(text: &str, refs: &mut BTreeSet<String>) {
 }
 
 fn is_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
+    crate::file::is_variable_name(name)
+}
+
+/// One slice of a parameter string. `variable` is set when the slice is a
+/// `${name}` reference the user wrote, not a `$${` escape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextPiece {
+    pub text: String,
+    pub variable: Option<String>,
+}
+
+/// Splits `text` into literal runs and `${name}` references. `$${` becomes a
+/// literal `${` and is not a reference.
+pub fn split_references(text: &str) -> Vec<TextPiece> {
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut rest = text;
+    let push_literal = |literal: &mut String, pieces: &mut Vec<TextPiece>| {
+        if !literal.is_empty() {
+            pieces.push(TextPiece {
+                text: std::mem::take(literal),
+                variable: None,
+            });
+        }
+    };
+    loop {
+        let Some(index) = rest.find('$') else {
+            literal.push_str(rest);
+            break;
+        };
+        literal.push_str(&rest[..index]);
+        let tail = &rest[index..];
+        if let Some(after) = tail.strip_prefix("$${") {
+            literal.push_str("${");
+            rest = after;
+            continue;
+        }
+        if !tail.starts_with("${") {
+            literal.push('$');
+            rest = &tail[1..];
+            continue;
+        }
+        let Some(close) = tail[2..].find('}') else {
+            literal.push_str(tail);
+            break;
+        };
+        let name = &tail[2..2 + close];
+        if !is_ident(name) {
+            literal.push_str("${");
+            rest = &tail[2..];
+            continue;
+        }
+        push_literal(&mut literal, &mut pieces);
+        pieces.push(TextPiece {
+            text: format!("${{{name}}}"),
+            variable: Some(name.to_string()),
+        });
+        rest = &tail[2 + close + 1..];
     }
-    chars.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+    push_literal(&mut literal, &mut pieces);
+    pieces
+}
+
+/// Names a `${}` reference can resolve: declared variables, plus `loop_index`
+/// and each loop start's own name.
+pub fn bound_names(graph: &crate::model::Graph) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = graph
+        .variables
+        .iter()
+        .map(|variable| variable.name.clone())
+        .collect();
+    for node in &graph.nodes {
+        if node.feature != "loop_start" {
+            continue;
+        }
+        let name = node.param_str("name");
+        names.insert(if name.is_empty() {
+            "loop_value".to_string()
+        } else {
+            name
+        });
+        names.insert("loop_index".to_string());
+    }
+    names
+}
+
+/// Text form of a variable value, for an input that edits it.
+pub fn value_text_of(value: &Value) -> String {
+    value_text(value)
 }
 
 /// Replaces `${name}` with the value as text. `$${` escapes to a literal `${`.
@@ -346,5 +429,28 @@ mod tests {
         graph.variables[0].value = json!("other.csv");
         assert_ne!(dependency_key(&graph, "n2"), user_before);
         assert_eq!(dependency_key(&graph, "m2"), plain_before);
+    }
+
+    #[test]
+    fn split_references_keeps_literals_and_escapes() {
+        let pieces = split_references("hello ${name} and $${rows}");
+        assert_eq!(
+            pieces,
+            vec![
+                TextPiece {
+                    text: "hello ".into(),
+                    variable: None,
+                },
+                TextPiece {
+                    text: "${name}".into(),
+                    variable: Some("name".into()),
+                },
+                TextPiece {
+                    text: " and ${rows}".into(),
+                    variable: None,
+                },
+            ]
+        );
+        assert!(split_references("${not a var}")[0].variable.is_none());
     }
 }

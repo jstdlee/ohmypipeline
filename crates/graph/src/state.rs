@@ -163,6 +163,10 @@ impl ExecState {
         self.inactive = ids.iter().cloned().collect();
     }
 
+    pub fn is_inactive(&self, id: &str) -> bool {
+        self.inactive.contains(id)
+    }
+
     /// Forgets `id` and everything downstream of it.
     pub fn reset(&mut self, graph: &Graph, id: &str) {
         let mut gone = vec![id.to_string()];

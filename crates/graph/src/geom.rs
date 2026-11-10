@@ -6,7 +6,7 @@ pub const GRID_PX: f32 = 16.0;
 /// Window pixels. Measured after the camera, so zoom does not change the grab.
 pub const SNAP_RADIUS_PX: f32 = 12.0;
 
-const ZOOM_MIN: f32 = 0.25;
+const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 2.5;
 
 /// `window = canvas * zoom + camera`. `x` and `y` are the window position of the canvas origin.
@@ -166,5 +166,17 @@ mod tests {
         let far = camera.to_window(Point::new(bounds.x + bounds.w, bounds.y + bounds.h));
         assert!(origin.x >= 19.0 && origin.y >= 19.0);
         assert!(far.x <= 781.0 && far.y <= 381.0);
+    }
+
+    #[test]
+    fn fit_zooms_out_to_a_tenth_for_a_graph_that_would_not_fit() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 8000.0,
+            h: 4000.0,
+        };
+        let camera = fit_camera(800.0, 600.0, bounds, 72.0);
+        assert!((camera.zoom - 0.1).abs() < 1e-4);
     }
 }

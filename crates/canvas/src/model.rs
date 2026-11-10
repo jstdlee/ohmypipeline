@@ -19,13 +19,14 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px,
 };
 use graph::{
-    Camera, Document, Edge, Frame, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX, SnapCandidate,
-    TypeName, card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
+    Camera, Document, Edge, Frame, MarkKind, Node, Point, Presentation, Reject, SNAP_RADIUS_PX,
+    SnapCandidate, TypeName, bound_names, card_width, output_types, pick_snap, reject_message,
+    split_references, try_connect, type_pair_label,
 };
 
 use crate::layout::{self, Detail, Side, card_height, port_slots};
 use crate::motion;
-use crate::plot::{feature_chart, points_from};
+use crate::plot::{feature_chart, legend_entries, placed_origin, points_from};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -120,12 +121,33 @@ struct WirePaint {
     reroutes: Vec<Point>,
     path: Arc<Vec<layout::Cubic>>,
     source_color: gpui_kit::Hsla,
+    /// An inactive branch: drawn thin and faint.
+    dim: bool,
+}
+
+/// A title or legend drag on a chart card. The document changes once, on mouse up.
+#[derive(Clone)]
+struct LabelDrag {
+    node: String,
+    title: bool,
+    origin: (f32, f32),
+    live: (f32, f32),
+    start: GPoint<Pixels>,
+}
+
+#[derive(Clone, Default)]
+struct ChartMetric {
+    plot: Option<Bounds<Pixels>>,
+    title: Option<(f32, f32)>,
+    legend: Option<(f32, f32)>,
 }
 
 struct CameraAnim {
     from: Camera,
     to: Camera,
     started: Instant,
+    /// Opening a document frames the graph without marking it dirty.
+    quiet: bool,
 }
 
 #[derive(Clone)]
@@ -314,6 +336,12 @@ pub struct CanvasModel {
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
     wire_cache: HashMap<String, CachedWire>,
+    /// Live drag of a chart card's title or legend.
+    label_drag: Option<LabelDrag>,
+    /// Which chart label the pointer is over, for the hover outline.
+    label_hover: Option<(String, bool)>,
+    /// Plot box and label sizes, filled while the card paints.
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
 }
 
 impl CanvasModel {
@@ -371,6 +399,9 @@ impl CanvasModel {
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
             wire_cache: HashMap::new(),
+            label_drag: None,
+            label_hover: None,
+            chart_metrics: Rc::new(RefCell::new(BTreeMap::new())),
         }
         .with_focus(window)
     }
@@ -517,7 +548,7 @@ impl CanvasModel {
             self.settle = None;
             self.badge_fade.clear();
             if let Some(anim) = self.camera_anim.take() {
-                self.editor.set_camera(anim.to);
+                self.place_camera(anim.to, anim.quiet);
             }
         }
         cx.notify();
@@ -565,6 +596,41 @@ impl CanvasModel {
             .find_map(|id| self.editor.graph().node(id))
     }
 
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.selection.clear();
+        cx.emit(CanvasEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    /// Park the camera at `zoom`, with the graph centered in the viewport.
+    pub fn pin_zoom_centered(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.viewport.borrow() else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .editor
+            .graph()
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        let Some(rect) = graph::bounds_of(self.editor.graph(), &ids, card_height) else {
+            return;
+        };
+        let center = Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        self.camera_anim = None;
+        self.editor.set_camera(Camera {
+            zoom,
+            x: bounds.size.width.as_f32() * 0.5 - center.x * zoom,
+            y: bounds.size.height.as_f32() * 0.5 - center.y * zoom,
+        });
+        cx.emit(CanvasEvent::Edited);
+        cx.notify();
+    }
+
     pub fn add_feature(&mut self, feature: &str, cx: &mut Context<Self>) -> Option<String> {
         let origin = self.local_origin();
         let at = self
@@ -572,6 +638,24 @@ impl CanvasModel {
             .graph()
             .camera
             .to_canvas(Point::new(origin.0, origin.1));
+        // A loop is a pair. The end lands 400px to the right of the start.
+        if feature == "loop_start" {
+            let at = if let Some(selected) = self.selected_node() {
+                Point::new(
+                    selected.position[0] + card_width(&selected.feature) + 48.0,
+                    selected.position[1],
+                )
+            } else {
+                at
+            };
+            let (start, _) = self.editor.add_loop(at)?;
+            self.selection = vec![start.clone()];
+            self.enter_node(&start);
+            self.changed(cx);
+            cx.emit(CanvasEvent::FocusInspector);
+            cx.emit(CanvasEvent::SelectionChanged);
+            return Some(start);
+        }
         let id = if let Some(selected) = self.selected_node().map(|node| node.id.clone()) {
             self.editor.add_after(&selected, feature)
         } else {
@@ -901,14 +985,19 @@ impl CanvasModel {
     }
 
     pub fn fit_all(&mut self, cx: &mut Context<Self>) {
-        self.fit_ids(false, cx);
+        self.fit_ids(false, false, cx);
+    }
+
+    /// Frame the graph the way an open does: no dirty mark.
+    pub fn fit_all_quiet(&mut self, cx: &mut Context<Self>) {
+        self.fit_ids(false, true, cx);
     }
 
     pub fn fit(&mut self, cx: &mut Context<Self>) {
-        self.fit_ids(true, cx);
+        self.fit_ids(true, false, cx);
     }
 
-    fn fit_ids(&mut self, selection_only: bool, cx: &mut Context<Self>) {
+    fn fit_ids(&mut self, selection_only: bool, quiet: bool, cx: &mut Context<Self>) {
         let bounds = self
             .viewport
             .borrow()
@@ -930,7 +1019,7 @@ impl CanvasModel {
         let Some(rect) = graph::bounds_of(self.editor.graph(), &ids, card_height) else {
             return;
         };
-        self.animate_camera(graph::fit_camera(w, h, rect, 72.0), cx);
+        self.animate_camera(graph::fit_camera(w, h, rect, 72.0), quiet, cx);
     }
 
     pub fn zoom_by(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -1153,7 +1242,7 @@ impl CanvasModel {
         if let Some((w, h)) = view {
             let rect = graph::bounds_of(self.editor.graph(), &ids, card_height);
             if let Some(rect) = rect {
-                self.animate_camera(graph::fit_camera(w, h, rect, 72.0), cx);
+                self.animate_camera(graph::fit_camera(w, h, rect, 72.0), false, cx);
             }
         }
         self.changed(cx);
@@ -1224,7 +1313,7 @@ impl CanvasModel {
             zoom,
         };
         if animate {
-            self.animate_camera(camera, cx);
+            self.animate_camera(camera, false, cx);
         } else {
             self.camera_anim = None;
             self.editor.set_camera(camera);
@@ -1649,7 +1738,134 @@ impl CanvasModel {
         cx.notify();
     }
 
+    /// Press on a chart card's title or legend. The card itself must not move.
+    pub fn chart_label_down(
+        &mut self,
+        node: &str,
+        title: bool,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        cx.stop_propagation();
+        if event.click_count >= 2 {
+            self.label_drag = None;
+            self.reset_chart_label(node, title, cx);
+            return;
+        }
+        if self.editor.is_readonly() {
+            return;
+        }
+        let presentation = self
+            .editor
+            .graph()
+            .node(node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        let origin = if title {
+            (presentation.title.x, presentation.title.y)
+        } else {
+            (presentation.legend.x, presentation.legend.y)
+        };
+        self.label_drag = Some(LabelDrag {
+            node: node.to_string(),
+            title,
+            origin,
+            live: origin,
+            start: event.position,
+        });
+        cx.notify();
+    }
+
+    pub fn chart_label_hover(
+        &mut self,
+        node: &str,
+        title: bool,
+        over: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = over.then(|| (node.to_string(), title));
+        if self.label_hover != next {
+            self.label_hover = next;
+            cx.notify();
+        }
+    }
+
+    fn move_chart_label(&mut self, at: GPoint<Pixels>) {
+        let Some(drag) = self.label_drag.clone() else {
+            return;
+        };
+        let metric = self
+            .chart_metrics
+            .borrow()
+            .get(&drag.node)
+            .cloned()
+            .unwrap_or_default();
+        let Some(plot) = metric.plot else {
+            return;
+        };
+        let width = plot.size.width.as_f32().max(1.0);
+        let height = plot.size.height.as_f32().max(1.0);
+        let dx = (at.x - drag.start.x).as_f32();
+        let dy = (at.y - drag.start.y).as_f32();
+        let live = (
+            (drag.origin.0 + dx / width).clamp(0.0, 1.0),
+            (drag.origin.1 + dy / height).clamp(0.0, 1.0),
+        );
+        self.label_drag = Some(LabelDrag { live, ..drag });
+    }
+
+    fn commit_chart_label(&mut self, drag: &LabelDrag, cx: &mut Context<Self>) {
+        let mut next = self
+            .editor
+            .graph()
+            .node(&drag.node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        if drag.title {
+            next.title.x = drag.live.0;
+            next.title.y = drag.live.1;
+        } else {
+            next.legend.x = drag.live.0;
+            next.legend.y = drag.live.1;
+        }
+        let node = drag.node.clone();
+        self.editor.set_presentation(&node, next);
+        self.changed(cx);
+    }
+
+    fn reset_chart_label(&mut self, node: &str, title: bool, cx: &mut Context<Self>) {
+        if self.editor.is_readonly() {
+            return;
+        }
+        let mut next = self
+            .editor
+            .graph()
+            .node(node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        let fresh = Presentation::default();
+        if title {
+            next.title.x = fresh.title.x;
+            next.title.y = fresh.title.y;
+            next.title.anchor = fresh.title.anchor;
+        } else {
+            next.legend.x = fresh.legend.x;
+            next.legend.y = fresh.legend.y;
+            next.legend.anchor = fresh.legend.anchor;
+        }
+        self.editor.set_presentation(node, next);
+        self.changed(cx);
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.label_drag.is_some() {
+            self.move_chart_label(event.position);
+            cx.notify();
+            return;
+        }
         let local = self.local_of(event.position);
         let Some(mut drag) = self.drag.clone() else {
             self.track_hover(local, cx);
@@ -1784,6 +2000,13 @@ impl CanvasModel {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.label_drag.is_some() {
+            self.move_chart_label(event.position);
+            if let Some(drag) = self.label_drag.take() {
+                self.commit_chart_label(&drag, cx);
+            }
+            return;
+        }
         let local = self.local_of(event.position);
         self.minimap_drag = false;
         let drag = self.drag.take();
@@ -2195,7 +2418,7 @@ impl CanvasModel {
         });
     }
 
-    fn animate_camera(&mut self, to: Camera, cx: &mut Context<Self>) {
+    fn animate_camera(&mut self, to: Camera, quiet: bool, cx: &mut Context<Self>) {
         let from = self.editor.graph().camera;
         if self.reduced_motion
             || ((from.x - to.x).abs() < 0.5
@@ -2203,8 +2426,10 @@ impl CanvasModel {
                 && (from.zoom - to.zoom).abs() < 0.001)
         {
             self.camera_anim = None;
-            self.editor.set_camera(to);
-            cx.emit(CanvasEvent::Edited);
+            self.place_camera(to, quiet);
+            if !quiet {
+                cx.emit(CanvasEvent::Edited);
+            }
             cx.notify();
             return;
         }
@@ -2212,8 +2437,17 @@ impl CanvasModel {
             from,
             to,
             started: Instant::now(),
+            quiet,
         });
         cx.notify();
+    }
+
+    fn place_camera(&mut self, camera: Camera, quiet: bool) {
+        if quiet {
+            self.editor.set_camera_quiet(camera);
+        } else {
+            self.editor.set_camera(camera);
+        }
     }
 
     fn motion_active(&self) -> bool {
@@ -2240,11 +2474,15 @@ impl CanvasModel {
         if let Some(anim) = &self.camera_anim {
             let t = (anim.started.elapsed().as_secs_f32() / motion::CAMERA.as_secs_f32())
                 .clamp(0.0, 1.0);
-            self.editor.set_camera(Camera {
-                x: motion::lerp(anim.from.x, anim.to.x, t),
-                y: motion::lerp(anim.from.y, anim.to.y, t),
-                zoom: motion::lerp(anim.from.zoom, anim.to.zoom, t),
-            });
+            let quiet = anim.quiet;
+            self.place_camera(
+                Camera {
+                    x: motion::lerp(anim.from.x, anim.to.x, t),
+                    y: motion::lerp(anim.from.y, anim.to.y, t),
+                    zoom: motion::lerp(anim.from.zoom, anim.to.zoom, t),
+                },
+                quiet,
+            );
             if t >= 1.0 {
                 self.camera_anim = None;
             }
@@ -2666,6 +2904,12 @@ impl Render for CanvasModel {
         let wire_paints: Vec<WirePaint> = {
             let mut cache = std::mem::take(&mut self.wire_cache);
             let mut paints: Vec<WirePaint> = Vec::with_capacity(edges.len());
+            let inactive: std::collections::BTreeSet<String> = self
+                .badges
+                .iter()
+                .filter(|(_, badge)| matches!(badge, Badge::Inactive))
+                .map(|(id, _)| id.clone())
+                .collect();
             build_wire_paints(
                 &placed_graph.nodes,
                 &graph,
@@ -2675,6 +2919,7 @@ impl Render for CanvasModel {
                 view_rect,
                 &chart,
                 theme_muted,
+                &inactive,
                 &mut cache,
                 &mut paints,
             );
@@ -2972,6 +3217,12 @@ impl Render for CanvasModel {
                             dragging.iter().any(|id| id == &node.id),
                             link_from.clone(),
                             snap_target.clone(),
+                            self.label_drag
+                                .as_ref()
+                                .filter(|drag| drag.node == node.id)
+                                .cloned(),
+                            self.label_hover.clone(),
+                            self.chart_metrics.clone(),
                             CardPaint {
                                 card: theme_card,
                                 raised: theme_raised,
@@ -3476,6 +3727,8 @@ fn paint_scene(
         }
     }
 
+    paint_loop_pairs(origin, camera, nodes, primary, window);
+
     // Wires paint behind the frames, cards, and marks. Frames arrive as
     // translucent element layers above this scene.
     for wire in wires {
@@ -3485,6 +3738,8 @@ fn paint_scene(
         let base = wire.source_color.opacity(if selected { 1.0 } else { 0.85 });
         let (color, width) = if hinted {
             (primary, 2.5)
+        } else if wire.dim {
+            (wire.source_color.opacity(0.35), 1.0)
         } else if selected {
             (wire.source_color, 1.75)
         } else {
@@ -3562,6 +3817,7 @@ fn build_wire_paints(
     viewport: Option<graph::Rect>,
     chart: &[gpui_kit::Hsla; 6],
     muted: gpui_kit::Hsla,
+    inactive: &std::collections::BTreeSet<String>,
     cache: &mut HashMap<String, CachedWire>,
     out: &mut Vec<WirePaint>,
 ) {
@@ -3592,15 +3848,34 @@ fn build_wire_paints(
             }
         };
         let rect = crate::perf::chain_window_box(&chain, camera);
+        let dim = wire_is_dim(graph, edge, inactive);
         let Some(view) = view else {
-            out.push(wire_paint(edge, chain, key, graph, chart, muted));
+            out.push(wire_paint(edge, chain, key, graph, chart, muted, dim));
             continue;
         };
         if !crate::perf::rects_intersect(rect, view) {
             continue;
         }
-        out.push(wire_paint(edge, chain, key, graph, chart, muted));
+        out.push(wire_paint(edge, chain, key, graph, chart, muted, dim));
     }
+}
+
+/// A wire on the inactive side of a branch, or a wire whose both ends are
+/// inactive, draws faint.
+fn wire_is_dim(
+    graph: &graph::Graph,
+    edge: &Edge,
+    inactive: &std::collections::BTreeSet<String>,
+) -> bool {
+    let source = inactive.contains(&edge.from);
+    let target = inactive.contains(&edge.to);
+    if source && target {
+        return true;
+    }
+    target
+        && graph
+            .node(&edge.from)
+            .is_some_and(|node| node.feature == "if_switch")
 }
 
 fn wire_paint(
@@ -3610,6 +3885,7 @@ fn wire_paint(
     graph: &graph::Graph,
     chart: &[gpui_kit::Hsla; 6],
     muted: gpui_kit::Hsla,
+    dim: bool,
 ) -> WirePaint {
     let source_color = output_types(graph, &edge.from)
         .into_iter()
@@ -3621,7 +3897,46 @@ fn wire_paint(
         reroutes: key.reroutes,
         path: chain,
         source_color,
+        dim,
     }
+}
+
+/// A 1px accent line at 30% opacity between a loop start and its paired end.
+fn paint_loop_pairs(
+    origin: GPoint<Pixels>,
+    camera: Camera,
+    nodes: &[Node],
+    accent: gpui_kit::Hsla,
+    window: &mut Window,
+) {
+    for end in nodes.iter().filter(|node| node.feature == "loop_end") {
+        let pair = end.param_str("pair");
+        let Some(start) = nodes
+            .iter()
+            .find(|node| node.id == pair && node.feature == "loop_start")
+        else {
+            continue;
+        };
+        let from = header_center(start);
+        let to = header_center(end);
+        let map = |at: Point| {
+            let window_point = camera.to_window(at);
+            origin + point(px(window_point.x), px(window_point.y))
+        };
+        let mut path = gpui_kit::PathBuilder::stroke(px(1.0));
+        path.move_to(map(from));
+        path.line_to(map(to));
+        if let Ok(path) = path.build() {
+            window.paint_path(path, accent.opacity(0.3));
+        }
+    }
+}
+
+fn header_center(node: &Node) -> Point {
+    Point::new(
+        node.position[0] + card_width(&node.feature) * 0.5,
+        node.position[1] + layout::PAD_Y + layout::HEADER * 0.5,
+    )
 }
 
 fn output_types_first(nodes: &[Node], id: &str) -> Option<TypeName> {
@@ -3783,19 +4098,20 @@ fn card_element(
     dragging: bool,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
     paint: CardPaint,
 ) -> gpui_kit::AnyElement {
     let zoom = camera.zoom;
     let origin = node.position_point();
     let window = camera.to_window(Point::new(origin.x + offset.x, origin.y + offset.y));
     let width = px(card_width(&node.feature) * zoom);
+    let height = px(layout::card_height(node) * zoom);
     let detail = layout::detail_for(zoom);
     let id = node.id.clone();
     let title = node.label.clone();
     let summary = node.summary();
-    let inputs = node.input_ports();
-    let output = node.output_port();
-    let rows = inputs.len().max(usize::from(output.is_some())).max(1);
     let accent = node
         .def()
         .map(|def| group_color(def.group, &paint.chart))
@@ -3843,6 +4159,7 @@ fn card_element(
         .left(px(window.x))
         .top(px(window.y))
         .w(width)
+        .h(height)
         .flex()
         .flex_col()
         .rounded(paint.radius)
@@ -3877,82 +4194,55 @@ fn card_element(
         });
     card = match detail {
         Detail::Title => {
-            // One bold title, always 13 screen px so a distant card keeps its name.
-            // Port dots stay at the layout offsets, so wires still end on ports.
-            let block = layout::PORT_ROW * rows as f32;
-            let port_top = (layout::PAD_Y + layout::HEADER + layout::SUMMARY) * zoom;
-            let mut column = div()
-                .absolute()
-                .left(px(0.0))
-                .right(px(0.0))
-                .top(px(port_top))
-                .h(px(block * zoom));
-            if inputs.len() <= 1 {
-                column = column.child(port_pair(
-                    entity.clone(),
-                    &id,
-                    inputs.first(),
-                    output.as_ref(),
-                    0.0,
-                    zoom,
-                    detail,
-                    graph,
-                    link_from.clone(),
-                    snap_target.clone(),
-                    &paint,
-                ));
-            } else {
-                for (index, port) in inputs.iter().enumerate() {
-                    column = column.child(port_pair(
-                        entity.clone(),
-                        &id,
-                        Some(port),
-                        None,
-                        layout::PORT_ROW * index as f32,
-                        zoom,
-                        detail,
-                        graph,
-                        link_from.clone(),
-                        snap_target.clone(),
-                        &paint,
-                    ));
-                }
-                if let Some(port) = output.as_ref() {
-                    let top = (block - layout::PORT_ROW) * 0.5;
-                    column = column.child(port_pair(
-                        entity.clone(),
-                        &id,
-                        None,
-                        Some(port),
-                        top,
-                        zoom,
-                        detail,
-                        graph,
-                        None,
-                        None,
-                        &paint,
-                    ));
-                }
+            // The glyph stays inside the card. Under 8px tall there is no title.
+            let on_screen = layout::card_height(node) * zoom;
+            let column = port_column(
+                entity.clone(),
+                node,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                &paint,
+                true,
+            );
+            let mut card = card.child(column);
+            if let Some(size) = layout::title_screen_px(on_screen) {
+                card = card.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .h(px(on_screen))
+                        .px(px((4.0 * zoom).max(1.0)))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .overflow_hidden()
+                                .truncate()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_size(px(size))
+                                .line_height(px(size))
+                                .text_color(paint.fg)
+                                .child(title),
+                        ),
+                );
             }
-            let (size, line) = layout::text_with_zoom(13.0 / zoom, 1.0);
-            card.child(
-                div()
-                    .mt(px(layout::PAD_Y * zoom))
-                    .h(px((layout::HEADER * zoom).max(size.as_f32())))
-                    .px(px(10.0 * zoom))
-                    .flex()
-                    .items_center()
-                    .truncate()
-                    .font_weight(gpui_kit::FontWeight::BOLD)
-                    .text_size(size)
-                    .line_height(line)
-                    .text_color(paint.fg)
-                    .child(title),
-            )
-            .child(column)
+            card
         }
         Detail::Compact | Detail::Full => {
-            let (title_size, title_line) = layout::text_with_zoom(layout::TITLE_TEXT, zoom);
+            let (title_size, title_line) = if detail == Detail::Compact {
+                let size = layout::compact_title_px(zoom);
+                (px(size), px(size * 1.15))
+            } else {
+                layout::text_with_zoom(layout::TITLE_TEXT, zoom)
+            };
             card
                 // The summary row keeps its height in every detail so the port
                 // block and the wires stay where the layout puts them.
@@ -3995,72 +4285,32 @@ fn card_element(
                                 .line_height(line)
                                 .text_color(paint.muted)
                                 .font_family(paint.mono.clone())
-                                .child(summary)
+                                .child(reference_line(&summary, graph, &paint))
                         }),
                 )
-                .child({
-                    let block = layout::PORT_ROW * rows as f32;
-                    let mut column = div()
-                        .relative()
-                        .mb(px(layout::PAD_Y * zoom))
-                        .h(px(block * zoom));
-                    if inputs.len() <= 1 {
-                        column = column.child(port_pair(
-                            entity.clone(),
-                            &id,
-                            inputs.first(),
-                            output.as_ref(),
-                            0.0,
-                            zoom,
-                            detail,
-                            graph,
-                            link_from.clone(),
-                            snap_target.clone(),
-                            &paint,
-                        ));
-                    } else {
-                        for (index, port) in inputs.iter().enumerate() {
-                            column = column.child(port_pair(
-                                entity.clone(),
-                                &id,
-                                Some(port),
-                                None,
-                                layout::PORT_ROW * index as f32,
-                                zoom,
-                                detail,
-                                graph,
-                                link_from.clone(),
-                                snap_target.clone(),
-                                &paint,
-                            ));
-                        }
-                        if let Some(port) = output.as_ref() {
-                            let top = (block - layout::PORT_ROW) * 0.5;
-                            column = column.child(port_pair(
-                                entity.clone(),
-                                &id,
-                                None,
-                                Some(port),
-                                top,
-                                zoom,
-                                detail,
-                                graph,
-                                None,
-                                None,
-                                &paint,
-                            ));
-                        }
-                    }
-                    column
-                })
+                .child(port_column(
+                    entity.clone(),
+                    node,
+                    zoom,
+                    detail,
+                    graph,
+                    link_from.clone(),
+                    snap_target.clone(),
+                    &paint,
+                    false,
+                ))
                 .when(detail == Detail::Full, |card| {
                     card.children(output_body(
+                        entity.clone(),
                         node,
                         paint.frame.as_ref(),
                         selected,
                         reduced_motion,
                         &paint,
                         zoom,
+                        label_drag.clone(),
+                        label_hover.clone(),
+                        chart_metrics.clone(),
                     ))
                 })
         }
@@ -4068,13 +4318,18 @@ fn card_element(
     card.into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn output_body(
+    entity: Entity<CanvasModel>,
     node: &Node,
     frame: Option<&FrameView>,
     selected: bool,
     reduced_motion: bool,
     paint: &CardPaint,
     zoom: f32,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
 ) -> Option<gpui_kit::AnyElement> {
     let (size, line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
     if matches!(
@@ -4138,21 +4393,20 @@ fn output_body(
             &node.param_str("y"),
             &node.param_str("series"),
         ) {
-            Ok(points) => div()
-                .h(px(168.0 * zoom))
-                .px(px(6.0 * zoom))
-                .pb(px(6.0 * zoom))
-                .child(feature_chart(
-                    &mark,
-                    points,
-                    colors,
-                    paint.fg,
-                    reduced_motion,
-                    selected,
-                    &node.id,
-                    "",
-                ))
-                .into_any_element(),
+            Ok(points) => chart_on_card(
+                entity,
+                node,
+                &mark,
+                points,
+                colors,
+                paint,
+                reduced_motion,
+                selected,
+                zoom,
+                label_drag,
+                label_hover,
+                chart_metrics,
+            ),
             Err(message) => div()
                 .px(px(10.0 * zoom))
                 .text_size(size)
@@ -4206,6 +4460,374 @@ fn mini_row(cells: &[String], header: bool, paint: &CardPaint, zoom: f32) -> gpu
         );
     }
     row
+}
+
+fn reference_line(text: &str, graph: &graph::Graph, paint: &CardPaint) -> gpui_kit::AnyElement {
+    let known = bound_names(graph);
+    let mut row = div().flex().flex_row().overflow_hidden().min_w(px(0.0));
+    for (index, piece) in split_references(text).into_iter().enumerate() {
+        if let Some(name) = piece.variable.clone() {
+            let known_name = known.contains(&name);
+            let color = if known_name {
+                paint.primary
+            } else {
+                paint.danger
+            };
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("ref-{index}-{name}")))
+                    .flex_shrink_0()
+                    .text_color(color)
+                    .child(piece.text.clone())
+                    .when(!known_name, |el| {
+                        el.tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("unknown variable")
+                                .build(window, cx)
+                        })
+                    }),
+            );
+        } else {
+            row = row.child(
+                div()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .truncate()
+                    .text_color(paint.muted)
+                    .child(piece.text),
+            );
+        }
+    }
+    row.into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn port_column(
+    entity: Entity<CanvasModel>,
+    node: &Node,
+    zoom: f32,
+    detail: layout::Detail,
+    graph: &graph::Graph,
+    link_from: Option<(String, String)>,
+    snap_target: Option<(String, String)>,
+    paint: &CardPaint,
+    absolute: bool,
+) -> gpui_kit::Div {
+    let inputs = node.input_ports();
+    let outputs = node.output_ports();
+    let rows = inputs.len().max(outputs.len()).max(1);
+    let block = layout::PORT_ROW * rows as f32;
+    let mut column = div();
+    column = if absolute {
+        let port_top = (layout::PAD_Y + layout::HEADER + layout::SUMMARY) * zoom;
+        column
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(port_top))
+            .h(px(block * zoom))
+    } else {
+        column
+            .relative()
+            .mb(px(layout::PAD_Y * zoom))
+            .h(px(block * zoom))
+    };
+    let id = node.id.as_str();
+    if outputs.len() <= 1 && inputs.len() <= 1 {
+        column = column.child(port_pair(
+            entity,
+            id,
+            inputs.first(),
+            outputs.first(),
+            0.0,
+            zoom,
+            detail,
+            graph,
+            link_from,
+            snap_target,
+            paint,
+        ));
+    } else if outputs.len() <= 1 {
+        for (index, port) in inputs.iter().enumerate() {
+            column = column.child(port_pair(
+                entity.clone(),
+                id,
+                Some(port),
+                None,
+                layout::PORT_ROW * index as f32,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                paint,
+            ));
+        }
+        if let Some(port) = outputs.first() {
+            let top = (block - layout::PORT_ROW) * 0.5;
+            column = column.child(port_pair(
+                entity,
+                id,
+                None,
+                Some(port),
+                top,
+                zoom,
+                detail,
+                graph,
+                None,
+                None,
+                paint,
+            ));
+        }
+    } else {
+        for index in 0..rows {
+            column = column.child(port_pair(
+                entity.clone(),
+                id,
+                inputs.get(index),
+                outputs.get(index),
+                layout::PORT_ROW * index as f32,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                paint,
+            ));
+        }
+    }
+    column
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chart_on_card(
+    entity: Entity<CanvasModel>,
+    node: &Node,
+    mark: &str,
+    points: Vec<crate::plot::PlotPoint>,
+    colors: [gpui_kit::Hsla; 5],
+    paint: &CardPaint,
+    reduced_motion: bool,
+    selected: bool,
+    zoom: f32,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
+) -> gpui_kit::AnyElement {
+    let presentation = node.presentation.clone().unwrap_or_default();
+    let metric = chart_metrics
+        .borrow()
+        .get(&node.id)
+        .cloned()
+        .unwrap_or_default();
+    let box_w = metric
+        .plot
+        .map(|bounds| bounds.size.width.as_f32())
+        .unwrap_or(card_width(&node.feature) * zoom);
+    let box_h = metric
+        .plot
+        .map(|bounds| bounds.size.height.as_f32())
+        .unwrap_or(168.0 * zoom);
+    let title_size = metric.title.unwrap_or((0.0, 0.0));
+    let legend_size = metric.legend.unwrap_or((0.0, 0.0));
+    let (title_x, title_y) = label_drag
+        .as_ref()
+        .filter(|drag| drag.title)
+        .map(|drag| drag.live)
+        .unwrap_or((presentation.title.x, presentation.title.y));
+    let (legend_x, legend_y) = label_drag
+        .as_ref()
+        .filter(|drag| !drag.title)
+        .map(|drag| drag.live)
+        .unwrap_or((presentation.legend.x, presentation.legend.y));
+    let (title_left, title_top) = placed_origin(
+        presentation.title.anchor,
+        title_x,
+        title_y,
+        box_w,
+        box_h,
+        title_size.0,
+        title_size.1,
+    );
+    let (legend_left, legend_top) = placed_origin(
+        presentation.legend.anchor,
+        legend_x,
+        legend_y,
+        box_w,
+        box_h,
+        legend_size.0,
+        legend_size.1,
+    );
+    let title = presentation
+        .title
+        .text
+        .clone()
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| node.label.clone());
+    let legend_items = legend_entries(mark, &points, &colors);
+    let (text_size, text_line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom.max(0.85));
+    let title_hot = label_hover
+        .as_ref()
+        .is_some_and(|(id, title)| id == &node.id && *title)
+        || label_drag.as_ref().is_some_and(|drag| drag.title);
+    let legend_hot = label_hover
+        .as_ref()
+        .is_some_and(|(id, title)| id == &node.id && !*title)
+        || label_drag.as_ref().is_some_and(|drag| !drag.title);
+    let mut legend = div().flex().flex_row().flex_wrap().gap(px(4.0 * zoom));
+    for (name, color) in &legend_items {
+        legend = legend.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.0 * zoom))
+                .child(
+                    div()
+                        .size(px(6.0 * zoom.max(0.8)))
+                        .rounded_full()
+                        .bg(*color),
+                )
+                .child(
+                    div()
+                        .text_size(text_size)
+                        .line_height(text_line)
+                        .text_color(paint.fg)
+                        .child(name.clone()),
+                ),
+        );
+    }
+    let node_id = node.id.clone();
+    div()
+        .relative()
+        .h(px(168.0 * zoom))
+        .px(px(6.0 * zoom))
+        .pb(px(6.0 * zoom))
+        .child(feature_chart(
+            mark,
+            points,
+            colors,
+            paint.fg,
+            reduced_motion,
+            selected,
+            &node.id,
+            "",
+            false,
+        ))
+        .child(metric_probe(chart_metrics.clone(), node_id.clone(), 0))
+        .when(!title.is_empty(), |box_element| {
+            let entity = entity.clone();
+            let id = node_id.clone();
+            let metrics = chart_metrics.clone();
+            box_element.child(
+                div()
+                    .id(SharedString::from(format!("card-title-{id}")))
+                    .absolute()
+                    .left(px(title_left))
+                    .top(px(title_top))
+                    .max_w(px(box_w * 0.8))
+                    .px(px(2.0))
+                    .text_size(text_size)
+                    .line_height(text_line)
+                    .text_color(paint.fg)
+                    .truncate()
+                    .cursor(CursorStyle::PointingHand)
+                    .when(title_hot, |element| {
+                        element
+                            .border_1()
+                            .border_dashed()
+                            .rounded(px(4.0))
+                            .border_color(paint.fg.opacity(0.5))
+                    })
+                    .child(title)
+                    .child(metric_probe(metrics, id.clone(), 1))
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |event, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_down(&id, true, event, cx);
+                            });
+                        }
+                    })
+                    .on_hover({
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |over, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_hover(&id, true, *over, cx);
+                            });
+                        }
+                    }),
+            )
+        })
+        .when(!legend_items.is_empty(), |box_element| {
+            let entity = entity.clone();
+            let id = node_id.clone();
+            let metrics = chart_metrics.clone();
+            box_element.child(
+                div()
+                    .id(SharedString::from(format!("card-legend-{id}")))
+                    .absolute()
+                    .left(px(legend_left))
+                    .top(px(legend_top))
+                    .max_w(px(box_w * 0.7))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(legend_hot, |element| {
+                        element
+                            .border_1()
+                            .border_dashed()
+                            .rounded(px(4.0))
+                            .border_color(paint.fg.opacity(0.5))
+                    })
+                    .child(legend)
+                    .child(metric_probe(metrics, id.clone(), 2))
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |event, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_down(&id, false, event, cx);
+                            });
+                        }
+                    })
+                    .on_hover({
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |over, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_hover(&id, false, *over, cx);
+                            });
+                        }
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+fn metric_probe(
+    metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
+    id: String,
+    kind: u8,
+) -> gpui_kit::AnyElement {
+    gpui_kit::canvas(
+        move |bounds, _, _| {
+            let mut map = metrics.borrow_mut();
+            let entry = map.entry(id.clone()).or_default();
+            match kind {
+                0 => entry.plot = Some(bounds),
+                1 => {
+                    entry.title = Some((bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                }
+                _ => {
+                    entry.legend = Some((bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                }
+            }
+        },
+        move |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]

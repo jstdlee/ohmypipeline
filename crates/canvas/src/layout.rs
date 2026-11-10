@@ -56,11 +56,28 @@ pub struct PortSlot {
     pub center: Point,
 }
 
+/// On-screen size of a Title-level name. `None` hides it: a card under 8px
+/// tall has no room for a glyph. Otherwise the size is at most 11px and at
+/// most 60% of the card, so the letters stay inside the box.
+pub fn title_screen_px(card_px: f32) -> Option<f32> {
+    if card_px < 8.0 {
+        None
+    } else {
+        Some(11.0_f32.min(card_px * 0.6).max(0.0))
+    }
+}
+
+/// Compact titles stay readable when the camera is far, and still track zoom
+/// once 12px times zoom is larger than 9.
+pub fn compact_title_px(zoom: f32) -> f32 {
+    (12.0 * zoom).max(9.0)
+}
+
 pub fn card_height(node: &Node) -> f32 {
     let rows = node
         .input_ports()
         .len()
-        .max(usize::from(node.output_port().is_some()))
+        .max(node.output_ports().len())
         .max(1) as f32;
     let extra = match node.feature.as_str() {
         "preview_table" => 108.0,
@@ -82,9 +99,10 @@ pub fn card_rect(node: &Node) -> (Point, f32, f32) {
 pub fn port_slots(node: &Node) -> Vec<PortSlot> {
     let origin = node.position_point();
     let inputs = node.input_ports();
-    let output = node.output_port();
-    let rows = inputs.len().max(usize::from(output.is_some())).max(1);
+    let outputs = node.output_ports();
+    let rows = inputs.len().max(outputs.len()).max(1);
     let top = origin.y + HEADER + SUMMARY + PAD_Y;
+    let width = card_width(&node.feature);
     let mut slots = Vec::new();
     for (index, port) in inputs.iter().enumerate() {
         slots.push(PortSlot {
@@ -93,13 +111,28 @@ pub fn port_slots(node: &Node) -> Vec<PortSlot> {
             center: Point::new(origin.x, top + PORT_ROW * index as f32 + PORT_ROW * 0.5),
         });
     }
-    if let Some(port) = output {
-        let y = top + (rows as f32 * PORT_ROW) * 0.5;
-        slots.push(PortSlot {
-            name: port.name,
-            side: Side::Out,
-            center: Point::new(origin.x + card_width(&node.feature), y),
-        });
+    // One output stays centered against the input stack. Several outputs,
+    // such as if_switch true and false, stack the same way inputs do.
+    if outputs.len() <= 1 {
+        if let Some(port) = outputs.into_iter().next() {
+            let y = top + (rows as f32 * PORT_ROW) * 0.5;
+            slots.push(PortSlot {
+                name: port.name,
+                side: Side::Out,
+                center: Point::new(origin.x + width, y),
+            });
+        }
+    } else {
+        for (index, port) in outputs.iter().enumerate() {
+            slots.push(PortSlot {
+                name: port.name.clone(),
+                side: Side::Out,
+                center: Point::new(
+                    origin.x + width,
+                    top + PORT_ROW * index as f32 + PORT_ROW * 0.5,
+                ),
+            });
+        }
     }
     slots
 }
@@ -237,6 +270,30 @@ mod tests {
         assert!(cubic.c1.x - cubic.from.x < 48.0);
         assert!(cubic.c1.x < 320.0);
         assert!(cubic.c2.x < cubic.from.x);
+    }
+
+    #[test]
+    fn an_if_switch_stacks_a_true_port_above_a_false_port() {
+        let node = Node::new("s", "if_switch", Point::new(10.0, 20.0));
+        let slots = port_slots(&node);
+        let outs: Vec<_> = slots.iter().filter(|slot| slot.side == Side::Out).collect();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].name, "true");
+        assert_eq!(outs[1].name, "false");
+        assert!(outs[1].center.y > outs[0].center.y);
+        assert!((outs[0].center.x - outs[1].center.x).abs() < 0.1);
+        let height = card_height(&node);
+        assert!(height >= HEADER + SUMMARY + PAD_Y * 2.0 + PORT_ROW * 2.0 - 0.1);
+    }
+
+    #[test]
+    fn title_text_shrinks_with_the_card_and_hides_when_it_cannot_fit() {
+        assert_eq!(title_screen_px(7.9), None);
+        let at_eight = title_screen_px(8.0).unwrap();
+        assert!((at_eight - 4.8).abs() < 1e-4, "{at_eight}");
+        assert_eq!(title_screen_px(20.0), Some(11.0));
+        assert!((compact_title_px(0.42) - 9.0).abs() < 1e-4);
+        assert!((compact_title_px(1.0) - 12.0).abs() < 1e-4);
     }
 
     #[test]

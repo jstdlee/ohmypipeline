@@ -163,9 +163,20 @@ impl Workspace {
                 } else {
                     at
                 };
-                let Some(id) = canvas.editor_mut().add_node(feature, position) else {
-                    canvas.editor_mut().cancel_gesture();
-                    return;
+                let id = if feature == "loop_start" {
+                    match canvas.editor_mut().add_loop(position) {
+                        Some((start, _)) => start,
+                        None => {
+                            canvas.editor_mut().cancel_gesture();
+                            return;
+                        }
+                    }
+                } else {
+                    let Some(id) = canvas.editor_mut().add_node(feature, position) else {
+                        canvas.editor_mut().cancel_gesture();
+                        return;
+                    };
+                    id
                 };
                 if let Some((from_node, from_port)) = &from {
                     let ports = canvas

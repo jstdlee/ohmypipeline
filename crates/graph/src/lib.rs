@@ -23,7 +23,9 @@ pub use connect::{
 };
 pub use editor::Document;
 pub use feature::{CATALOG, FeatureDef, ParamDef, ParamKind, feature, features_in, groups};
-pub use file::{FileError, load_path, load_str, recovery_path, save_atomic, to_json};
+pub use file::{
+    FileError, is_variable_name, load_path, load_str, recovery_path, save_atomic, to_json,
+};
 pub use flow::validate_condition;
 pub use geom::{
     Camera, GRID_PX, Point, Rect, SNAP_RADIUS_PX, fit_camera, point_in_rect, snap_grid, zoom_toward,
@@ -45,7 +47,10 @@ pub use template::{
     NodeTemplate, TEMPLATE_FORMAT, TEMPLATE_VERSION, TemplateParam, TemplatePort, load_template,
 };
 pub use types::TypeName;
-pub use vars::{apply_overrides, parse_value, referenced_vars, substitute};
+pub use vars::{
+    TextPiece, apply_overrides, bound_names, parse_value, referenced_vars, split_references,
+    substitute, value_text_of,
+};
 
 pub const FORMAT: &str = "ohmypipeline";
 pub const VERSION: u32 = 2;
