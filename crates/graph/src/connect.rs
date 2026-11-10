@@ -61,6 +61,54 @@ pub fn reject_message(reason: Reject, from_type: &str, to_types: &str) -> String
     }
 }
 
+fn preserves_input(feature: &str) -> bool {
+    matches!(
+        feature,
+        "head"
+            | "tail"
+            | "sample"
+            | "sort_values"
+            | "concat"
+            | "dropna"
+            | "fillna"
+            | "replace"
+            | "drop_duplicates"
+            | "reset_index"
+            | "abs"
+            | "round"
+            | "shift"
+            | "ffill"
+            | "bfill"
+            | "interpolate"
+            | "clip"
+            | "where"
+            | "isin"
+            | "between"
+            | "loc"
+            | "iloc"
+            | "rolling"
+            | "diff"
+            | "pct_change"
+            | "cumsum"
+            | "str"
+            | "dt"
+            | "to_datetime"
+            | "to_numeric"
+    )
+}
+
+fn feature_outputs(node: &Node) -> Vec<TypeName> {
+    feature(&node.feature)
+        .map(|def| {
+            if let Some(output) = def.output {
+                vec![output]
+            } else {
+                def.possible_outputs.to_vec()
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// Types this node's output can be right now.
 ///
 /// A known upstream collapses `head` and `sort` to that type. With no upstream,
@@ -81,13 +129,12 @@ pub fn output_types(graph: &Graph, node_id: &str) -> Vec<TypeName> {
             .as_ref()
             .map(|port| port.accepts.clone())
             .unwrap_or_else(|| vec![TypeName::Dataframe]),
-        "head" | "sort_values" | "concat" => {
+        "str" if node.param_str("method") == "extract" => vec![TypeName::Dataframe],
+        feature if preserves_input(feature) => {
             if let Some(concrete) = same_as_input(graph, node) {
                 vec![concrete]
             } else {
-                feature(&node.feature)
-                    .map(|def| def.possible_outputs.to_vec())
-                    .unwrap_or_default()
+                feature_outputs(node)
             }
         }
         _ => feature(&node.feature)
@@ -420,6 +467,24 @@ mod tests {
             try_connect(&graph, "n3", "out", "n2", "in").unwrap_err(),
             Reject::Type
         );
+    }
+
+    #[test]
+    fn a_writer_is_a_sink_and_text_follows_its_input() {
+        let writer = node("w", "to_csv");
+        assert!(writer.output_port().is_none());
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "column"));
+        graph.nodes.push(node("n2", "str"));
+        assert!(try_connect(&graph, "n1", "out", "n2", "in").is_ok());
+        graph
+            .edges
+            .push(crate::model::Edge::between("n1", "out", "n2", "in"));
+        assert_eq!(produced_type(&graph, "n2"), Some(TypeName::Series));
+        let mut wide = Graph::default();
+        wide.nodes.push(node("n1", "read_csv"));
+        wide.nodes.push(node("n2", "loc"));
+        assert!(try_connect(&wide, "n1", "out", "n2", "in").is_ok());
     }
 
     #[test]

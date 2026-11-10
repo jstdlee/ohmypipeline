@@ -83,3 +83,39 @@ Skip rows and header row need to be visible while the preview proves the title l
 Accepted: the inspector names the controls, and the table does not contain the preamble.
 
 Checked: `docs/screenshots/skip.png`. Skip rows is 1, Header is "header row", Header row is 0, and the preview columns are region, product, qty, and price. The status line is `preview · at most 10,000 source rows · 6 rows`.
+
+## Feature sample
+
+About a quarter of the catalog, mixing nodes that were already shipping with the text, selection, clean, reshape, window, and export batch. Ryugi interface-craft (repair) and verifying-ui were read. Ryugi was not run as a tool. The checks were made on lavapipe screenshots, and this file is the record. Two rounds, then stop.
+
+Sample: Read CSV (IO palette row and card), Is in and Loc (select), Fill forward and Clip (clean), Crosstab (reshape), Text plus To datetime plus Datetime (text and dates), Group by with two aggregations and Rolling (reduce and window), To CSV (export).
+
+### Round 1
+
+- Export inspector, Write index — the help said "Row labels of the pivot" — wrong field, wrong feature.
+- Crosstab Rows and Columns — the same pivot sentences, and Values talked about a keep-list.
+- Is in, Keep values — the help also mentioned a pivot.
+- To CSV, Separator — the box was empty even though the file is comma-separated.
+
+Accepted: a reused parameter name still has to say what it does on this node.
+
+Changed: help is chosen from the feature and the field. The CSV separator defaults to a comma. Fill forward, clip, and loc put a short summary on the card (forward, 5–9, 0:1) instead of only the feature id.
+
+Before: `docs/screenshots/review-before/export.png`, `reshape.png`, `select.png`.
+
+After: `docs/screenshots/export.png`, `reshape.png`, `select.png`.
+
+### Round 2
+
+The three after shots were checked and not changed again.
+
+Export says "Write the row labels as a column." and the separator is a comma. Crosstab says which column becomes rows and which becomes headers. Is in says "Comma-separated values to keep." The Write CSV card says "Wrote 4 rows to ompp-people.csv".
+
+Also checked, and left as they were: `docs/screenshots/text.png` (names lowercased, dates parsed, year 2024), `clean.png` (qty clipped to 9, 5, 5, 7), `window.png` (qty sum and qty mean by city, rolling window 2 on the canvas).
+
+### Left as they are
+
+- On a wide graph the fit zoom shrinks the cards, and a long title such as "Lowercase names" can clip. The text shot still shows that. Card type does not scale with the camera.
+- The inspector still prints the feature id under the title (`to_csv`, `crosstab`, `isin`). It is not JSON, and it was not removed in these two rounds.
+- The floating tool capsule in the middle of the canvas still reads as a grey bar. It was not part of this fix.
+- Text and Output sit below the first screen of the feature list. The list scrolls; these shots stay on the IO rows.

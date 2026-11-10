@@ -417,7 +417,8 @@ impl Node {
             return format!("unknown feature {}", self.feature);
         }
         match self.feature.as_str() {
-            "read_csv" | "read_excel" | "read_sql" => {
+            "read_csv" | "read_excel" | "read_sql" | "to_csv" | "to_excel" | "to_json"
+            | "to_parquet" | "to_sql" => {
                 let path = self.param_str("path");
                 if path.is_empty() {
                     "no file".to_string()
@@ -476,6 +477,47 @@ impl Node {
                 format!("{index} × {columns} · {values}")
             }
             "preview_table" => "table".to_string(),
+            "str" => format!("{} {}", self.param_str("method"), self.param_str("column")),
+            "dt" => format!(
+                "{} {}",
+                self.param_str("accessor"),
+                self.param_str("column")
+            ),
+            "to_datetime" | "to_numeric" => self.param_str("column"),
+            "isin" => self.param_str("values"),
+            "groupby" => {
+                let aggs = self.param_str("aggs");
+                if aggs.is_empty() {
+                    format!("{} {}", self.param_str("by"), self.param_str("agg"))
+                } else {
+                    format!("{} {aggs}", self.param_str("by"))
+                }
+            }
+            "rolling" => format!("window {}", self.param_i64("window").unwrap_or(3)),
+            "crosstab" => format!(
+                "{} × {}",
+                self.param_str("index"),
+                self.param_str("columns")
+            ),
+            "ffill" => "forward".to_string(),
+            "bfill" => "back".to_string(),
+            "clip" => {
+                let lower = self.param_str("lower");
+                let upper = self.param_str("upper");
+                if lower.is_empty() && upper.is_empty() {
+                    "clip".to_string()
+                } else {
+                    format!("{lower}–{upper}")
+                }
+            }
+            "loc" | "iloc" => {
+                let rows = self.param_str("rows");
+                if rows.is_empty() {
+                    self.feature.clone()
+                } else {
+                    rows
+                }
+            }
             "sort_values" => {
                 let by = self.param_str("by");
                 if by.is_empty() {

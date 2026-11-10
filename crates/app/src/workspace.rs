@@ -364,6 +364,12 @@ impl Workspace {
                 | Some("skip")
                 | Some("pie")
                 | Some("line")
+                | Some("text")
+                | Some("export")
+                | Some("select")
+                | Some("clean")
+                | Some("reshape")
+                | Some("window")
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
@@ -518,9 +524,14 @@ impl Workspace {
                 self.session.update(cx, |session, cx| {
                     session.running = false;
                     if let Some(error) = reply.error {
-                        session.error = Some(error.message);
+                        let node = error.node.clone();
+                        let message = error.message.clone();
+                        session.error = Some(message.clone());
                         session.full_enabled = false;
-                        session.status = session.error.clone().unwrap_or_default();
+                        session.status = message.clone();
+                        session.canvas.update(cx, |canvas, cx| {
+                            canvas.set_note(&node, message, cx);
+                        });
                     } else {
                         session.error = None;
                         session.columns = reply.columns;
@@ -541,13 +552,22 @@ impl Workspace {
                         };
                         let view_rows: Vec<_> = cached.rows.iter().take(64).cloned().collect();
                         let view_columns = cached.columns.clone();
+                        let rows_written = session.n;
                         let ids = output_views(session.canvas.read(cx).editor().graph(), &node_id);
+                        let wrote = writer_note(
+                            session.canvas.read(cx).editor().graph(),
+                            &node_id,
+                            rows_written,
+                        );
                         session.frames.insert(node_id.clone(), cached.clone());
                         for id in &ids {
                             session.frames.insert(id.clone(), cached.clone());
                         }
                         session.canvas.update(cx, |canvas, cx| {
                             canvas.set_frames(&ids, view_columns, view_rows, cx);
+                            if let Some(note) = wrote.clone() {
+                                canvas.set_note(&node_id, note, cx);
+                            }
                         });
                         if reply.mode == RunMode::Preview {
                             session.full_enabled = true;
@@ -1251,6 +1271,125 @@ fn reel_run(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) 
     }
 }
 
+fn load_batch_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let people = root.join("examples/people.csv");
+    let people = people.canonicalize().unwrap_or(people);
+    let sales = root.join("examples/sales.csv");
+    let sales = sales.canonicalize().unwrap_or(sales);
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 96.0))
+            .unwrap();
+        let selected = match demo {
+            "reshape" => {
+                doc.set_param(&read, "path", json!(sales.display().to_string()));
+                doc.set_param(&read, "skip_rows", json!(1));
+                doc.set_label(&read, "sales.csv".into());
+                let cross = doc
+                    .add_node("crosstab", graph::Point::new(360.0, 96.0))
+                    .unwrap();
+                doc.set_label(&cross, "Region by product".into());
+                doc.set_param(&cross, "index", json!("region"));
+                doc.set_param(&cross, "columns", json!("product"));
+                doc.set_param(&cross, "agg", json!("count"));
+                let _ = doc.connect(&read, "out", &cross, "in");
+                cross
+            }
+            "export" => {
+                doc.set_param(&read, "path", json!(people.display().to_string()));
+                doc.set_label(&read, "people.csv".into());
+                let write = doc
+                    .add_node("to_csv", graph::Point::new(360.0, 96.0))
+                    .unwrap();
+                doc.set_label(&write, "Write CSV".into());
+                doc.set_param(&write, "path", json!("/tmp/ompp-people.csv"));
+                doc.set_param(&write, "index", json!("no"));
+                let _ = doc.connect(&read, "out", &write, "in");
+                write
+            }
+            "text" => {
+                doc.set_param(&read, "path", json!(people.display().to_string()));
+                doc.set_label(&read, "people.csv".into());
+                let text = doc.add_node("str", graph::Point::new(320.0, 96.0)).unwrap();
+                doc.set_label(&text, "Lowercase names".into());
+                doc.set_param(&text, "method", json!("lower"));
+                doc.set_param(&text, "column", json!("name"));
+                let dates = doc
+                    .add_node("to_datetime", graph::Point::new(600.0, 96.0))
+                    .unwrap();
+                doc.set_label(&dates, "Parse dates".into());
+                doc.set_param(&dates, "column", json!("when"));
+                let year = doc.add_node("dt", graph::Point::new(880.0, 96.0)).unwrap();
+                doc.set_label(&year, "Year".into());
+                doc.set_param(&year, "accessor", json!("year"));
+                doc.set_param(&year, "column", json!("when"));
+                let _ = doc.connect(&read, "out", &text, "in");
+                let _ = doc.connect(&text, "out", &dates, "in");
+                let _ = doc.connect(&dates, "out", &year, "in");
+                year
+            }
+            "select" => {
+                doc.set_param(&read, "path", json!(people.display().to_string()));
+                doc.set_label(&read, "people.csv".into());
+                let kept = doc
+                    .add_node("isin", graph::Point::new(340.0, 64.0))
+                    .unwrap();
+                doc.set_label(&kept, "North and East".into());
+                doc.set_param(&kept, "column", json!("city"));
+                doc.set_param(&kept, "values", json!("North,East"));
+                let located = doc.add_node("loc", graph::Point::new(660.0, 64.0)).unwrap();
+                doc.set_label(&located, "First two labels".into());
+                doc.set_param(&located, "rows", json!("0:1"));
+                let _ = doc.connect(&read, "out", &kept, "in");
+                let _ = doc.connect(&kept, "out", &located, "in");
+                kept
+            }
+            "clean" => {
+                doc.set_param(&read, "path", json!(people.display().to_string()));
+                doc.set_label(&read, "people.csv".into());
+                let fill = doc
+                    .add_node("ffill", graph::Point::new(340.0, 96.0))
+                    .unwrap();
+                doc.set_label(&fill, "Fill forward".into());
+                let clip = doc
+                    .add_node("clip", graph::Point::new(640.0, 96.0))
+                    .unwrap();
+                doc.set_label(&clip, "Clip qty".into());
+                doc.set_param(&clip, "lower", json!("5"));
+                doc.set_param(&clip, "upper", json!("9"));
+                let _ = doc.connect(&read, "out", &fill, "in");
+                let _ = doc.connect(&fill, "out", &clip, "in");
+                clip
+            }
+            _ => {
+                doc.set_param(&read, "path", json!(people.display().to_string()));
+                doc.set_label(&read, "people.csv".into());
+                let grouped = doc
+                    .add_node("groupby", graph::Point::new(360.0, 48.0))
+                    .unwrap();
+                doc.set_label(&grouped, "Qty by city".into());
+                doc.set_param(&grouped, "by", json!("city"));
+                doc.set_param(&grouped, "agg", json!("sum"));
+                doc.set_param(&grouped, "aggs", json!("qty:sum, qty:mean"));
+                let rolling = doc
+                    .add_node("rolling", graph::Point::new(360.0, 260.0))
+                    .unwrap();
+                doc.set_label(&rolling, "Rolling mean".into());
+                doc.set_param(&rolling, "window", json!(2));
+                doc.set_param(&rolling, "agg", json!("mean"));
+                doc.set_param(&rolling, "column", json!("qty"));
+                let _ = doc.connect(&read, "out", &grouped, "in");
+                let _ = doc.connect(&read, "out", &rolling, "in");
+                grouped
+            }
+        };
+        canvas.load_document(doc, cx);
+        canvas.select_only(selected, cx);
+    });
+}
+
 fn load_sales_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let csv = root.join("examples/sales.csv");
@@ -1333,6 +1472,13 @@ fn load_demo(
     }
     if matches!(demo.as_str(), "outputs" | "skip" | "pie" | "line") {
         load_sales_demo(demo, canvas, cx);
+        return;
+    }
+    if matches!(
+        demo.as_str(),
+        "text" | "export" | "select" | "clean" | "reshape" | "window"
+    ) {
+        load_batch_demo(demo, canvas, cx);
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1683,7 +1829,25 @@ fn feature_icon(id: &str) -> IconName {
         "read_json" => IconName::Code,
         "pivot" | "groupby" | "melt" => IconName::Table,
         "assign" | "astype" => IconName::Type,
-        "sum" | "mean" | "min" | "max" | "count" | "describe" | "value_counts" => IconName::Hash,
+        "sum" | "mean" | "min" | "max" | "count" | "median" | "std" | "nunique" | "describe"
+        | "value_counts" | "cumsum" => IconName::Hash,
+        "str" => IconName::CaseSensitive,
+        "to_datetime" | "dt" => IconName::Calendar,
+        "to_numeric" => IconName::Hash,
+        "shift" => IconName::ArrowRight,
+        "to_csv" | "to_excel" | "to_json" => IconName::FileOutput,
+        "to_parquet" | "to_sql" => IconName::Database,
+        "isin" | "between" | "loc" | "iloc" | "where" => IconName::ListFilter,
+        "ffill" | "bfill" => IconName::ArrowDown,
+        "interpolate" => IconName::Spline,
+        "clip" => IconName::Scissors,
+        "explode" => IconName::UnfoldVertical,
+        "transpose" => IconName::ArrowLeftRight,
+        "stack" | "unstack" => IconName::Layers,
+        "crosstab" | "join" | "merge_asof" => IconName::Table,
+        "rolling" => IconName::Activity,
+        "diff" => IconName::Diff,
+        "pct_change" => IconName::Percent,
         _ => IconName::Square,
     }
 }
@@ -2595,6 +2759,9 @@ impl Render for InspectorPanel {
             if node.feature == "chart" && field.name == "series" && mark == "pie" {
                 continue;
             }
+            if !field_applies(&node, &field.name) {
+                continue;
+            }
             let kind = def
                 .and_then(|def| def.params.iter().find(|param| param.name == field.name))
                 .map(|param| param.kind);
@@ -2612,10 +2779,22 @@ impl Render for InspectorPanel {
                 "Sort by".to_string()
             } else if node.feature == "pivot" && field.name == "columns" {
                 "Columns".to_string()
+            } else if node.feature == "shift" && field.name == "n" {
+                "Periods".to_string()
+            } else if matches!(
+                node.feature.as_str(),
+                "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql"
+            ) && field.name == "index"
+            {
+                "Write index".to_string()
+            } else if node.feature == "crosstab" && field.name == "index" {
+                "Rows".to_string()
+            } else if node.feature == "isin" && field.name == "values" {
+                "Keep values".to_string()
             } else {
                 field_label(&field.name)
             };
-            let help = field_help(&field.name);
+            let help = field_help(&node.feature, &field.name);
             body = body.child(
                 div()
                     .text_xs()
@@ -2919,6 +3098,53 @@ fn output_views(graph: &graph::Graph, ran: &str) -> Vec<String> {
     ids
 }
 
+fn field_applies(node: &graph::Node, name: &str) -> bool {
+    let method = node.param_str("method");
+    let accessor = node.param_str("accessor");
+    match (node.feature.as_str(), name) {
+        ("str", "pat") => matches!(
+            method.as_str(),
+            "contains"
+                | "replace"
+                | "split"
+                | "rsplit"
+                | "extract"
+                | "startswith"
+                | "endswith"
+                | "count"
+                | "find"
+                | "match"
+        ),
+        ("str", "repl") => method == "replace",
+        ("str", "start") => method == "slice" || method == "get",
+        ("str", "stop") => method == "slice",
+        ("str", "n") => method == "split" || method == "rsplit",
+        ("str", "width") => method == "zfill" || method == "pad",
+        ("str", "side" | "fill") => method == "pad",
+        ("str", "sep") => method == "cat",
+        ("dt", "freq") => matches!(accessor.as_str(), "floor" | "ceil" | "round"),
+        ("dt", "fmt") => accessor == "strftime",
+        _ => true,
+    }
+}
+
+fn writer_note(graph: &graph::Graph, id: &str, rows: u64) -> Option<String> {
+    let node = graph.node(id)?;
+    if !matches!(
+        node.feature.as_str(),
+        "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql"
+    ) {
+        return None;
+    }
+    let path = node.param_str("path");
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path);
+    Some(format!("Wrote {rows} rows to {name}"))
+}
+
 fn field_label(name: &str) -> String {
     match name {
         "n" => "Rows".into(),
@@ -2949,32 +3175,99 @@ fn field_label(name: &str) -> String {
         "decimals" => "Decimals".into(),
         "old" => "Find".into(),
         "new" => "Replace with".into(),
+        "method" => "Method".into(),
+        "accessor" => "Accessor".into(),
+        "format" | "fmt" => "Format".into(),
+        "freq" => "Frequency".into(),
+        "pat" => "Find".into(),
+        "repl" => "Replacement".into(),
+        "start" => "Start".into(),
+        "stop" => "Stop".into(),
+        "width" => "Width".into(),
+        "side" => "Side".into(),
+        "fill" => "Fill".into(),
+        "sep" => "Separator".into(),
+        "rows" => "Rows".into(),
+        "lower" => "Lower".into(),
+        "upper" => "Upper".into(),
+        "inclusive" => "Inclusive".into(),
+        "cond" => "Condition".into(),
+        "other" => "Other".into(),
+        "mode" => "Mode".into(),
+        "limit" => "Limit".into(),
+        "window" => "Window".into(),
+        "periods" => "Periods".into(),
+        "aggs" => "Aggregations".into(),
+        "direction" => "Direction".into(),
+        "if_exists" => "If the table exists".into(),
+        "orient" => "Layout".into(),
+        "table" => "Table".into(),
+        "sheet" => "Sheet".into(),
         other => other.into(),
     }
 }
 
-fn field_help(name: &str) -> &'static str {
-    match name {
-        "skip_rows" => "Lines to discard before the header. For SQLite, rows to skip.",
-        "header_row" => "Which remaining row is the header. 0 is the first.",
-        "header" => "Use a header row, or treat every row as data.",
-        "index" => "Row labels of the pivot.",
-        "columns" => "Which columns to keep, or the pivot column.",
-        "values" => "Numbers to aggregate.",
-        "agg" => "How the values combine.",
-        "series" => "One line for each value in this column.",
-        "x" => "Horizontal axis. On a pie chart this is the category.",
-        "y" => "Vertical axis. On a pie chart this is the slice size.",
-        "n" => "How many rows to keep.",
-        "expr" => "A pandas query expression.",
-        "code" => "def run(...) is the block the pipeline calls.",
-        "bins" => "Histogram bins.",
+fn field_help(feature: &str, name: &str) -> &'static str {
+    match (feature, name) {
+        ("to_csv" | "to_excel" | "to_parquet" | "to_sql", "index") => {
+            "Write the row labels as a column."
+        }
+        ("to_csv", "sep") => "Character between fields. A comma is the usual one.",
+        ("crosstab", "index") => "The column that becomes the rows.",
+        ("crosstab", "columns") => "The column that becomes the new headers.",
+        ("crosstab", "values") => "Optional numbers to aggregate. Empty counts the rows.",
+        ("isin", "values") => "Comma-separated values to keep.",
+        ("pivot", "index") => "Row labels of the pivot.",
+        ("pivot", "columns") => "The column that becomes the new headers.",
+        ("pivot", "values") => "Numbers to aggregate.",
+        (_, "skip_rows") => "Lines to discard before the header. For SQLite, rows to skip.",
+        (_, "header_row") => "Which remaining row is the header. 0 is the first.",
+        (_, "header") => "Use a header row, or treat every row as data.",
+        (_, "columns") => "Which columns to keep.",
+        (_, "agg") => "How the values combine.",
+        (_, "series") => "One line for each value in this column.",
+        (_, "x") => "Horizontal axis. On a pie chart this is the category.",
+        (_, "y") => "Vertical axis. On a pie chart this is the slice size.",
+        (_, "n") => "How many rows to keep.",
+        (_, "expr") => "A pandas query expression.",
+        (_, "code") => "def run(...) is the block the pipeline calls.",
+        (_, "bins") => "Histogram bins.",
+        (_, "aggs") => "column:sum, column:mean. Empty uses the single aggregation above.",
+        (_, "values") => "Comma-separated values to keep.",
+        (_, "rows") => {
+            "Labels or positions. 0:2 is a slice. a,b is a list. Loc includes both ends."
+        }
+        (_, "cond") => "A pandas expression, such as qty > 0.",
+        (_, "pat") => "Text to find. Extract and Match use a regular expression.",
+        (_, "method") => "Which text or fill operation to run.",
+        (_, "accessor") => "Which part of the timestamp to take.",
+        (_, "freq") => "Floor, ceil, and round use this, such as D or h.",
+        (_, "fmt") => "strftime pattern, such as %Y-%m-%d.",
+        (_, "format") => "Optional timestamp pattern. Empty lets pandas infer it.",
+        (_, "lower") => "Lowest value to keep or clip.",
+        (_, "upper") => "Highest value to keep or clip.",
+        (_, "window") => "How many rows are in the window.",
+        (_, "periods") => "How many rows to look back.",
+        (_, "limit") => "Most empty cells to fill. Empty means no limit.",
+        (_, "column") => "Which column. Leave empty when the input is already one column.",
         _ => "",
     }
 }
 
 fn coerce(name: &str, text: &str) -> Value {
-    if matches!(name, "n" | "bins" | "skip_rows" | "header_row" | "decimals") {
+    if matches!(
+        name,
+        "n" | "bins"
+            | "skip_rows"
+            | "header_row"
+            | "decimals"
+            | "window"
+            | "periods"
+            | "start"
+            | "stop"
+            | "width"
+            | "limit"
+    ) {
         json!(text.parse::<i64>().unwrap_or(0))
     } else if name == "ascending" {
         json!(text == "true")

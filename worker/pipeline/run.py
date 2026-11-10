@@ -236,9 +236,17 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         "astype",
         "preview_table",
         "chart",
+        "explode",
+        "transpose",
+        "unstack",
+        "crosstab",
+        "join",
+        "merge_asof",
     ):
         return "dataframe"
-    if kind in ("value_counts", "sum", "mean", "min", "max", "count"):
+    if kind == "str" and str((node.get("params") or {}).get("method") or "") == "extract":
+        return "dataframe"
+    if kind in ("value_counts", "sum", "mean", "min", "max", "count", "median", "std", "nunique", "stack"):
         return "series"
     if kind == "column":
         return "series"
@@ -261,6 +269,29 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         "reset_index",
         "abs",
         "round",
+        "shift",
+        "ffill",
+        "bfill",
+        "interpolate",
+        "clip",
+        "where",
+        "isin",
+        "between",
+        "loc",
+        "iloc",
+        "rolling",
+        "diff",
+        "pct_change",
+        "cumsum",
+        "str",
+        "dt",
+        "to_datetime",
+        "to_numeric",
+        "to_csv",
+        "to_excel",
+        "to_json",
+        "to_parquet",
+        "to_sql",
     ):
         return input_type(node, graph, values)
     return None
@@ -430,6 +461,11 @@ def execute(
         return run_python(node_id, str(code), graph, node, values)
     if kind in ("chart", "preview_table"):
         return require_frame_or_series()
+    from pipeline.batch import run_batch
+
+    batched = run_batch(kind, node_id, params, require_frame_or_series, base_dir)
+    if batched is not _MISSING:
+        return batched
     extra = run_extra(kind, node_id, graph, params, wired, require_frame_or_series, preview, base_dir, overrides)
     if extra is not _MISSING:
         return extra
@@ -488,6 +524,9 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
         "min",
         "max",
         "count",
+        "median",
+        "std",
+        "nunique",
         "abs",
         "round",
     }:
@@ -576,9 +615,27 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
         if kind == "groupby":
             by = str(params.get("by") or "")
             agg = str(params.get("agg") or "sum")
+            aggs = str(params.get("aggs") or "").strip()
             if by not in frame.columns:
                 raise NodeError(node_id, f"missing column {by}")
             grouped = frame.groupby(by, as_index=False)
+            if aggs:
+                spec: dict[str, list[str]] = {}
+                for piece in aggs.split(","):
+                    piece = piece.strip()
+                    if ":" not in piece:
+                        raise NodeError(node_id, "aggregations use column:function")
+                    col, fn = (part.strip() for part in piece.split(":", 1))
+                    if col not in frame.columns:
+                        raise NodeError(node_id, f"missing column {col}")
+                    spec.setdefault(col, []).append(fn)
+                table = grouped.agg(spec)
+                if isinstance(table.columns, pd.MultiIndex):
+                    table.columns = [
+                        " ".join(str(part) for part in col if str(part) not in ("", "nan")).strip()
+                        for col in table.columns
+                    ]
+                return table
             if agg == "count":
                 return grouped.count()
             if agg == "mean":
@@ -587,6 +644,12 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
                 return grouped.min(numeric_only=True)
             if agg == "max":
                 return grouped.max(numeric_only=True)
+            if agg == "median":
+                return grouped.median(numeric_only=True)
+            if agg == "std":
+                return grouped.std(numeric_only=True)
+            if agg == "nunique":
+                return grouped.nunique()
             return grouped.sum(numeric_only=True)
         if kind == "describe":
             return frame.describe()
@@ -596,13 +659,16 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
                 raise NodeError(node_id, f"missing column {column}")
             counts = frame[column].value_counts()
             return counts.rename("count")
-        if kind in ("sum", "mean", "min", "max", "count"):
+        if kind in ("sum", "mean", "min", "max", "count", "median", "std", "nunique"):
             if isinstance(frame, pd.Series):
                 value = getattr(frame, kind)()
                 return pd.Series([value], name=frame.name or kind)
-            numeric = frame.select_dtypes(include="number") if kind != "count" else frame
-            reduced = getattr(numeric, kind)(numeric_only=True) if kind != "count" else frame.count()
-            return reduced
+            if kind == "count":
+                return frame.count()
+            if kind == "nunique":
+                return frame.nunique()
+            numeric = frame.select_dtypes(include="number")
+            return getattr(numeric, kind)(numeric_only=True)
         if kind == "abs":
             if isinstance(frame, pd.Series):
                 return frame.abs()

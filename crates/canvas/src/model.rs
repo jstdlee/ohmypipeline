@@ -134,6 +134,7 @@ pub struct CanvasModel {
     label_input: Entity<gpui_kit::component::input::InputState>,
     editing: Option<String>,
     frames: BTreeMap<String, FrameView>,
+    notes: BTreeMap<String, String>,
     reduced_motion: bool,
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -175,6 +176,7 @@ impl CanvasModel {
             label_input,
             editing: None,
             frames: BTreeMap::new(),
+            notes: BTreeMap::new(),
             reduced_motion: false,
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
@@ -563,6 +565,16 @@ impl CanvasModel {
         let frame = FrameView { columns, rows };
         for id in ids {
             self.frames.insert(id.clone(), frame.clone());
+        }
+        cx.notify();
+    }
+
+    pub fn set_note(&mut self, node: &str, note: impl Into<String>, cx: &mut Context<Self>) {
+        let note = note.into();
+        if note.is_empty() {
+            self.notes.remove(node);
+        } else {
+            self.notes.insert(node.to_string(), note);
         }
         cx.notify();
     }
@@ -1633,6 +1645,7 @@ impl Render for CanvasModel {
                         radius,
                         mono: mono.to_string(),
                         frame: self.frames.get(&node.id).cloned(),
+                        note: self.notes.get(&node.id).cloned(),
                     },
                 )
             }))
@@ -1819,6 +1832,7 @@ struct CardPaint {
     radius: Pixels,
     mono: String,
     frame: Option<FrameView>,
+    note: Option<String>,
 }
 
 fn type_color(ty: TypeName, chart: &[gpui_kit::Hsla; 6]) -> gpui_kit::Hsla {
@@ -2252,6 +2266,24 @@ fn output_body(
     reduced_motion: bool,
     paint: &CardPaint,
 ) -> Option<gpui_kit::AnyElement> {
+    if matches!(
+        node.feature.as_str(),
+        "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql"
+    ) {
+        let (text, color) = match paint.note.as_deref() {
+            Some(note) if note.starts_with("Wrote") => (note.to_string(), paint.success),
+            Some(note) => (note.to_string(), paint.danger),
+            None => ("Set a path, then run".to_string(), paint.muted),
+        };
+        return Some(
+            div()
+                .px(px(10.0))
+                .text_xs()
+                .text_color(color)
+                .child(text)
+                .into_any_element(),
+        );
+    }
     if node.feature == "preview_table" {
         return Some(match frame {
             Some(frame) => mini_table(frame, paint),

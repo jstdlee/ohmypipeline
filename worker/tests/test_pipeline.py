@@ -381,5 +381,324 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(chart.get("error"), chart.get("error"))
 
 
+class BatchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+        self.csv = self.tmp / "people.csv"
+        self.csv.write_text(
+            "name,city,qty,when,note\nAda,North,10,2024-01-15, hello\nBea,South,4,2024-03-02,Hello\nCal,North,,2024-06-20,  hi\nDee,East,7,2024-08-01,Hi there\n",
+            encoding="utf-8",
+        )
+
+    def job(self, nodes, edges, node_id):
+        reply = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(nodes, edges),
+                "node": node_id,
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        return reply
+
+    def reader(self, node_id="n1"):
+        return node(node_id, "read_csv", {"path": str(self.csv)})
+
+    def test_str_lower_and_strip_on_a_column(self):
+        lowered = self.job(
+            [self.reader(), node("n2", "str", {"method": "lower", "column": "name"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(lowered["rows"][0][lowered["columns"].index("name")], "ada")
+        stripped = self.job(
+            [self.reader(), node("n2", "str", {"method": "strip", "column": "note"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(stripped["rows"][0][stripped["columns"].index("note")], "hello")
+
+    def test_str_contains_split_and_extract(self):
+        contains = self.job(
+            [self.reader(), node("n2", "str", {"method": "contains", "column": "note", "pat": "Hi"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        flags = [row[contains["columns"].index("note")] for row in contains["rows"]]
+        self.assertEqual(flags, [False, False, False, True])
+        split = self.job(
+            [
+                self.reader(),
+                node("n2", "str", {"method": "split", "column": "note", "pat": " "}),
+                node("n3", "explode", {"column": "note"}),
+            ],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertGreater(split["n"], 4)
+        extracted = self.job(
+            [
+                node("s", "column", {"name": "name"}),
+                self.reader(),
+                node("n2", "str", {"method": "extract", "pat": "([A-Z])"}),
+            ],
+            [edge("n1", "s"), edge("s", "n2")],
+            "n2",
+        )
+        self.assertIn("0", extracted["columns"])
+        self.assertEqual(extracted["rows"][0][0], "A")
+
+    def test_datetime_accessors_and_to_numeric(self):
+        dated = self.job(
+            [
+                self.reader(),
+                node("n2", "to_datetime", {"column": "when"}),
+                node("n3", "dt", {"accessor": "year", "column": "when"}),
+            ],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertEqual(dated["rows"][0][dated["columns"].index("when")], 2024)
+        numeric = self.job(
+            [
+                node("n1", "read_csv", {"path": str(self.csv)}),
+                node("n2", "column", {"name": "qty"}),
+                node("n3", "to_numeric", {}),
+            ],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertEqual(numeric["rows"][0][0], 10)
+
+    def test_shift_isin_between_loc_and_iloc(self):
+        shifted = self.job(
+            [self.reader(), node("n2", "shift", {"n": 1})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIsNone(shifted["rows"][0][shifted["columns"].index("qty")])
+        kept = self.job(
+            [self.reader(), node("n2", "isin", {"column": "city", "values": "North,East"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(kept["n"], 3)
+        span = self.job(
+            [
+                self.reader(),
+                node("n2", "between", {"column": "qty", "lower": "5", "upper": "10", "inclusive": "both"}),
+            ],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(span["n"], 2)
+        located = self.job(
+            [self.reader(), node("n2", "loc", {"rows": "0:1"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(located["n"], 2)
+        positioned = self.job(
+            [self.reader(), node("n2", "iloc", {"rows": "1:3"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(positioned["rows"][0][positioned["columns"].index("name")], "Bea")
+        self.assertEqual(positioned["n"], 2)
+
+    def test_ffill_clip_and_where(self):
+        filled = self.job(
+            [self.reader(), node("n2", "ffill", {}), node("n3", "clip", {"lower": "5", "upper": "9"})],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        qty = filled["columns"].index("qty")
+        self.assertEqual([row[qty] for row in filled["rows"]], [9, 5, 5, 7])
+        masked = self.job(
+            [self.reader(), node("n2", "where", {"mode": "mask", "cond": "qty > 8", "other": "0"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(masked["rows"][0][masked["columns"].index("qty")], 0)
+
+    def test_stack_unstack_transpose_and_crosstab(self):
+        stacked = self.job(
+            [self.reader(), node("n2", "stack", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(stacked["n"], 20)
+        wide = self.job(
+            [self.reader(), node("n2", "stack", {}), node("n3", "unstack", {})],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertGreaterEqual(len(wide["columns"]), 2)
+        flipped = self.job(
+            [self.reader(), node("n2", "transpose", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(flipped["n"], 5)
+        counted = self.job(
+            [self.reader(), node("n2", "crosstab", {"index": "city", "columns": "name"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("city", counted["columns"])
+        self.assertIn("Ada", counted["columns"])
+
+    def test_rolling_diff_groupby_and_reducers(self):
+        rolled = self.job(
+            [self.reader(), node("n2", "rolling", {"window": 2, "agg": "mean", "column": "qty"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        qty = rolled["columns"].index("qty")
+        self.assertEqual(rolled["rows"][0][qty], 10)
+        self.assertEqual(rolled["rows"][1][qty], 7)
+        changed = self.job(
+            [self.reader(), node("n2", "diff", {"periods": 1})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(changed["rows"][1][changed["columns"].index("qty")], -6)
+        grouped = self.job(
+            [self.reader(), node("n2", "groupby", {"by": "city", "agg": "sum", "aggs": "qty:sum, qty:mean"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("city", grouped["columns"])
+        self.assertTrue(any("sum" in column for column in grouped["columns"]))
+        unique = self.job(
+            [self.reader(), node("n2", "nunique", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(unique["rows"][unique["index"].index("city")][0], 3)
+
+    def test_writers_require_a_path_and_write_the_frame(self):
+        missing = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(
+                    [self.reader(), node("n2", "to_csv", {"path": ""})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIn("no path", missing["error"]["message"])
+        csv_path = self.tmp / "out.csv"
+        written = self.job(
+            [self.reader(), node("n2", "to_csv", {"path": str(csv_path), "index": "no"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(written["n"], 4)
+        self.assertIn("name,city,qty,when,note", csv_path.read_text(encoding="utf-8").splitlines()[0])
+        excel = self.tmp / "out.xlsx"
+        self.job(
+            [self.reader(), node("n2", "to_excel", {"path": str(excel), "sheet": "People", "index": "no"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertTrue(excel.is_file())
+        blob = self.tmp / "out.json"
+        self.job(
+            [self.reader(), node("n2", "to_json", {"path": str(blob), "orient": "records"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("Ada", blob.read_text(encoding="utf-8"))
+        parquet = self.tmp / "out.parquet"
+        self.job(
+            [self.reader(), node("n2", "to_parquet", {"path": str(parquet), "index": "no"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertTrue(parquet.is_file())
+        db = self.tmp / "out.sqlite"
+        self.job(
+            [
+                self.reader(),
+                node("n2", "to_sql", {"path": str(db), "table": "people", "if_exists": "replace", "index": "no"}),
+            ],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        with sqlite3.connect(db) as con:
+            count = con.execute("select count(*) from people").fetchone()[0]
+        self.assertEqual(count, 4)
+
+    def test_pct_change_cumsum_bfill_interpolate_and_median(self):
+        changed = self.job(
+            [self.reader(), node("n2", "pct_change", {"periods": 1})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIsNone(changed["rows"][0][changed["columns"].index("qty")])
+        total = self.job(
+            [self.reader(), node("n2", "cumsum", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(total["rows"][1][total["columns"].index("qty")], 14)
+        filled = self.job(
+            [self.reader(), node("n2", "bfill", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(filled["rows"][2][filled["columns"].index("qty")], 7)
+        smooth = self.job(
+            [self.reader(), node("n2", "interpolate", {"method": "linear"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(smooth["rows"][2][smooth["columns"].index("qty")], 5.5)
+        middle = self.job(
+            [self.reader(), node("n2", "median", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(middle["rows"][middle["index"].index("qty")][0], 7)
+
+    def test_join_and_merge_asof(self):
+        right = self.tmp / "managers.csv"
+        right.write_text("city,manager\nNorth,Ada\nSouth,Bea\nEast,Cal\n", encoding="utf-8")
+        joined = self.job(
+            [
+                self.reader(),
+                node("r", "read_csv", {"path": str(right)}),
+                node("n2", "join", {"on": "city", "how": "left"}),
+            ],
+            [edge("n1", "n2", dst_port="left"), edge("r", "n2", dst_port="right")],
+            "n2",
+        )
+        self.assertIn("manager", joined["columns"])
+        self.assertEqual(joined["n"], 4)
+        quotes = self.tmp / "quotes.csv"
+        quotes.write_text("time,price\n1,10\n4,12\n", encoding="utf-8")
+        trades = self.tmp / "trades.csv"
+        trades.write_text("time,qty\n1,1\n3,2\n5,3\n", encoding="utf-8")
+        merged = self.job(
+            [
+                node("l", "read_csv", {"path": str(trades)}),
+                node("r", "read_csv", {"path": str(quotes)}),
+                node("n2", "merge_asof", {"on": "time", "direction": "backward"}),
+            ],
+            [edge("l", "n2", dst_port="left"), edge("r", "n2", dst_port="right")],
+            "n2",
+        )
+        price = merged["columns"].index("price")
+        self.assertEqual(merged["rows"][1][price], 10)
+        self.assertEqual(merged["rows"][2][price], 12)
+
+
 if __name__ == "__main__":
     unittest.main()

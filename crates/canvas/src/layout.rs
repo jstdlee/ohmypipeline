@@ -33,6 +33,7 @@ pub fn card_height(node: &Node) -> f32 {
     let extra = match node.feature.as_str() {
         "preview_table" => 108.0,
         "chart" => 196.0,
+        "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql" => 28.0,
         _ => 0.0,
     };
     HEADER + SUMMARY + PAD_Y + PORT_ROW * rows + PAD_Y + extra
