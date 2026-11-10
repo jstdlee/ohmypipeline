@@ -13,4 +13,4 @@ pub use layout::{
     wire_hit,
 };
 pub use model::{CanvasEvent, CanvasModel, Dot, FrameView, Tool};
-pub use plot::{PlotPoint, feature_chart, points_from};
+pub use plot::{PlotPoint, feature_chart, points_for_encodings, points_from};

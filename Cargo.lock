@@ -195,6 +195,7 @@ dependencies = [
  "gpui-kit",
  "graph",
  "libc",
+ "regex",
  "serde",
  "serde_json",
 ]

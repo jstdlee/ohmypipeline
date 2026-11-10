@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use canvas::{CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, points_from, port_slots};
+use canvas::{
+    CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, points_for_encodings, port_slots,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{
@@ -86,6 +88,7 @@ pub struct Session {
     pub assist_note: Option<String>,
     pub assist_fill: Option<(String, String, String)>,
     pub assist_rx: Option<std::sync::mpsc::Receiver<crate::assist::AssistReply>>,
+    pub rename_draft: Vec<(String, String)>,
     frames: BTreeMap<String, CachedFrame>,
 }
 
@@ -99,9 +102,11 @@ struct CachedFrame {
     status: String,
 }
 
+#[derive(Clone, Copy)]
 pub enum PathKind {
     Open,
     SaveAs,
+    ImportTemplate,
 }
 
 impl Session {
@@ -216,6 +221,7 @@ impl Workspace {
             assist_note: None,
             assist_fill: None,
             assist_rx: None,
+            rename_draft: Vec::new(),
             frames: BTreeMap::new(),
         });
         let path_input = cx.new(|cx| InputState::new(window, cx));
@@ -375,6 +381,10 @@ impl Workspace {
                 | Some("compute")
                 | Some("readers")
                 | Some("wide")
+                | Some("plot")
+                | Some("rename")
+                | Some("calc")
+                | Some("library")
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
@@ -578,6 +588,12 @@ impl Workspace {
                             session.full_enabled = true;
                             session.preview_fp = Some(fp);
                         }
+                        if let Some(fitted) = reply.fitted.clone() {
+                            let id = node_id.clone();
+                            session.canvas.update(cx, |canvas, _| {
+                                canvas.editor_mut().set_fitted(&id, Some(fitted));
+                            });
+                        }
                     }
                     session.recompute_dots(cx);
                     cx.notify();
@@ -648,7 +664,21 @@ impl Workspace {
             return;
         }
         let path = PathBuf::from(text);
-        let save = matches!(self.session.read(cx).path_prompt, Some(PathKind::SaveAs));
+        let kind = self.session.read(cx).path_prompt;
+        if matches!(kind, Some(PathKind::ImportTemplate)) {
+            let result = import_template(&path);
+            self.session.update(cx, |session, cx| {
+                session.path_prompt = None;
+                session.assist_note = Some(match result {
+                    Ok(saved) => format!("Imported {saved}"),
+                    Err(err) => err,
+                });
+                cx.notify();
+            });
+            let _ = window;
+            return;
+        }
+        let save = matches!(kind, Some(PathKind::SaveAs));
         if save {
             let result = self.session.update(cx, |session, cx| {
                 session.canvas.update(cx, |canvas, _| {
@@ -1345,6 +1375,70 @@ fn load_more_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
                 let _ = doc.connect(&read, "out", &apply, "in");
                 arith
             }
+            "plot" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 80.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("plot.csv")));
+                doc.set_label(&read, "plot.csv".into());
+                let chart = doc
+                    .add_node("chart", graph::Point::new(340.0, 48.0))
+                    .unwrap();
+                doc.set_label(&chart, "Qty and price".into());
+                doc.set_param(&chart, "mark", json!("line"));
+                doc.set_param(&chart, "x", json!("month"));
+                doc.set_param(&chart, "ys", json!("qty,price"));
+                doc.set_param(&chart, "y_axes", json!("qty:left,price:right"));
+                doc.set_param(&chart, "log_left", json!("yes"));
+                let _ = doc.connect(&read, "out", &chart, "in");
+                chart
+            }
+            "rename" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 80.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("bins.csv")));
+                doc.set_label(&read, "bins.csv".into());
+                let headers = doc
+                    .add_node("change_headers", graph::Point::new(340.0, 80.0))
+                    .unwrap();
+                doc.set_label(&headers, "Rename".into());
+                doc.set_param(
+                    &headers,
+                    "mapping",
+                    json!([{"from": "qty", "to": "quantity"}, {"from": "flag", "to": "group"}]),
+                );
+                let _ = doc.connect(&read, "out", &headers, "in");
+                headers
+            }
+            "calc" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 80.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("bins.csv")));
+                doc.set_label(&read, "bins.csv".into());
+                let calc = doc
+                    .add_node("calculate", graph::Point::new(340.0, 80.0))
+                    .unwrap();
+                doc.set_label(&calc, "Double qty".into());
+                doc.set_param(&calc, "expr", json!("double = qty * 2"));
+                let _ = doc.connect(&read, "out", &calc, "in");
+                calc
+            }
+            "library" => {
+                let node = doc
+                    .add_node("python", graph::Point::new(48.0, 80.0))
+                    .unwrap();
+                doc.set_label(&node, "Library note".into());
+                doc.set_param(&node, "goal", json!("Describe the frame"));
+                doc.set_param(&node, "notes", json!("Saved from the user library."));
+                doc.set_param(
+                    &node,
+                    "code",
+                    json!("def run(df):\n    return df.head(2)\n"),
+                );
+                node
+            }
             "wide" => {
                 let read = doc
                     .add_node("read_csv", graph::Point::new(48.0, 96.0))
@@ -1599,7 +1693,7 @@ fn load_demo(
     }
     if matches!(
         demo.as_str(),
-        "time" | "bins" | "compute" | "readers" | "wide"
+        "time" | "bins" | "compute" | "readers" | "wide" | "plot" | "rename" | "calc" | "library"
     ) {
         load_more_demo(demo, canvas, cx);
         return;
@@ -1929,6 +2023,49 @@ impl Render for PalettePanel {
                 );
             }
         }
+        let library = library_templates();
+        if !library.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Library"),
+            );
+            for template in library {
+                if !query.is_empty() && !template.title.to_lowercase().contains(&query) {
+                    continue;
+                }
+                let session = self.session.clone();
+                let title = template.title.clone();
+                let id = template.id.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("library-{id}")))
+                        .h(px(36.0))
+                        .w_full()
+                        .px_2()
+                        .rounded(px(6.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .child(IconName::Code)
+                        .child(title)
+                        .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                            session.update(cx, |session, cx| {
+                                session.canvas.update(cx, |canvas, cx| {
+                                    add_library_node(canvas, &id, cx);
+                                });
+                            });
+                        }),
+                );
+            }
+        }
         column.child(list)
     }
 }
@@ -1980,6 +2117,8 @@ fn feature_icon(id: &str) -> IconName {
         "rank" | "corr" | "cov" | "unique" | "quantile" => IconName::Hash,
         "reindex" | "sort_index" => IconName::ArrowDownWideNarrow,
         "combine_first" => IconName::GitMerge,
+        "standard_scale" | "minmax_scale" | "robust_scale" => IconName::Sigma,
+        "ols" | "calculate" => IconName::Hash,
         "diff" => IconName::Diff,
         "pct_change" => IconName::Percent,
         _ => IconName::Square,
@@ -2201,16 +2340,24 @@ impl Render for ChartPanel {
                 .child(format!("{n} points. Aggregate or sample before charting."))
                 .into_any_element();
         }
-        let points = match points_from(&columns, &rows, &x_name, &y_name, &series_name) {
-            Ok(points) => points,
-            Err(message) => {
-                return div()
-                    .p_4()
-                    .text_color(cx.theme().danger)
-                    .child(message)
-                    .into_any_element();
-            }
+        let y_names = split_list(&node.param_str("ys"));
+        let y_names = if y_names.is_empty() && !y_name.is_empty() {
+            vec![y_name.clone()]
+        } else {
+            y_names
         };
+        let axes = axis_pairs(&node.param_str("y_axes"));
+        let points =
+            match points_for_encodings(&columns, &rows, &x_name, &y_names, &series_name, &axes) {
+                Ok(points) => points,
+                Err(message) => {
+                    return div()
+                        .p_4()
+                        .text_color(cx.theme().danger)
+                        .child(message)
+                        .into_any_element();
+                }
+            };
         let title = node
             .presentation
             .as_ref()
@@ -2224,8 +2371,11 @@ impl Render for ChartPanel {
             cx.theme().chart_4,
             cx.theme().chart_5,
         ];
+        let log_note = chart_limitation(&node);
         let note = if error.is_some() {
             error.unwrap_or_default()
+        } else if !log_note.is_empty() {
+            log_note.clone()
         } else {
             "preview · the chart draws this window".into()
         };
@@ -2247,6 +2397,7 @@ impl Render for ChartPanel {
                 reduced,
                 true,
                 &node.id,
+                &log_note,
             )
         };
         div()
@@ -2275,6 +2426,8 @@ struct InspectorPanel {
     python_rows: Vec<PyRow>,
     python_count: usize,
     bound: Option<String>,
+    picker_search: Entity<InputState>,
+    picker_pattern: Entity<InputState>,
 }
 struct PyRow {
     input: Entity<InputState>,
@@ -2292,7 +2445,7 @@ struct MapRow {
     _subs: Vec<Subscription>,
 }
 impl InspectorPanel {
-    fn new(session: Entity<Session>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         Self {
             focus: cx.focus_handle(),
@@ -2302,6 +2455,8 @@ impl InspectorPanel {
             python_rows: Vec::new(),
             python_count: 0,
             bound: None,
+            picker_search: cx.new(|cx| InputState::new(window, cx)),
+            picker_pattern: cx.new(|cx| InputState::new(window, cx)),
         }
     }
 
@@ -2710,6 +2865,138 @@ impl InspectorPanel {
         });
     }
 
+    fn batch_picker(
+        &self,
+        field: &str,
+        input: Entity<InputState>,
+        choices: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let search = self.picker_search.read(cx).value().to_string();
+        let pattern = self.picker_pattern.read(cx).value().to_string();
+        let regex = regex::Regex::new(&pattern).ok();
+        let selected = split_list(&input.read(cx).value());
+        let mut matches = Vec::new();
+        for choice in choices {
+            if !search.is_empty() && !choice.to_lowercase().contains(&search.to_lowercase()) {
+                continue;
+            }
+            if let Some(regex) = &regex
+                && !regex.is_match(choice)
+            {
+                continue;
+            }
+            matches.push(choice.clone());
+        }
+        let mut column = div().flex().flex_col().gap_1();
+        column = column.child(Input::new(&self.picker_search).small());
+        column = column.child(Input::new(&self.picker_pattern).small());
+        let input_add = input.clone();
+        let matches_add = matches.clone();
+        column = column.child(
+            Button::new(SharedString::from(format!("pick-add-{field}")))
+                .small()
+                .label("Add matches")
+                .on_click(move |_, window, cx| {
+                    let mut current = split_list(&input_add.read(cx).value());
+                    for name in &matches_add {
+                        if !current.iter().any(|item| item == name) {
+                            current.push(name.clone());
+                        }
+                    }
+                    let text = current.join(", ");
+                    input_add.update(cx, |state, cx| {
+                        state.set_value(text, window, cx);
+                    });
+                }),
+        );
+        let mut chosen = div().flex().flex_row().flex_wrap().gap_1();
+        for name in &selected {
+            let name = name.clone();
+            let input_remove = input.clone();
+            chosen = chosen.child(
+                Button::new(SharedString::from(format!("pick-drop-{field}-{name}")))
+                    .ghost()
+                    .small()
+                    .label(format!("{name} ×"))
+                    .on_click(move |_, window, cx| {
+                        let text = split_list(&input_remove.read(cx).value())
+                            .into_iter()
+                            .filter(|item| item != &name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        input_remove.update(cx, |state, cx| {
+                            state.set_value(text, window, cx);
+                        });
+                    }),
+            );
+        }
+        column = column.child(chosen);
+        let input_clear = input.clone();
+        column = column.child(
+            Button::new(SharedString::from(format!("pick-clear-{field}")))
+                .ghost()
+                .small()
+                .label("Clear")
+                .on_click(move |_, window, cx| {
+                    input_clear.update(cx, |state, cx| {
+                        state.set_value(String::new(), window, cx);
+                    });
+                }),
+        );
+        column.into_any_element()
+    }
+
+    fn export_node(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let template = self.session.update(cx, |session, cx| {
+            session
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .node(node_id)
+                .map(|node| graph::NodeTemplate::from_node(node, sanitize_id(&node.label)))
+        });
+        let Some(template) = template else {
+            return;
+        };
+        match save_template(&template) {
+            Ok(path) => self.session.update(cx, |session, cx| {
+                session.assist_note = Some(format!("Exported {}", path.display()));
+                cx.notify();
+            }),
+            Err(err) => self.session.update(cx, |session, cx| {
+                session.assist_note = Some(err);
+                cx.notify();
+            }),
+        }
+    }
+
+    fn customize_node(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let template = self.session.update(cx, |session, cx| {
+            let canvas = session.canvas.read(cx);
+            let node = canvas.editor().graph().node(node_id)?;
+            let id = format!("custom_{}_{}", node.feature, node.id);
+            Some(graph::NodeTemplate::from_node(node, sanitize_id(&id)))
+        });
+        let Some(template) = template else {
+            return;
+        };
+        match save_template(&template) {
+            Ok(path) => self.session.update(cx, |session, cx| {
+                session.assist_note = Some(format!(
+                    "Saved a library copy at {}. The built-in node was left as it is.",
+                    path.display()
+                ));
+                cx.notify();
+            }),
+            Err(err) => self.session.update(cx, |session, cx| {
+                session.assist_note = Some(err);
+                cx.notify();
+            }),
+        }
+    }
+
     fn ask_model(
         &mut self,
         node_id: &str,
@@ -2799,11 +3086,27 @@ fn watch_assist(session: Entity<Session>, window: &mut Window, cx: &mut App) {
             match reply {
                 crate::assist::AssistReply::Value(text) => {
                     if let Some((node, field, _)) = target {
-                        session.canvas.update(cx, |canvas, cx| {
-                            canvas.set_param(&node, &field, json!(text.clone()), cx);
-                        });
-                        session.assist_fill = Some((node, field, text));
-                        session.assist_note = None;
+                        if field == "mapping" {
+                            session.rename_draft = parse_rename(&text);
+                            session.assist_note = Some(
+                                "Review the suggested names. Apply writes them onto the node."
+                                    .into(),
+                            );
+                            session.assist_fill = None;
+                        } else {
+                            session.canvas.update(cx, |canvas, cx| {
+                                canvas.set_param(&node, &field, json!(text.clone()), cx);
+                            });
+                            session.assist_note = if field == "code" {
+                                Some(
+                                    "Review the draft in the code field. It runs only when you press Preview."
+                                        .into(),
+                                )
+                            } else {
+                                None
+                            };
+                            session.assist_fill = Some((node, field, text));
+                        }
                     }
                 }
                 crate::assist::AssistReply::Ask(text)
@@ -2871,6 +3174,9 @@ impl Render for InspectorPanel {
                 .text_color(cx.theme().muted_foreground)
                 .child(node.feature.clone()),
         );
+        if let Some(fitted) = node.fitted.clone() {
+            body = body.child(fit_summary(&fitted));
+        }
         if node.feature == "python" {
             body = body.child(
                 div()
@@ -3039,6 +3345,12 @@ impl Render for InspectorPanel {
                     body = body.child(chips);
                 }
             }
+            if matches!(field.name.as_str(), "ys" | "columns" | "x")
+                && !choices.is_empty()
+                && let Some(input) = &field.line
+            {
+                body = body.child(self.batch_picker(&field.name, input.clone(), &choices, cx));
+            }
             if !help.is_empty() {
                 body = body.child(
                     div()
@@ -3063,8 +3375,55 @@ impl Render for InspectorPanel {
         }
         if node.feature == "python" {
             self.sync_python(&node, window, cx);
+            let node_id = node.id.clone();
+            body = body.child(
+                Button::new("draft-code")
+                    .small()
+                    .label("Draft code")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ask_model(&node_id, "code", window, cx);
+                    })),
+            );
             body = body.child(self.python_block(cx));
         }
+        let export_id = node.id.clone();
+        let customize_id = node.id.clone();
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    Button::new("export-template")
+                        .small()
+                        .ghost()
+                        .label("Export template")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.export_node(&export_id, cx);
+                        })),
+                )
+                .child(
+                    Button::new("customize-template")
+                        .small()
+                        .ghost()
+                        .label("Customize")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.customize_node(&customize_id, cx);
+                        })),
+                )
+                .child(
+                    Button::new("import-template")
+                        .small()
+                        .ghost()
+                        .label("Import")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.session.update(cx, |session, cx| {
+                                session.path_prompt = Some(PathKind::ImportTemplate);
+                                cx.notify();
+                            });
+                        })),
+                ),
+        );
         if let Some(note) = self.session.read(cx).assist_note.clone() {
             body = body.child(
                 div()
@@ -3076,6 +3435,41 @@ impl Render for InspectorPanel {
             );
         }
         if node.feature == "change_headers" {
+            let node_id = node.id.clone();
+            body = body.child(
+                Button::new("suggest-names")
+                    .small()
+                    .label("Suggest names")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ask_model(&node_id, "mapping", window, cx);
+                    })),
+            );
+            let draft = self.session.read(cx).rename_draft.clone();
+            if !draft.is_empty() {
+                for (from, to) in &draft {
+                    body = body.child(div().text_xs().child(format!("{from} → {to}")));
+                }
+                let session = self.session.clone();
+                let node_id = node.id.clone();
+                body = body.child(
+                    Button::new("apply-names")
+                        .small()
+                        .label("Apply names")
+                        .on_click(move |_, _, cx| {
+                            let pairs = session.read(cx).rename_draft.clone();
+                            let mapping = pairs
+                                .into_iter()
+                                .map(|(from, to)| json!({"from": from, "to": to}))
+                                .collect::<Vec<_>>();
+                            session.update(cx, |session, cx| {
+                                session.rename_draft.clear();
+                                session.canvas.update(cx, |canvas, cx| {
+                                    canvas.set_param(&node_id, "mapping", json!(mapping), cx);
+                                });
+                            });
+                        }),
+                );
+            }
             body = body.child(
                 div()
                     .text_xs()
@@ -3272,6 +3666,182 @@ fn field_applies(node: &graph::Node, name: &str) -> bool {
     }
 }
 
+fn fit_summary(fitted: &serde_json::Value) -> gpui_kit::AnyElement {
+    let summary = fitted
+        .get("summary")
+        .and_then(|item| item.as_str())
+        .unwrap_or("Fitted parameters");
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .child(summary.to_string());
+    if let Some(columns) = fitted.get("columns").and_then(|item| item.as_object()) {
+        for (name, stats) in columns {
+            let center = stats
+                .get("center")
+                .and_then(|item| item.as_f64())
+                .unwrap_or(0.0);
+            let scale = stats
+                .get("scale")
+                .and_then(|item| item.as_f64())
+                .unwrap_or(1.0);
+            column = column.child(format!("{name}: center {center:.4}, scale {scale:.4}"));
+        }
+    }
+    if let Some(coefficients) = fitted.get("coefficients").and_then(|item| item.as_object()) {
+        for (name, value) in coefficients {
+            let number = value.as_f64().unwrap_or(0.0);
+            column = column.child(format!("{name}: {number:.4}"));
+        }
+    }
+    column.into_any_element()
+}
+
+fn parse_rename(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches(['-', '*', ' ']);
+            if line.is_empty() {
+                return None;
+            }
+            let (from, to) = line.split_once("->").or_else(|| line.split_once(','))?;
+            let from = from.trim();
+            let to = to.trim();
+            if from.is_empty() || to.is_empty() {
+                None
+            } else {
+                Some((from.to_string(), to.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn library_dir() -> PathBuf {
+    if let Some(dir) = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+    {
+        return PathBuf::from(dir).join("ohmypipeline").join("library");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("ohmypipeline")
+        .join("library")
+}
+
+fn library_templates() -> Vec<graph::NodeTemplate> {
+    let mut templates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(library_dir()) else {
+        return templates;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Ok(template) = graph::load_template(&text) {
+            templates.push(template);
+        }
+    }
+    templates.sort_by(|left, right| left.title.cmp(&right.title));
+    templates
+}
+
+fn sanitize_id(text: &str) -> String {
+    let id: String = text
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let id = id.trim_matches('_').to_string();
+    if id.is_empty() { "template".into() } else { id }
+}
+
+fn save_template(template: &graph::NodeTemplate) -> Result<PathBuf, String> {
+    let dir = library_dir();
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(format!("{}.json", sanitize_id(&template.id)));
+    std::fs::write(&path, template.to_json()).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn import_template(path: &std::path::Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let template = graph::load_template(&text)?;
+    let saved = save_template(&template)?;
+    Ok(saved.display().to_string())
+}
+
+fn add_library_node(canvas: &mut CanvasModel, id: &str, cx: &mut gpui_kit::Context<CanvasModel>) {
+    let templates = library_templates();
+    let Some(template) = templates.into_iter().find(|item| item.id == id) else {
+        return;
+    };
+    let feature = template.base.clone().unwrap_or_else(|| "python".into());
+    let Some(node) = canvas.add_feature(&feature, cx) else {
+        return;
+    };
+    canvas.set_label(&node, template.title.clone(), cx);
+    for param in &template.params {
+        canvas.set_param(&node, &param.name, param.default.clone(), cx);
+    }
+    if let Some(notes) = template.notes.clone() {
+        canvas.editor_mut().set_notes(&node, notes);
+    }
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn axis_pairs(text: &str) -> Vec<(String, String)> {
+    split_list(text)
+        .into_iter()
+        .filter_map(|part| {
+            let (name, axis) = part.split_once(':')?;
+            let axis = if axis.trim() == "right" {
+                "right"
+            } else {
+                "left"
+            };
+            Some((name.trim().to_string(), axis.to_string()))
+        })
+        .collect()
+}
+
+fn chart_limitation(node: &graph::Node) -> String {
+    let mut axes = Vec::new();
+    if node.param_str("log_x") == "yes" {
+        axes.push("x");
+    }
+    if node.param_str("log_left") == "yes" {
+        axes.push("left y");
+    }
+    if node.param_str("log_right") == "yes" {
+        axes.push("right y");
+    }
+    if axes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "GPUI Chart has no log scale. {} stays linear.",
+            axes.join(", ")
+        )
+    }
+}
+
 fn writer_note(graph: &graph::Graph, id: &str, rows: u64) -> Option<String> {
     let node = graph.node(id)?;
     if !matches!(
@@ -3382,6 +3952,9 @@ fn field_help(feature: &str, name: &str) -> &'static str {
         ("crosstab", "columns") => "The column that becomes the new headers.",
         ("crosstab", "values") => "Optional numbers to aggregate. Empty counts the rows.",
         ("isin", "values") => "Comma-separated values to keep.",
+        ("calculate", "expr") => {
+            "One assignment per line, such as revenue = qty * price. Only + - * / parentheses, numbers, and column names."
+        }
         ("resample" | "asfreq" | "date_range", "freq") => "A pandas offset such as D, W, or h.",
         ("cut", "bins") => "An integer count, or edges such as 0,5,10.",
         ("pivot", "index") => "Row labels of the pivot.",

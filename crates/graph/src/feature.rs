@@ -143,14 +143,32 @@ const LITERAL_PARAMS: &[ParamDef] = &[
     },
 ];
 
-const PYTHON_PARAMS: &[ParamDef] = &[ParamDef {
-    name: "code",
-    kind: ParamKind::Code,
-    wireable: true,
-    wire_types: &[TypeName::Code],
-    options: &[],
-    default_json: "\"def run(df):\\n    return df\\n\"",
-}];
+const PYTHON_PARAMS: &[ParamDef] = &[
+    ParamDef {
+        name: "goal",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\"",
+    },
+    ParamDef {
+        name: "notes",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\"",
+    },
+    ParamDef {
+        name: "code",
+        kind: ParamKind::Code,
+        wireable: true,
+        wire_types: &[TypeName::Code],
+        options: &[],
+        default_json: "\"def run(df):\\n    return df\\n\"",
+    },
+];
 
 const CHART_PARAMS: &[ParamDef] = &[
     ParamDef {
@@ -192,6 +210,46 @@ const CHART_PARAMS: &[ParamDef] = &[
         wire_types: &[],
         options: &[],
         default_json: "24",
+    },
+    ParamDef {
+        name: "ys",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\"",
+    },
+    ParamDef {
+        name: "y_axes",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\"",
+    },
+    ParamDef {
+        name: "log_x",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["no", "yes"],
+        default_json: "\"no\"",
+    },
+    ParamDef {
+        name: "log_left",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["no", "yes"],
+        default_json: "\"no\"",
+    },
+    ParamDef {
+        name: "log_right",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["no", "yes"],
+        default_json: "\"no\"",
     },
 ];
 
@@ -1230,6 +1288,51 @@ pub static CATALOG: &[FeatureDef] = &[
         DF_OR_SERIES,
         MAP_PARAM,
     ),
+    feature_row(
+        "standard_scale",
+        "Standard scale",
+        "Clean",
+        SCALE_IN,
+        Some(TypeName::Dataframe),
+        DF,
+        SCALE_PARAM,
+    ),
+    feature_row(
+        "minmax_scale",
+        "Min-max scale",
+        "Clean",
+        SCALE_IN,
+        Some(TypeName::Dataframe),
+        DF,
+        SCALE_PARAM,
+    ),
+    feature_row(
+        "robust_scale",
+        "Robust scale",
+        "Clean",
+        SCALE_IN,
+        Some(TypeName::Dataframe),
+        DF,
+        SCALE_PARAM,
+    ),
+    feature_row(
+        "ols",
+        "Linear fit",
+        "Clean",
+        SCALE_IN,
+        Some(TypeName::Dataframe),
+        DF,
+        OLS_PARAM,
+    ),
+    feature_row(
+        "calculate",
+        "Calculate",
+        "Code",
+        &[IN_DF],
+        Some(TypeName::Dataframe),
+        DF,
+        CALCULATE_PARAM,
+    ),
     FeatureDef {
         id: "arith",
         title: "Arithmetic",
@@ -1892,6 +1995,64 @@ const ASOF_PARAM: &[ParamDef] = &[
     },
 ];
 
+const SCALE_IN: &[PortDef] = &[
+    PortDef {
+        name: "in",
+        accepts: DF,
+        multi: false,
+    },
+    PortDef {
+        name: "fit",
+        accepts: DF,
+        multi: false,
+    },
+];
+const SCALE_PARAM: &[ParamDef] = &[
+    text_param("columns"),
+    ParamDef {
+        name: "action",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["fit_transform", "transform"],
+        default_json: "\"fit_transform\"",
+    },
+];
+const OLS_PARAM: &[ParamDef] = &[
+    ParamDef {
+        name: "y",
+        kind: ParamKind::Column,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\"",
+    },
+    text_param("x"),
+    ParamDef {
+        name: "residuals",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["yes", "no"],
+        default_json: "\"yes\"",
+    },
+    ParamDef {
+        name: "action",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["fit_transform", "transform"],
+        default_json: "\"fit_transform\"",
+    },
+];
+const CALCULATE_PARAM: &[ParamDef] = &[ParamDef {
+    name: "expr",
+    kind: ParamKind::Code,
+    wireable: false,
+    wire_types: &[],
+    options: &[],
+    default_json: "\"\"",
+}];
 const OTHER_VALUE_TYPES: &[TypeName] = &[TypeName::Dataframe, TypeName::Series, TypeName::Scalar];
 const IN_OTHER: PortDef = PortDef {
     name: "other",

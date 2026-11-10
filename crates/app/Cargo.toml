@@ -13,6 +13,7 @@ gpui-kit = "0.9"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+regex = "1"
 
 [lints]
 workspace = true

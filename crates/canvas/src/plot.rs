@@ -1,6 +1,7 @@
 //! Chart marks drawn with GPUI Kit. The worker never sees these pixels.
 
 use gpui_kit::component::chart::{BarChart, LineChart, PieChart};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Corners, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
@@ -14,6 +15,8 @@ pub struct PlotPoint {
     pub y: f32,
     pub series: String,
     pub index: usize,
+    /// "left" or "right". GPUI Chart draws one y axis, so right is a second plot.
+    pub axis: String,
 }
 
 pub fn points_from(
@@ -72,6 +75,7 @@ pub fn points_from(
             y,
             series,
             index,
+            axis: "left".into(),
         });
     }
     if points.is_empty() {
@@ -80,6 +84,43 @@ pub fn points_from(
     Ok(points)
 }
 
+pub fn points_for_encodings(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    x_name: &str,
+    y_names: &[String],
+    series_name: &str,
+    axes: &[(String, String)],
+) -> Result<Vec<PlotPoint>, String> {
+    let names = if y_names.is_empty() {
+        vec![String::new()]
+    } else {
+        y_names.to_vec()
+    };
+    let mut all = Vec::new();
+    for y_name in &names {
+        let mut part = points_from(columns, rows, x_name, y_name, series_name)?;
+        let axis = axes
+            .iter()
+            .find(|(name, _)| name == y_name)
+            .map(|(_, axis)| axis.clone())
+            .unwrap_or_else(|| "left".into());
+        for point in &mut part {
+            if names.len() > 1 {
+                point.series = if series_name.is_empty() {
+                    y_name.clone()
+                } else {
+                    format!("{y_name} · {}", point.series)
+                };
+            }
+            point.axis = axis.clone();
+        }
+        all.extend(part);
+    }
+    Ok(all)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn feature_chart(
     mark: &str,
     points: Vec<PlotPoint>,
@@ -88,6 +129,7 @@ pub fn feature_chart(
     reduced_motion: bool,
     interactive: bool,
     id_prefix: &str,
+    limitation: &str,
 ) -> AnyElement {
     if points.is_empty() {
         return div()
@@ -98,6 +140,12 @@ pub fn feature_chart(
             .into_any_element();
     }
     let appear = !reduced_motion;
+    let limitation_row = (!limitation.is_empty()).then(|| {
+        div()
+            .text_xs()
+            .text_color(foreground)
+            .child(limitation.to_string())
+    });
     if mark == "pie" {
         let legend = slice_legend(&points, &colors, foreground);
         let prefix = id_prefix.to_string();
@@ -116,8 +164,18 @@ pub fn feature_chart(
             .gap_1()
             .child(div().flex_1().min_h(px(96.)).child(pie))
             .child(legend)
+            .children(limitation_row)
             .into_any_element();
     }
+    let right: Vec<PlotPoint> = points
+        .iter()
+        .filter(|point| point.axis == "right")
+        .cloned()
+        .collect();
+    let points: Vec<PlotPoint> = points
+        .into_iter()
+        .filter(|point| point.axis != "right")
+        .collect();
     if matches!(mark, "bar" | "histogram") {
         let names = series_names(&points);
         let legend = series_legend(&names, &colors, foreground);
@@ -149,6 +207,17 @@ pub fn feature_chart(
             .gap_1()
             .child(div().flex_1().min_h(px(96.)).child(bars))
             .child(legend)
+            .when(!right.is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(foreground)
+                        .child("GPUI Chart has one y axis. Right-axis series need a line mark, drawn in a second plot."),
+                )
+            })
+            .when(!limitation.is_empty(), |row| {
+                row.child(div().text_xs().text_color(foreground).child(limitation.to_string()))
+            })
             .into_any_element();
     }
     let names = series_names(&points);
@@ -182,6 +251,39 @@ pub fn feature_chart(
             .appear(appear);
         plot = plot.child(div().absolute().size_full().child(line));
     }
+    let right_names = series_names(&right);
+    let right_legend = series_legend(&right_names, &colors, foreground);
+    let (right_min, right_max) = if right.is_empty() {
+        (0.0, 1.0)
+    } else {
+        y_span(&right)
+    };
+    let mut right_plot = div().relative().h(px(120.));
+    for (index, name) in right_names.iter().enumerate() {
+        let rows: Vec<PlotPoint> = right
+            .iter()
+            .filter(|point| &point.series == name)
+            .cloned()
+            .collect();
+        let color = colors[(index + 2) % colors.len()];
+        let prefix = id_prefix.to_string();
+        let series_name = name.clone();
+        let line = LineChart::new(rows)
+            .id(SharedString::from(format!("{prefix}-right-{index}")))
+            .x(|point: &PlotPoint| point.x.clone())
+            .y(|point: &PlotPoint| point.y)
+            .y_domain(right_min, right_max)
+            .x_axis(true)
+            .y_axis(true)
+            .y_tick_count(3)
+            .grid(index == 0)
+            .dot()
+            .name(series_name.clone())
+            .stroke(color)
+            .interactive(false)
+            .appear(appear);
+        right_plot = right_plot.child(div().absolute().size_full().child(line));
+    }
     div()
         .size_full()
         .flex()
@@ -189,6 +291,24 @@ pub fn feature_chart(
         .gap_1()
         .child(plot)
         .child(legend)
+        .when(!right.is_empty(), |column| {
+            column
+                .child(
+                    div().text_xs().text_color(foreground).child(
+                        "Right axis. GPUI Chart has one y axis, so this is a separate plot.",
+                    ),
+                )
+                .child(right_plot)
+                .child(right_legend)
+        })
+        .when(!limitation.is_empty(), |column| {
+            column.child(
+                div()
+                    .text_xs()
+                    .text_color(foreground)
+                    .child(limitation.to_string()),
+            )
+        })
         .into_any_element()
 }
 

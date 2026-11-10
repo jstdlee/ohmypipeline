@@ -102,6 +102,13 @@ pub struct Node {
     pub output: Option<PortRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<Presentation>,
+    /// A note the user wrote on this node. The worker ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Fitted scaler or regression parameters. Not part of the run fingerprint,
+    /// so saving a preview fit does not turn Full off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fitted: Option<Value>,
     /// Set on load when `feature` is not in the catalog. Not written back;
     /// the unknown type string is what round-trips.
     #[serde(skip)]
@@ -311,6 +318,8 @@ impl Node {
             wired: BTreeSet::new(),
             output: None,
             presentation: None,
+            notes: None,
+            fitted: None,
             unknown: def.is_none(),
         };
         if feature_id == "python" {
@@ -494,6 +503,24 @@ impl Node {
                 }
             }
             "rolling" => format!("window {}", self.param_i64("window").unwrap_or(3)),
+            "standard_scale" | "minmax_scale" | "robust_scale" | "ols" => self
+                .fitted
+                .as_ref()
+                .and_then(|fitted| fitted.get("source"))
+                .and_then(|source| source.as_str())
+                .map(|source| match source {
+                    "full" => "fit on the full file".to_string(),
+                    _ => "fit on the preview".to_string(),
+                })
+                .unwrap_or_else(|| "not fit yet".to_string()),
+            "calculate" => {
+                let expr = self.param_str("expr");
+                if expr.is_empty() {
+                    "no expression".to_string()
+                } else {
+                    expr.lines().next().unwrap_or("").to_string()
+                }
+            }
             "crosstab" => format!(
                 "{} × {}",
                 self.param_str("index"),

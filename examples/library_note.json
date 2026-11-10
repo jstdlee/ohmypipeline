@@ -1,0 +1,18 @@
+{
+  "format": "ohmypipeline-template",
+  "version": 1,
+  "id": "library_note",
+  "title": "Library note",
+  "group": "Library",
+  "base": "python",
+  "notes": "Saved from the user library.",
+  "ports": [
+    { "name": "df", "accepts": ["dataframe"], "multi": false }
+  ],
+  "params": [
+    { "name": "goal", "kind": "string", "default": "Describe the frame" },
+    { "name": "notes", "kind": "string", "default": "Saved from the user library." },
+    { "name": "code", "kind": "code", "default": "def run(df):\n    return df.head(2)\n" }
+  ],
+  "code": "def run(df):\n    return df.head(2)\n"
+}

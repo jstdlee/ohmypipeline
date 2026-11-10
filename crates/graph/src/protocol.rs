@@ -87,6 +87,9 @@ pub struct Reply {
     pub error: Option<WorkerError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csv_path: Option<String>,
+    /// Fitted parameters from a scaler or OLS node, when this run fit them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fitted: Option<Value>,
 }
 
 /// A preview cell as text. Null is an em dash, never the letters n-u-l-l.
@@ -202,6 +205,7 @@ mod tests {
             claim: "preview".into(),
             error: None,
             csv_path: None,
+            fitted: None,
         };
         let frame = encode_frame(&reply).unwrap();
         let back: Reply = decode_frame(&frame).unwrap();

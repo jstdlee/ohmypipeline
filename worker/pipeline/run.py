@@ -55,6 +55,9 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         window = PREVIEW_ROW_CAP if mode == "preview" else TABLE_WINDOW
     window = int(window)
 
+    from pipeline.scale import clear_fits, take_fit
+
+    clear_fits()
     try:
         if not node_id:
             raise NodeError("", "no node was requested")
@@ -99,6 +102,8 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "error": None,
             }
         )
+        if fit := take_fit(node_id):
+            payload["fitted"] = fit
         return payload
     except NodeError as exc:
         return {
@@ -189,6 +194,7 @@ def compute_node(
         "added_inputs": node.get("added_inputs"),
         "wired": sorted(node.get("wired") or []),
         "output": node.get("output"),
+        "fitted": node.get("fitted"),
         "parents": parent_keys,
         "mode": mode,
         "override": overrides.get(node_id),
@@ -230,6 +236,11 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         "get_dummies",
         "wide_to_long",
         "combine_first",
+        "standard_scale",
+        "minmax_scale",
+        "robust_scale",
+        "ols",
+        "calculate",
         "change_headers",
         "query",
         "to_frame",
@@ -498,6 +509,10 @@ def execute(
         return batched
     from pipeline.more import run_more
 
+    if kind in ("standard_scale", "minmax_scale", "robust_scale", "ols", "calculate"):
+        from pipeline.scale import run_scale
+
+        return run_scale(kind, node_id, node, params, require_frame_or_series(), wired("fit"), mode)
     extra_more = run_more(
         kind,
         node_id,

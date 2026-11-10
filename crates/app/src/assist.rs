@@ -46,6 +46,12 @@ pub fn local_question(job: &AssistJob) -> Option<String> {
                 .into(),
         );
     }
+    if matches!(job.field.as_str(), "mapping" | "code" | "goal") && job.columns.is_empty() {
+        return Some(
+            "Run Preview so the model can see column names and a few values. Nothing was invented."
+                .into(),
+        );
+    }
     let wants_column = matches!(
         job.field.as_str(),
         "name" | "x" | "y" | "by" | "on" | "series" | "from"

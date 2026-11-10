@@ -700,6 +700,119 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(merged["rows"][2][price], 12)
 
 
+class ScaleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+        self.csv = self.tmp / "scale.csv"
+        self.csv.write_text("qty,x,y\n1,1,2\n2,2,4\n3,3,6\n", encoding="utf-8")
+
+    def test_standard_scale_labels_a_preview_fit_and_transform_reuses_it(self):
+        read = node("n1", "read_csv", {"path": str(self.csv)})
+        fitted = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(
+                    [read, node("n2", "standard_scale", {"columns": "qty", "action": "fit_transform"})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(fitted.get("error"), fitted.get("error"))
+        self.assertEqual(fitted["fitted"]["source"], "preview")
+        self.assertIn("preview", fitted["fitted"]["summary"])
+        self.assertAlmostEqual(fitted["rows"][1][fitted["columns"].index("qty")], 0.0)
+        changed = self.tmp / "scale2.csv"
+        changed.write_text("qty\n1\n2\n3\n10\n", encoding="utf-8")
+        transformed = run_job(
+            {
+                "generation": 2,
+                "mode": "full",
+                "graph": graph_of(
+                    [
+                        node("n1", "read_csv", {"path": str(changed)}),
+                        node(
+                            "n2",
+                            "standard_scale",
+                            {"columns": "qty", "action": "transform"},
+                            fitted=fitted["fitted"],
+                        ),
+                    ],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(transformed.get("error"), transformed.get("error"))
+        self.assertNotIn("fitted", transformed)
+        bare = run_job(
+            {
+                "generation": 3,
+                "mode": "preview",
+                "graph": graph_of(
+                    [node("n1", "read_csv", {"path": str(self.csv)}), node("n2", "minmax_scale", {"action": "transform"})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+            }
+        )
+        self.assertIn("no fitted parameters", bare["error"]["message"])
+
+    def test_ols_writes_fitted_values_and_coefficients(self):
+        read = node("n1", "read_csv", {"path": str(self.csv)})
+        reply = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(
+                    [read, node("n2", "ols", {"y": "y", "x": "x", "residuals": "yes", "action": "fit_transform"})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertAlmostEqual(reply["fitted"]["coefficients"]["x"], 2.0, places=4)
+        self.assertIn("y_fitted", reply["columns"])
+        self.assertIn("y_residual", reply["columns"])
+        self.assertAlmostEqual(reply["rows"][0][reply["columns"].index("y_residual")], 0.0, places=4)
+
+    def test_calculate_assigns_columns_and_rejects_other_syntax(self):
+        read = node("n1", "read_csv", {"path": str(self.csv)})
+        reply = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(
+                    [read, node("n2", "calculate", {"expr": "double = qty * 2\nsum = qty + x"})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["rows"][0][reply["columns"].index("double")], 2)
+        bad = run_job(
+            {
+                "generation": 2,
+                "mode": "preview",
+                "graph": graph_of(
+                    [read, node("n2", "calculate", {"expr": "bad = qty + missing"})],
+                    [edge("n1", "n2")],
+                ),
+                "node": "n2",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIn("unknown column missing", bad["error"]["message"])
+
+
 class MoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(__file__).resolve().parent / "_tmp"

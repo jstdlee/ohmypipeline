@@ -507,6 +507,26 @@ impl Document {
         true
     }
 
+    /// Stores a fit without an undo step. A preview fit must not become an edit the user undoes away by accident, and it is not part of the run fingerprint.
+    pub fn set_fitted(&mut self, node_id: &str, fitted: Option<serde_json::Value>) {
+        if let Some(node) = self.graph.node_mut(node_id) {
+            node.fitted = fitted;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_notes(&mut self, node_id: &str, notes: String) -> bool {
+        if self.readonly {
+            return false;
+        }
+        self.mutate(|graph| {
+            if let Some(node) = graph.node_mut(node_id) {
+                node.notes = if notes.is_empty() { None } else { Some(notes) };
+            }
+        });
+        true
+    }
+
     pub fn set_label(&mut self, node_id: &str, label: String) -> bool {
         if self.readonly {
             return false;

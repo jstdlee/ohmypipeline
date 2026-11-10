@@ -11,6 +11,7 @@ mod geom;
 mod model;
 mod protocol;
 mod sniff;
+mod template;
 mod types;
 
 pub use connect::{
@@ -33,6 +34,9 @@ pub use protocol::{
     WorkerError, cell_text, decode_frame, encode_frame, read_frame, status_line, write_frame,
 };
 pub use sniff::{csv_headers, csv_headers_after, sniff_separator};
+pub use template::{
+    NodeTemplate, TEMPLATE_FORMAT, TEMPLATE_VERSION, TemplateParam, TemplatePort, load_template,
+};
 pub use types::TypeName;
 
 pub const FORMAT: &str = "ohmypipeline";
