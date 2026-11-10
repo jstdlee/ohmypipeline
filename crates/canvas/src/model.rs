@@ -49,6 +49,18 @@ impl Tool {
     }
 }
 
+/// Run or reset one node. Emitted from the card context menu; the workspace
+/// owns the execution state, so it does the work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeCommand {
+    /// Run this node as a preview job.
+    Execute,
+    /// The same run, with the menu name that says where it stops.
+    ExecuteTo,
+    /// Drop this node's cached output and everything downstream of it.
+    Reset,
+}
+
 pub enum CanvasEvent {
     Edited,
     SelectionChanged,
@@ -62,6 +74,19 @@ pub enum CanvasEvent {
         ty: Option<TypeName>,
         at: Point,
         screen: GPoint<Pixels>,
+    },
+    /// An Execute, Execute to here, or Reset picked from a card or the menu.
+    NodeCommand {
+        id: String,
+        command: NodeCommand,
+    },
+    /// The frame on the clicked wire. The wire's source node computes it.
+    PreviewWire {
+        edge: String,
+    },
+    /// An output port was clicked without a drag.
+    PreviewPort {
+        node: String,
     },
 }
 
@@ -123,6 +148,8 @@ enum Drag {
         rewired: Vec<Edge>,
         /// Canvas point under the pointer.
         pointer: Point,
+        /// Canvas point where the drag began, to tell a click from a move.
+        origin: Point,
     },
     /// Drag of one reroute point on a wire.
     Reroute {
@@ -180,13 +207,64 @@ struct FrameAnim {
     started: Instant,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dot {
-    Muted,
-    Success,
-    Warning,
-    Danger,
+/// How long a badge color blends into the next one.
+const BADGE_FADE: Duration = Duration::from_millis(120);
+
+/// What the header badge of a card says. The reason and the message come
+/// from the session, which owns the execution state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Badge {
+    /// Hollow ring. The reason, when it is known, goes in the tooltip.
+    NotConfigured(Option<String>),
+    /// Filled muted dot.
+    Configured,
+    /// Accent dot, pulsing while reduced motion is off.
     Running,
+    /// Filled success dot.
+    Executed,
+    /// Filled danger dot, plus a danger border on the card.
+    Error(String),
+    /// Filled warning dot.
+    Stale,
+    /// The branch is skipped. The whole card draws at 40 percent opacity.
+    Inactive,
+}
+
+impl Badge {
+    /// Stable index of the badge's color class. A change between two dot
+    /// classes fades over 120 ms; a change into or out of the ring, or of
+    /// the inactive dimming, jumps straight to the new look.
+    fn class(&self) -> u8 {
+        match self {
+            Self::NotConfigured(_) => 0,
+            Self::Configured => 1,
+            Self::Running => 2,
+            Self::Executed => 3,
+            Self::Error(_) => 4,
+            Self::Stale => 5,
+            Self::Inactive => 6,
+        }
+    }
+
+    fn is_dot(&self) -> bool {
+        matches!(self.class(), 1..=5)
+    }
+
+    /// The tooltip text of the badge.
+    pub fn tooltip_text(&self) -> String {
+        match self {
+            Self::NotConfigured(reason) => match reason {
+                Some(reason) => format!("Not configured: {reason}"),
+                None => "Not configured".to_string(),
+            },
+            Self::Configured => "Configured".to_string(),
+            Self::Running => "Running".to_string(),
+            Self::Executed => "Executed".to_string(),
+            Self::Error(message) => format!("Error: {message}"),
+            Self::Stale => "Stale: an input or setting changed".to_string(),
+            Self::Inactive => "Inactive branch".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -198,7 +276,10 @@ pub struct FrameView {
 pub struct CanvasModel {
     focus: FocusHandle,
     editor: Document,
-    dots: BTreeMap<String, Dot>,
+    badges: BTreeMap<String, Badge>,
+    /// Color of the badge before the last change, and when it changed. A
+    /// badge color blends into the next one over 120 ms when motion is on.
+    badge_fade: BTreeMap<String, (Badge, Instant)>,
     pub(crate) selection: Vec<String>,
     tool: Tool,
     space_hand: bool,
@@ -262,7 +343,8 @@ impl CanvasModel {
         Self {
             focus: cx.focus_handle(),
             editor: Document::new(),
-            dots: BTreeMap::new(),
+            badges: BTreeMap::new(),
+            badge_fade: BTreeMap::new(),
             selection: Vec::new(),
             tool: Tool::Select,
             space_hand: false,
@@ -402,10 +484,30 @@ impl CanvasModel {
         cx.notify();
     }
 
-    pub fn set_dots(&mut self, dots: BTreeMap<String, Dot>, cx: &mut Context<Self>) {
-        let running = dots.values().any(|dot| *dot == Dot::Running);
-        self.dots = dots;
-        let _ = running;
+    pub fn set_badges(&mut self, badges: BTreeMap<String, Badge>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut gain = Vec::new();
+        for (id, badge) in &badges {
+            let old = self.badges.get(id).cloned().unwrap_or(Badge::Configured);
+            if old == *badge || !old.is_dot() || !badge.is_dot() {
+                continue;
+            }
+            gain.push(id.clone());
+            self.badge_fade.insert(id.clone(), (old, now));
+        }
+        self.badges = badges;
+        if !gain.is_empty() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(BADGE_FADE + Duration::from_millis(40))
+                    .await;
+                // The motion tick loop paints the blend on frames that run.
+                // This timer is the floor: it repaints the settled color even
+                // when the window draws no motion frames at all.
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -413,6 +515,7 @@ impl CanvasModel {
         self.reduced_motion = reduced;
         if reduced {
             self.settle = None;
+            self.badge_fade.clear();
             if let Some(anim) = self.camera_anim.take() {
                 self.editor.set_camera(anim.to);
             }
@@ -432,6 +535,8 @@ impl CanvasModel {
         self.camera_anim = None;
         self.frame_anim.clear();
         self.wire_cache.clear();
+        self.badge_fade.clear();
+        self.badges.clear();
         self.minimap_drag = false;
         self.minimap_fade = None;
         self.hover_wire = None;
@@ -851,6 +956,7 @@ impl CanvasModel {
             to: None,
             rewired: Vec::new(),
             pointer: at,
+            origin: at,
         });
         self.refresh_link_status();
         cx.notify();
@@ -869,6 +975,7 @@ impl CanvasModel {
             to: None,
             rewired: Vec::new(),
             pointer: self.canvas_of(point(px(local.0), px(local.1))),
+            origin: self.canvas_of(point(px(local.0), px(local.1))),
         });
         self.refresh_link_status();
         cx.notify();
@@ -1372,8 +1479,13 @@ impl CanvasModel {
         }
         if let Some((edge, _)) = self.wire_hit_at(canvas) {
             self.picked_reroute = None;
-            self.selection = vec![edge];
+            self.selection = vec![edge.clone()];
             cx.emit(CanvasEvent::SelectionChanged);
+            // A click on a wire shows the frame it carries. The workspace
+            // turns this into a preview job for the wire's source node.
+            if event.click_count == 1 {
+                cx.emit(CanvasEvent::PreviewWire { edge });
+            }
             cx.notify();
             return;
         }
@@ -1400,6 +1512,7 @@ impl CanvasModel {
         let local = self.local_of(event.position);
         window.focus(&self.focus, cx);
         let pointer = self.canvas_of(local);
+        let origin = pointer;
         if side == Side::Out {
             self.editor.begin_gesture();
             let wires: Vec<Edge> = self
@@ -1426,6 +1539,7 @@ impl CanvasModel {
                 to: None,
                 rewired,
                 pointer,
+                origin,
             });
         } else if let Some(edge) = self
             .editor
@@ -1443,6 +1557,7 @@ impl CanvasModel {
                     to: Some((node.to_string(), port.to_string())),
                     rewired: Vec::new(),
                     pointer,
+                    origin,
                 });
             }
         } else {
@@ -1454,6 +1569,7 @@ impl CanvasModel {
                 to: Some((node.to_string(), port.to_string())),
                 rewired: Vec::new(),
                 pointer,
+                origin,
             });
         }
         self.refresh_link_status();
@@ -1754,6 +1870,7 @@ impl CanvasModel {
                 to,
                 rewired,
                 pointer,
+                origin,
                 ..
             }) => {
                 if !rewired.is_empty() {
@@ -1816,6 +1933,18 @@ impl CanvasModel {
                     });
                     self.editor.commit_gesture();
                     self.changed(cx);
+                } else if let Some((from_node, _)) = from.clone()
+                    // A click on the output port that never dragged: show the
+                    // frame this output produces. A real drag a few pixels
+                    // away still opens the catalog.
+                    && (pointer.x - origin.x).abs() + (pointer.y - origin.y).abs() < 6.0 / self.zoom()
+                {
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.selection = vec![from_node.clone()];
+                    cx.emit(CanvasEvent::SelectionChanged);
+                    cx.emit(CanvasEvent::PreviewPort { node: from_node });
+                    cx.notify();
                 } else if let Some((from_node, from_port)) = from.clone() {
                     self.status.clear();
                     let ty = graph::output_types(self.editor.graph(), &from_node)
@@ -2092,7 +2221,7 @@ impl CanvasModel {
             || self.camera_anim.is_some()
             || !self.frame_anim.is_empty()
             || self.minimap_fade.is_some()
-            || (self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion)
+            || (self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion)
     }
 
     fn tick_motion(&mut self) {
@@ -2120,7 +2249,9 @@ impl CanvasModel {
                 self.camera_anim = None;
             }
         }
-        if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
+        self.badge_fade
+            .retain(|_, (_, started)| started.elapsed() < BADGE_FADE);
+        if self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion {
             self.flow = (self.flow + 0.02) % 1.0;
         }
     }
@@ -2489,11 +2620,12 @@ impl Render for CanvasModel {
             hint: self.insert_hint.clone(),
         };
         let snap_target = link.as_ref().and_then(|item| item.snapped.clone());
-        let flow = if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
-            Some(self.flow)
-        } else {
-            None
-        };
+        let flow =
+            if self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion {
+                Some(self.flow)
+            } else {
+                None
+            };
         let graph = self.editor.graph().clone();
         let hovered = self.hovered.clone();
         let hidden = crate::frames::collapsed_members(&graph);
@@ -2804,15 +2936,34 @@ impl Render for CanvasModel {
                             .find(|(id, _)| id == &node.id)
                             .map(|(_, offset)| *offset)
                             .unwrap_or_else(|| Point::new(0.0, 0.0));
+                        let badge = self
+                            .badges
+                            .get(&node.id)
+                            .cloned()
+                            .unwrap_or(Badge::Configured);
+                        let fade = self.badge_fade.get(&node.id).and_then(|(from, started)| {
+                            if self.reduced_motion {
+                                return None;
+                            }
+                            let t = started.elapsed().as_secs_f32() / BADGE_FADE.as_secs_f32();
+                            (t < 1.0).then(|| {
+                                let from = badge_color(
+                                    from,
+                                    theme_muted,
+                                    theme_primary,
+                                    theme_success,
+                                    theme_warning,
+                                    theme_danger,
+                                );
+                                (from, t)
+                            })
+                        });
                         card_element(
                             entity.clone(),
                             node,
                             &graph,
-                            self.dots.get(&node.id).copied().unwrap_or(if node.unknown {
-                                Dot::Danger
-                            } else {
-                                Dot::Muted
-                            }),
+                            &badge,
+                            fade,
                             self.reduced_motion,
                             camera,
                             offset,
@@ -3103,6 +3254,51 @@ fn canvas_menu(
         .item(PopupMenuItem::new("Auto-layout").on_click(move |_, _, cx| {
             layout.update(cx, |this, cx| this.auto_layout(cx));
         }));
+    // A right click on a card leaves its node selected. The execution
+    // commands then land next to the edit ones.
+    let node = entity.read(cx).selection.iter().find_map(|id| {
+        entity
+            .read(cx)
+            .editor()
+            .graph()
+            .node(id)
+            .map(|node| node.id.clone())
+    });
+    if let Some(node) = node {
+        let run = entity.clone();
+        let run_to = entity.clone();
+        let reset = entity.clone();
+        let run_node = node.clone();
+        let run_to_node = node.clone();
+        menu = menu
+            .separator()
+            .item(PopupMenuItem::new("Execute").on_click(move |_, _, cx| {
+                run.update(cx, |_, cx| {
+                    cx.emit(CanvasEvent::NodeCommand {
+                        id: run_node.clone(),
+                        command: NodeCommand::Execute,
+                    })
+                });
+            }))
+            .item(
+                PopupMenuItem::new("Execute to here").on_click(move |_, _, cx| {
+                    run_to.update(cx, |_, cx| {
+                        cx.emit(CanvasEvent::NodeCommand {
+                            id: run_to_node.clone(),
+                            command: NodeCommand::ExecuteTo,
+                        })
+                    });
+                }),
+            )
+            .item(PopupMenuItem::new("Reset").on_click(move |_, _, cx| {
+                reset.update(cx, |_, cx| {
+                    cx.emit(CanvasEvent::NodeCommand {
+                        id: node.clone(),
+                        command: NodeCommand::Reset,
+                    })
+                });
+            }));
+    }
     // A right click on a wire adds bend commands to the same menu.
     if let Some((edge, at, segment)) = entity.read(cx).wire_pick.clone() {
         let add = entity.clone();
@@ -3513,12 +3709,72 @@ fn card_shadow(dragging: bool, ink: gpui_kit::Hsla) -> Vec<gpui_kit::BoxShadow> 
     }
 }
 
+/// Fill color of a badge. The hollow ring uses the border color instead,
+/// which `card_element` handles.
+fn badge_color(
+    badge: &Badge,
+    muted: gpui_kit::Hsla,
+    primary: gpui_kit::Hsla,
+    success: gpui_kit::Hsla,
+    warning: gpui_kit::Hsla,
+    danger: gpui_kit::Hsla,
+) -> gpui_kit::Hsla {
+    match badge {
+        Badge::NotConfigured(_) | Badge::Configured | Badge::Inactive => muted.opacity(0.55),
+        Badge::Running => primary,
+        Badge::Executed => success,
+        Badge::Error(_) => danger,
+        Badge::Stale => warning,
+    }
+}
+
+/// Linear blend of two theme colors, eased with the shared curve.
+fn mix_color(from: gpui_kit::Hsla, to: gpui_kit::Hsla, t: f32) -> gpui_kit::Hsla {
+    let t = motion::ease_out(t);
+    gpui_kit::Hsla {
+        h: from.h + (to.h - from.h) * t,
+        s: from.s + (to.s - from.s) * t,
+        l: from.l + (to.l - from.l) * t,
+        a: from.a + (to.a - from.a) * t,
+    }
+}
+
+/// The badge that sits at the end of a card header. Shows a tooltip with the
+/// state the canvas is claiming for the node.
+fn badge_element(
+    node_id: &str,
+    badge: &Badge,
+    color: gpui_kit::Hsla,
+    ring: gpui_kit::Hsla,
+    zoom: f32,
+) -> gpui_kit::AnyElement {
+    let size = px(7.0 * zoom);
+    let id = SharedString::from(format!("badge-{node_id}"));
+    let text = badge.tooltip_text();
+    let base = div()
+        .id(id)
+        .size(size)
+        .flex_shrink_0()
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+        });
+    if matches!(badge, Badge::NotConfigured(_)) {
+        base.rounded_full()
+            .border_1()
+            .border_color(ring)
+            .into_any_element()
+    } else {
+        base.rounded_full().bg(color).into_any_element()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn card_element(
     entity: Entity<CanvasModel>,
     node: &Node,
     graph: &graph::Graph,
-    dot_kind: Dot,
+    badge: &Badge,
+    fade: Option<(gpui_kit::Hsla, f32)>,
     reduced_motion: bool,
     camera: Camera,
     offset: Point,
@@ -3544,21 +3800,29 @@ fn card_element(
         .def()
         .map(|def| group_color(def.group, &paint.chart))
         .unwrap_or(paint.muted);
-    let pulse = if dot_kind == Dot::Running && !reduced_motion {
+    let ring = matches!(badge, Badge::NotConfigured(_));
+    let pulse = if matches!(badge, Badge::Running) && !reduced_motion {
         let wave = (Instant::now().elapsed().as_secs_f32() * 4.0).sin().abs();
         0.45 + 0.55 * wave
     } else {
         1.0
     };
-    let dot = match dot_kind {
-        Dot::Success => paint.success,
-        Dot::Warning => paint.warning,
-        Dot::Danger => paint.danger,
-        Dot::Running => paint.primary,
-        Dot::Muted => paint.muted.opacity(0.55),
-    }
+    let target = badge_color(
+        badge,
+        paint.muted,
+        paint.primary,
+        paint.success,
+        paint.warning,
+        paint.danger,
+    )
     .opacity(pulse);
-    let border_color = if dot_kind == Dot::Danger {
+    // A badge color takes 120 ms to settle into the next one. Reduced motion
+    // (and a ring, which has no fill to blend with) skips the blend.
+    let dot = match fade {
+        Some((from, t)) if !ring && t < 1.0 => mix_color(from, target, t),
+        _ => target,
+    };
+    let border_color = if matches!(badge, Badge::Error(_)) {
         paint.danger
     } else if selected {
         paint.primary
@@ -3587,6 +3851,8 @@ fn card_element(
         .border_color(border_color)
         .shadow(card_shadow(dragging, paint.fg))
         .overflow_hidden()
+        // An inactive branch draws its whole card dimmed.
+        .when(matches!(badge, Badge::Inactive), |card| card.opacity(0.4))
         .on_hover({
             let entity = entity.clone();
             let id = id.clone();
@@ -3716,7 +3982,7 @@ fn card_element(
                                 .text_color(paint.fg)
                                 .child(title),
                         )
-                        .child(div().size(px(7.0 * zoom)).rounded_full().bg(dot)),
+                        .child(badge_element(&id, badge, dot, paint.muted, zoom)),
                 )
                 .child(
                     div()

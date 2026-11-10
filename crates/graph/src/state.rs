@@ -133,6 +133,12 @@ impl ExecState {
         }
     }
 
+    /// The in-flight mark goes away, with no result recorded: the job was
+    /// replaced or cancelled. Only one job is in flight, so the whole set goes.
+    pub fn clear_running(&mut self) {
+        self.running.clear();
+    }
+
     /// These nodes finished, or were served from the cache. Their current
     /// dependency keys become the keys of the last success.
     pub fn record_success(&mut self, graph: &Graph, computed_ids: &[String]) {

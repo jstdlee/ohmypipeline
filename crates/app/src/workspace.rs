@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use canvas::{
-    CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, legend_entries, points_for_encodings,
-    port_slots,
+    Badge, CanvasEvent, CanvasModel, NodeCommand, Side, Tool, feature_chart, legend_entries,
+    points_for_encodings, port_slots,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -33,8 +33,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div, px,
 };
 use graph::{
-    CHART_POINT_CAP, Job, JobOp, PREVIEW_ROW_CAP, Presentation, RunMode, TABLE_WINDOW, ancestors,
-    cell_text, duplicate_headers, header_pairs, run_fingerprint, sinks, status_line,
+    CHART_POINT_CAP, ColumnStats, ExecState, Job, JobOp, NodeState, PREVIEW_ROW_CAP, Presentation,
+    RunMode, TABLE_WINDOW, ancestors, cell_text, duplicate_headers, header_pairs, run_fingerprint,
+    sinks, status_line,
 };
 use serde_json::{Value, json};
 
@@ -49,6 +50,8 @@ actions!(
         SaveFileAs,
         RunPreview,
         RunFull,
+        ExecuteNode,
+        ResetNode,
         UndoEdit,
         RedoEdit,
         DeleteSelection,
@@ -93,6 +96,19 @@ pub struct Session {
     pub assist_fill: Option<(String, String, String)>,
     pub assist_rx: Option<std::sync::mpsc::Receiver<crate::assist::AssistReply>>,
     pub rename_draft: Vec<(String, String)>,
+    /// Per-node execution bookkeeping. The badges on cards are its view.
+    pub exec: ExecState,
+    /// Per-column stats of the last run that asked for them (a wire or a
+    /// port preview).
+    pub stats: Option<Vec<ColumnStats>>,
+    /// The Stats tab of the preview panel is showing.
+    pub stats_open: bool,
+    /// The panel title of a preview that looks at a wire or a port. None
+    /// brings the plain "Preview" title back.
+    pub preview_label: Option<String>,
+    /// The demo the session is playing, with its step. Screenshot reels only.
+    pub demo: Option<(String, u8)>,
+    pub polling: bool,
     frames: BTreeMap<String, CachedFrame>,
 }
 
@@ -127,6 +143,274 @@ impl Session {
         }
     }
 
+    /// Rebuild the badge of every card from the execution state. The canvas
+    /// stays ownerless: it stores the drawn answer and animates its color.
+    fn sync_states(&self, cx: &mut App) {
+        let canvas = self.canvas.read(cx);
+        let graph = canvas.editor().graph();
+        let mut badges = BTreeMap::new();
+        for node in &graph.nodes {
+            let badge = match self.exec.state_of(graph, &node.id) {
+                NodeState::NotConfigured => {
+                    Badge::NotConfigured(not_configured_reason(graph, &node.id))
+                }
+                NodeState::Configured => Badge::Configured,
+                NodeState::Running => Badge::Running,
+                NodeState::Executed => Badge::Executed,
+                NodeState::Error(message) => Badge::Error(message),
+                NodeState::Stale => Badge::Stale,
+                NodeState::Inactive => Badge::Inactive,
+            };
+            badges.insert(node.id.clone(), badge);
+        }
+        self.canvas
+            .update(cx, |canvas, cx| canvas.set_badges(badges, cx));
+    }
+
+    /// Build and submit one preview job for `node`. Ancestors run first, as
+    /// the worker computes them. `stats` also asks for the per-column stats
+    /// of the whole result frame. `label` replaces the preview panel title
+    /// when the run looks at a wire or an output port.
+    pub fn run_job(
+        &mut self,
+        mode: RunMode,
+        node: String,
+        stats: bool,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (graph, base) = {
+            let canvas = self.canvas.read(cx);
+            let graph = canvas.editor().graph().clone();
+            let base = canvas
+                .editor()
+                .path()
+                .and_then(|path| path.parent().map(|path| path.display().to_string()));
+            (graph, base)
+        };
+        let generation = self.generation.wrapping_add(1);
+        let window = if mode == RunMode::Full {
+            TABLE_WINDOW
+        } else {
+            PREVIEW_ROW_CAP
+        };
+        let order = ancestors(&graph, &node).unwrap_or_default();
+        self.exec.start(&order);
+        let job = Job {
+            generation,
+            mode,
+            graph,
+            node: node.clone(),
+            base_dir: base,
+            inputs: BTreeMap::new(),
+            op: JobOp::Preview,
+            output: None,
+            window: Some(window),
+            stats,
+            nodes: Vec::new(),
+            overrides: BTreeMap::new(),
+        };
+        self.generation = generation;
+        self.mode = mode;
+        self.running = true;
+        self.ran_node = Some(node.clone());
+        self.error = None;
+        self.stats = None;
+        self.preview_label = label;
+        self.worker.submit(job);
+        self.sync_states(cx);
+        cx.notify();
+    }
+
+    /// Preview the frame one wire carries: a job for the wire's source node
+    /// with per-column stats. The panel title names the wire's two ends.
+    pub fn preview_wire(&mut self, edge_id: &str, cx: &mut Context<Self>) {
+        let graph = self.canvas.read(cx).editor().graph().clone();
+        let Some(edge) = graph.edges.iter().find(|edge| edge.id == edge_id) else {
+            return;
+        };
+        let label = |id: &str| {
+            graph
+                .node(id)
+                .map(|node| node.label.clone())
+                .unwrap_or_else(|| id.into())
+        };
+        let from = label(&edge.from);
+        let to = label(&edge.to);
+        self.run_job(
+            RunMode::Preview,
+            edge.from.clone(),
+            true,
+            Some(format!("Output of {from} → {to}")),
+            cx,
+        );
+    }
+
+    /// Preview the frame one output port produces, with per-column stats.
+    pub fn preview_port(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let graph = self.canvas.read(cx).editor().graph().clone();
+        let Some(node) = graph.node(node_id) else {
+            return;
+        };
+        self.run_job(
+            RunMode::Preview,
+            node.id.clone(),
+            true,
+            Some(format!("Output of {}", node.label.clone())),
+            cx,
+        );
+    }
+
+    /// Forget the cached output of `node` and everything downstream of it,
+    /// here and in the worker.
+    pub fn reset_node(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let (graph, base, nodes) = {
+            let canvas = self.canvas.read(cx);
+            let graph = canvas.editor().graph().clone();
+            let base = canvas
+                .editor()
+                .path()
+                .and_then(|path| path.parent().map(|path| path.display().to_string()));
+            let mut nodes = vec![node_id.to_string()];
+            nodes.extend(graph::descendants(&graph, node_id));
+            (graph, base, nodes)
+        };
+        self.exec.reset(&graph, node_id);
+        let generation = self.generation.wrapping_add(1);
+        let count = nodes.len();
+        let job = Job {
+            generation,
+            mode: RunMode::Preview,
+            graph,
+            node: String::new(),
+            base_dir: base,
+            inputs: BTreeMap::new(),
+            op: JobOp::Reset,
+            output: None,
+            window: None,
+            stats: false,
+            nodes,
+            overrides: BTreeMap::new(),
+        };
+        self.generation = generation;
+        self.worker.submit(job);
+        self.status = format!("reset {count} cached output(s)");
+        self.sync_states(cx);
+        cx.notify();
+    }
+
+    /// Keep one pump loop alive so replies are picked up frame by frame,
+    /// even while no render is scheduled.
+    pub fn arm_poll(&mut self, win: &mut Window, cx: &mut Context<Self>) {
+        if self.polling {
+            return;
+        }
+        self.polling = true;
+        let this = cx.entity().downgrade();
+        win.on_next_frame(move |win, cx| session_pump(this, win, cx));
+    }
+
+    /// Pull one worker reply into the session. The workspace render calls
+    /// this every frame, and the pump keeps frames coming while a job runs.
+    pub fn poll_worker(&mut self, cx: &mut Context<Self>) {
+        let Some((generation, op, result)) = self.worker.try_recv() else {
+            return;
+        };
+        if generation != self.generation {
+            return;
+        }
+        match result {
+            Ok(reply) if op == JobOp::Reset => {
+                // A reset reply carries no payload. The cached outputs are
+                // already gone; only an error would be worth surfacing.
+                if let Some(error) = reply.error {
+                    self.status = error.message.clone();
+                }
+                self.sync_states(cx);
+                cx.notify();
+            }
+            Ok(reply) => {
+                let graph = self.canvas.read(cx).editor().graph().clone();
+                let fp = run_fingerprint(&graph);
+                self.running = false;
+                if let Some(error) = reply.error {
+                    let node = error.node.clone();
+                    let message = error.message.clone();
+                    self.error = Some(message.clone());
+                    self.full_enabled = false;
+                    self.status = message.clone();
+                    self.exec.record_error(&graph, &node, message.clone());
+                    self.canvas.update(cx, |canvas, cx| {
+                        canvas.set_note(&node, message, cx);
+                    });
+                } else {
+                    self.error = None;
+                    self.columns = reply.columns;
+                    self.dtypes = reply.dtypes;
+                    self.index = reply.index;
+                    self.rows = reply.rows;
+                    self.n = reply.n;
+                    let shown = self.rows.len();
+                    self.status = status_line(reply.mode, self.n, shown);
+                    let node_id = self.ran_node.clone().unwrap_or_default();
+                    let cached = CachedFrame {
+                        columns: self.columns.clone(),
+                        dtypes: self.dtypes.clone(),
+                        index: self.index.clone(),
+                        rows: self.rows.clone(),
+                        n: self.n,
+                        status: self.status.clone(),
+                    };
+                    let view_rows: Vec<_> = cached.rows.iter().take(64).cloned().collect();
+                    let view_columns = cached.columns.clone();
+                    let rows_written = self.n;
+                    let graph2 = self.canvas.read(cx).editor().graph().clone();
+                    let ids = output_views(&graph2, &node_id);
+                    let wrote = writer_note(&graph2, &node_id, rows_written);
+                    self.frames.insert(node_id.clone(), cached.clone());
+                    for id in &ids {
+                        self.frames.insert(id.clone(), cached.clone());
+                    }
+                    self.canvas.update(cx, |canvas, cx| {
+                        canvas.set_frames(&ids, view_columns, view_rows, cx);
+                        if let Some(note) = wrote.clone() {
+                            canvas.set_note(&node_id, note, cx);
+                        }
+                    });
+                    // Every node the worker computed now claims Executed.
+                    self.exec.record_success(&graph, &reply.computed);
+                    self.exec.set_inactive(&reply.inactive);
+                    if let Some(stats) = reply.stats {
+                        self.stats = Some(stats);
+                        if self.preview_label.is_some() {
+                            self.stats_open = true;
+                        }
+                    }
+                    if reply.mode == RunMode::Preview {
+                        self.full_enabled = true;
+                        self.preview_fp = Some(fp);
+                    }
+                    if let Some(fitted) = reply.fitted.clone() {
+                        let id = node_id.clone();
+                        self.canvas.update(cx, |canvas, _| {
+                            canvas.editor_mut().set_fitted(&id, Some(fitted));
+                        });
+                    }
+                }
+                self.sync_states(cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.running = false;
+                if !err.contains("broken") && !err.contains("EOF") && !err.contains("os error") {
+                    self.error = Some(err);
+                }
+                self.sync_states(cx);
+                cx.notify();
+            }
+        }
+    }
+
     fn show_cached(&mut self, id: &str) -> bool {
         let Some(frame) = self.frames.get(id).cloned() else {
             return false;
@@ -140,44 +424,12 @@ impl Session {
         self.error = None;
         true
     }
-
-    fn recompute_dots(&self, cx: &mut App) {
-        let canvas = self.canvas.read(cx);
-        let graph = canvas.editor().graph();
-        let mut dots = BTreeMap::new();
-        let live = self
-            .ran_node
-            .as_deref()
-            .and_then(|id| ancestors(graph, id).ok())
-            .unwrap_or_default();
-        let done = !self.running && self.error.is_none() && self.preview_fp.is_some();
-        for node in &graph.nodes {
-            let dot = if node.unknown {
-                Dot::Danger
-            } else if self.running && live.iter().any(|id| id == &node.id) {
-                Dot::Running
-            } else if self.error.is_some() && self.ran_node.as_deref() == Some(node.id.as_str()) {
-                Dot::Danger
-            } else if done && live.iter().any(|id| id == &node.id) {
-                Dot::Success
-            } else {
-                Dot::Muted
-            };
-            dots.insert(node.id.clone(), dot);
-        }
-        let reduced = self.reduced_motion;
-        self.canvas.update(cx, |canvas, cx| {
-            canvas.set_reduced_motion(reduced, cx);
-            canvas.set_dots(dots, cx);
-        });
-    }
 }
 
 pub struct Workspace {
     pub(crate) session: Entity<Session>,
     dock: Entity<DockArea>,
     focus: FocusHandle,
-    polling: bool,
     path_input: Entity<InputState>,
     model_endpoint: Entity<InputState>,
     model_name: Entity<InputState>,
@@ -229,6 +481,12 @@ impl Workspace {
             assist_fill: None,
             assist_rx: None,
             rename_draft: Vec::new(),
+            exec: ExecState::new(),
+            stats: None,
+            stats_open: false,
+            preview_label: None,
+            demo: None,
+            polling: false,
             frames: BTreeMap::new(),
         });
         let path_input = cx.new(|cx| InputState::new(window, cx));
@@ -296,7 +554,8 @@ impl Workspace {
             move |this, _, event, window, cx| match event {
                 CanvasEvent::Edited => this.on_graph_edit(cx),
                 CanvasEvent::SelectionChanged => {
-                    this.on_graph_edit(cx);
+                    // A selection is not an edit: the preview stays valid, and
+                    // only a switch of the run's own node cancels its job.
                     let chart_selected = this
                         .session
                         .read(cx)
@@ -309,10 +568,25 @@ impl Workspace {
                             gpui_kit::component::dock::PanelId::from(chart_for_select.entity_id());
                         dock_for_select.update(cx, |area, cx| area.select_panel(id, window, cx));
                     }
-                    if this.session.read(cx).running {
+                    let selected_node = this
+                        .session
+                        .read(cx)
+                        .canvas
+                        .read(cx)
+                        .selected_node()
+                        .map(|node| node.id.clone());
+                    let ran_node = this.session.read(cx).ran_node.clone();
+                    if this.session.read(cx).running
+                        && selected_node.is_some()
+                        && selected_node != ran_node
+                    {
+                        // Switching away from the run's node cancels the
+                        // in-flight preview. Picking its card again, or
+                        // selecting a wire, keeps the job.
                         this.session.update(cx, |session, _| {
                             session.generation = session.generation.wrapping_add(1);
                             session.running = false;
+                            session.exec.clear_running();
                             session.worker.cancel();
                         });
                     }
@@ -332,10 +606,26 @@ impl Workspace {
                             session.rows.clear();
                             session.n = 0;
                         }
+                        session.sync_states(cx);
                         cx.notify();
                     });
                 }
                 CanvasEvent::FocusInspector => {}
+                CanvasEvent::NodeCommand { id, command } => {
+                    this.node_command(id, command.clone(), window, cx);
+                }
+                CanvasEvent::PreviewWire { edge } => {
+                    this.session
+                        .update(cx, |session, cx| session.preview_wire(edge, cx));
+                    this.session
+                        .update(cx, |session, cx| session.arm_poll(window, cx));
+                }
+                CanvasEvent::PreviewPort { node } => {
+                    this.session
+                        .update(cx, |session, cx| session.preview_port(node, cx));
+                    this.session
+                        .update(cx, |session, cx| session.arm_poll(window, cx));
+                }
                 CanvasEvent::OpenCatalog {
                     from,
                     to,
@@ -402,7 +692,6 @@ impl Workspace {
             session,
             dock: dock.clone(),
             focus,
-            polling: false,
             path_input,
             model_endpoint,
             model_name,
@@ -498,6 +787,15 @@ impl Workspace {
                 play_reel(demo, session, started, window, cx);
             });
         }
+        if matches!(options.demo.as_deref(), Some("states") | Some("stats")) {
+            let session = workspace.session.clone();
+            let demo = options.demo.clone().unwrap_or_default();
+            session.update(cx, |session, _| session.demo = Some((demo, 0)));
+            let started = std::time::Instant::now();
+            window.on_next_frame(move |window, cx| {
+                play_exec_demo(session, started, window, cx);
+            });
+        }
         // The search demo opens the popover as if a wire from the last node's
         // output was dropped on empty canvas, two frames in so the camera
         // fit has already happened.
@@ -556,7 +854,15 @@ impl Workspace {
             if session.preview_fp != Some(fp) {
                 session.full_enabled = false;
             }
-            session.recompute_dots(cx);
+            // An edit while a job is in flight would make the reply's claim
+            // unreadable. Drop the job; the state machine says Stale instead.
+            if session.running {
+                session.generation = session.generation.wrapping_add(1);
+                session.running = false;
+                session.exec.clear_running();
+                session.worker.cancel();
+            }
+            session.sync_states(cx);
             cx.notify();
         });
     }
@@ -572,16 +878,16 @@ impl Workspace {
             });
             return;
         };
-        let (graph, base) = {
-            let session = self.session.read(cx);
-            let canvas = session.canvas.read(cx);
-            let graph = canvas.editor().graph().clone();
-            let base = canvas
-                .editor()
-                .path()
-                .and_then(|path| path.parent().map(|path| path.display().to_string()));
-            (graph, base)
-        };
+        // A code block in the ancestry gets the focus so the user sees the
+        // code before it runs.
+        let graph = self
+            .session
+            .read(cx)
+            .canvas
+            .read(cx)
+            .editor()
+            .graph()
+            .clone();
         if let Some(python) = ancestors(&graph, &node).ok().and_then(|order| {
             order
                 .into_iter()
@@ -593,154 +899,34 @@ impl Workspace {
                 });
             });
         }
-        let generation = self.session.read(cx).generation.wrapping_add(1);
-        let window = if mode == RunMode::Full {
-            TABLE_WINDOW
-        } else {
-            PREVIEW_ROW_CAP
-        };
-        let ran = node.clone();
-        let job = Job {
-            generation,
-            mode,
-            graph,
-            node,
-            base_dir: base,
-            inputs: BTreeMap::new(),
-            op: JobOp::Preview,
-            output: None,
-            window: Some(window),
-            stats: false,
-            nodes: Vec::new(),
-            overrides: BTreeMap::new(),
-        };
         self.session.update(cx, |session, cx| {
-            session.generation = generation;
-            session.mode = mode;
-            session.running = true;
-            session.ran_node = Some(ran);
-            session.error = None;
-            session.worker.submit(job);
-            session.recompute_dots(cx);
-            cx.notify();
+            session.run_job(mode, node, false, None, cx)
         });
-        self.arm_poll(win, cx);
+        self.session
+            .update(cx, |session, cx| session.arm_poll(win, cx));
     }
 
-    fn arm_poll(&mut self, win: &mut Window, cx: &mut Context<Self>) {
-        if self.polling {
-            return;
-        }
-        self.polling = true;
-        let this = cx.entity().downgrade();
-        win.on_next_frame(move |win, cx| Self::pump(this, win, cx));
-    }
-
-    fn pump(this: gpui_kit::WeakEntity<Self>, win: &mut Window, cx: &mut App) {
-        let again = this
-            .update(cx, |this, cx| {
-                this.poll_worker(cx);
-                let running = this.session.read(cx).running;
-                let waiting = this.session.read(cx).assist_rx.is_some();
-                if !running && !waiting {
-                    this.polling = false;
-                }
-                running || waiting
-            })
-            .unwrap_or(false);
-        if again {
-            win.on_next_frame(move |win, cx| Self::pump(this, win, cx));
-        }
-    }
-
-    fn poll_worker(&mut self, cx: &mut Context<Self>) {
-        let message = self.session.read(cx).worker.try_recv();
-        let Some((generation, result)) = message else {
-            return;
-        };
-        if generation != self.session.read(cx).generation {
-            return;
-        }
-        match result {
-            Ok(reply) => {
-                let fp = run_fingerprint(self.session.read(cx).canvas.read(cx).editor().graph());
+    /// Execute, Execute to here, or Reset from the canvas or the inspector.
+    fn node_command(
+        &mut self,
+        id: &str,
+        command: NodeCommand,
+        win: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            NodeCommand::Execute | NodeCommand::ExecuteTo => {
                 self.session.update(cx, |session, cx| {
-                    session.running = false;
-                    if let Some(error) = reply.error {
-                        let node = error.node.clone();
-                        let message = error.message.clone();
-                        session.error = Some(message.clone());
-                        session.full_enabled = false;
-                        session.status = message.clone();
-                        session.canvas.update(cx, |canvas, cx| {
-                            canvas.set_note(&node, message, cx);
-                        });
-                    } else {
-                        session.error = None;
-                        session.columns = reply.columns;
-                        session.dtypes = reply.dtypes;
-                        session.index = reply.index;
-                        session.rows = reply.rows;
-                        session.n = reply.n;
-                        let shown = session.rows.len();
-                        session.status = status_line(reply.mode, reply.n, shown);
-                        let node_id = session.ran_node.clone().unwrap_or_default();
-                        let cached = CachedFrame {
-                            columns: session.columns.clone(),
-                            dtypes: session.dtypes.clone(),
-                            index: session.index.clone(),
-                            rows: session.rows.clone(),
-                            n: session.n,
-                            status: session.status.clone(),
-                        };
-                        let view_rows: Vec<_> = cached.rows.iter().take(64).cloned().collect();
-                        let view_columns = cached.columns.clone();
-                        let rows_written = session.n;
-                        let ids = output_views(session.canvas.read(cx).editor().graph(), &node_id);
-                        let wrote = writer_note(
-                            session.canvas.read(cx).editor().graph(),
-                            &node_id,
-                            rows_written,
-                        );
-                        session.frames.insert(node_id.clone(), cached.clone());
-                        for id in &ids {
-                            session.frames.insert(id.clone(), cached.clone());
-                        }
-                        session.canvas.update(cx, |canvas, cx| {
-                            canvas.set_frames(&ids, view_columns, view_rows, cx);
-                            if let Some(note) = wrote.clone() {
-                                canvas.set_note(&node_id, note, cx);
-                            }
-                        });
-                        if reply.mode == RunMode::Preview {
-                            session.full_enabled = true;
-                            session.preview_fp = Some(fp);
-                        }
-                        if let Some(fitted) = reply.fitted.clone() {
-                            let id = node_id.clone();
-                            session.canvas.update(cx, |canvas, _| {
-                                canvas.editor_mut().set_fitted(&id, Some(fitted));
-                            });
-                        }
-                    }
-                    session.recompute_dots(cx);
-                    cx.notify();
+                    session.run_job(RunMode::Preview, id.to_string(), false, None, cx)
                 });
-                cx.notify();
             }
-            Err(err) => {
-                self.session.update(cx, |session, cx| {
-                    session.running = false;
-                    if !err.contains("broken") && !err.contains("EOF") && !err.contains("os error")
-                    {
-                        session.error = Some(err);
-                    }
-                    session.recompute_dots(cx);
-                    cx.notify();
-                });
-                cx.notify();
+            NodeCommand::Reset => {
+                self.session
+                    .update(cx, |session, cx| session.reset_node(id, cx));
             }
         }
+        self.session
+            .update(cx, |session, cx| session.arm_poll(win, cx));
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -780,6 +966,9 @@ impl Workspace {
                     session.path_prompt = None;
                     session.rows.clear();
                     session.full_enabled = false;
+                    session.exec = ExecState::new();
+                    session.stats = None;
+                    session.preview_label = None;
                     cx.notify();
                 });
                 self.apply_dock_sizes(&saved, window, cx);
@@ -894,7 +1083,8 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.poll_worker(cx);
+        self.session
+            .update(cx, |session, cx| session.poll_worker(cx));
         let (title, dirty, readonly, full_enabled, prompt, narrow, running, mode, reduced) = {
             let session = self.session.read(cx);
             let canvas = session.canvas.read(cx);
@@ -936,6 +1126,15 @@ impl Render for Workspace {
                 cx.listener(|this, _: &RunPreview, win, cx| this.run(RunMode::Preview, win, cx)),
             )
             .on_action(cx.listener(|this, _: &RunFull, win, cx| this.run(RunMode::Full, win, cx)))
+            .on_action(
+                cx.listener(|this, _: &ExecuteNode, win, cx| this.run(RunMode::Preview, win, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ResetNode, win, cx| {
+                let Some(node) = this.session.read(cx).target_node(cx) else {
+                    return;
+                };
+                this.node_command(&node, NodeCommand::Reset, win, cx);
+            }))
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &OpenFile, _, cx| {
                 this.session.update(cx, |session, cx| {
@@ -1297,6 +1496,78 @@ impl Workspace {
     }
 }
 
+/// The session pump: poll each frame while a job or an assist request is
+/// in flight, then stop.
+fn session_pump(this: gpui_kit::WeakEntity<Session>, win: &mut Window, cx: &mut App) {
+    let again = this
+        .update(cx, |session, cx| {
+            session.poll_worker(cx);
+            let waiting = session.assist_rx.is_some();
+            if !(session.running || waiting) {
+                session.polling = false;
+            }
+            session.running || waiting
+        })
+        .unwrap_or(false);
+    if again {
+        win.on_next_frame(move |win, cx| session_pump(this, win, cx));
+    }
+}
+
+/// The Execute / Execute to here / Reset ghost buttons under the inspector
+/// title. They drive the same session commands as the card menu.
+fn execute_header(session: Entity<Session>, node: &graph::Node) -> gpui_kit::AnyElement {
+    let run = node.id.clone();
+    let run_to = node.id.clone();
+    let reset = node.id.clone();
+    let run_session = session.clone();
+    let reset_session = session.clone();
+    div()
+        .flex()
+        .flex_row()
+        .gap_1()
+        .child(
+            Button::new("inspector-execute")
+                .ghost()
+                .compact()
+                .icon(IconName::Play)
+                .tooltip("Execute: run a preview through this node")
+                .on_click(move |_, window, cx| {
+                    run_session.update(cx, |session, cx| {
+                        session.run_job(RunMode::Preview, run.clone(), false, None, cx);
+                        session.arm_poll(window, cx);
+                    });
+                }),
+        )
+        .child(
+            Button::new("inspector-execute-to")
+                .ghost()
+                .compact()
+                .icon(IconName::Play)
+                .tooltip("Execute to here: the same run, named for where it stops")
+                .on_click(move |_, window, cx| {
+                    session.update(cx, |session, cx| {
+                        session.run_job(RunMode::Preview, run_to.clone(), false, None, cx);
+                        session.arm_poll(window, cx);
+                    });
+                }),
+        )
+        .child(
+            Button::new("inspector-reset")
+                .ghost()
+                .compact()
+                .icon(IconName::RotateCcw)
+                .tooltip("Reset: drop this node and its downstream cached outputs")
+                .on_click(move |_, window, cx| {
+                    reset_session.update(cx, |session, cx| {
+                        session.reset_node(&reset, cx);
+                        session.arm_poll(window, cx);
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
 fn icon_button(
     id: &str,
     icon: IconName,
@@ -1493,6 +1764,159 @@ fn reel_run(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) 
                 canvas.fit_all(cx);
             }
         });
+    }
+}
+
+/// The states demo: one chain and a sibling branch already executed, then a
+/// param edit that only the chain turns stale, plus a python node with no
+/// code that stays Not configured.
+fn load_states_demo(canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let csv = root.join("examples/orders.csv");
+    let csv = csv.canonicalize().unwrap_or(csv);
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 96.0))
+            .unwrap();
+        doc.set_param(&read, "path", json!(csv.display().to_string()));
+        doc.set_label(&read, "orders.csv".into());
+        let head = doc
+            .add_node("head", graph::Point::new(320.0, 96.0))
+            .unwrap();
+        doc.set_param(&head, "n", json!(5));
+        let headers = doc
+            .add_node("change_headers", graph::Point::new(592.0, 96.0))
+            .unwrap();
+        doc.set_param(
+            &headers,
+            "mapping",
+            json!([{"from": "amount", "to": "revenue"}]),
+        );
+        let read2 = doc
+            .add_node("read_csv", graph::Point::new(48.0, 320.0))
+            .unwrap();
+        doc.set_param(&read2, "path", json!(csv.display().to_string()));
+        doc.set_label(&read2, "orders.csv (branch)".into());
+        let dropna = doc
+            .add_node("dropna", graph::Point::new(320.0, 320.0))
+            .unwrap();
+        let python = doc
+            .add_node("python", graph::Point::new(48.0, 520.0))
+            .unwrap();
+        doc.set_label(&python, "Describe the frame".into());
+        doc.set_param(&python, "code", json!(""));
+        let _ = doc.connect(&read, "out", &head, "in");
+        let _ = doc.connect(&head, "out", &headers, "in");
+        let _ = doc.connect(&read2, "out", &dropna, "in");
+        canvas.load_document(doc, cx);
+    });
+}
+
+/// The stats demo: an orders pipeline whose first wire gets picked as if the
+/// user had clicked it. The Stats tab opens when the reply arrives.
+fn load_stats_demo(canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let csv = root.join("examples/orders.csv");
+    let csv = csv.canonicalize().unwrap_or(csv);
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 96.0))
+            .unwrap();
+        doc.set_param(&read, "path", json!(csv.display().to_string()));
+        doc.set_label(&read, "orders.csv".into());
+        let head = doc
+            .add_node("head", graph::Point::new(320.0, 96.0))
+            .unwrap();
+        doc.set_param(&head, "n", json!(5));
+        let headers = doc
+            .add_node("change_headers", graph::Point::new(592.0, 96.0))
+            .unwrap();
+        doc.set_param(
+            &headers,
+            "mapping",
+            json!([{"from": "amount", "to": "revenue"}]),
+        );
+        let _ = doc.connect(&read, "out", &head, "in");
+        let _ = doc.connect(&head, "out", &headers, "in");
+        canvas.load_document(doc, cx);
+    });
+}
+
+/// Short timed steps for the `states` and `stats` demos. Each step fires
+/// once its guard holds; a screenshot a few seconds in shows the end state.
+fn play_exec_demo(
+    session: Entity<Session>,
+    started: std::time::Instant,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let t = started.elapsed().as_secs_f32();
+    let keep = session.update(cx, |session, cx| {
+        exec_demo_tick(session, t, window, cx);
+        t < 7.5
+    });
+    if keep {
+        window.on_next_frame(move |window, cx| play_exec_demo(session, started, window, cx));
+    }
+}
+fn exec_demo_tick(
+    session: &mut Session,
+    t: f32,
+    window: &mut Window,
+    cx: &mut gpui_kit::Context<Session>,
+) {
+    let Some((name, step)) = session.demo.clone() else {
+        return;
+    };
+    match (name.as_str(), step) {
+        ("states", 0) if t > 1.2 => {
+            let graph = session.canvas.read(cx).editor().graph().clone();
+            if let Some(target) = node_id(&graph, "change_headers") {
+                session.run_job(RunMode::Preview, target, false, None, cx);
+                session.arm_poll(window, cx);
+                session.demo = Some((name, 1));
+            } else {
+                session.demo = None;
+            }
+        }
+        ("states", 1) if t > 2.8 && !session.running => {
+            let graph = session.canvas.read(cx).editor().graph().clone();
+            if let Some(target) = node_id(&graph, "dropna") {
+                session.run_job(RunMode::Preview, target, false, None, cx);
+                session.arm_poll(window, cx);
+                session.demo = Some((name, 2));
+            } else {
+                session.demo = None;
+            }
+        }
+        ("states", 2) if t > 4.0 && !session.running => {
+            let graph = session.canvas.read(cx).editor().graph().clone();
+            if let Some(head) = node_id(&graph, "head") {
+                session.canvas.update(cx, |canvas, cx| {
+                    canvas.set_param(&head, "n", json!(7), cx);
+                });
+                session.demo = Some((name, 3));
+            } else {
+                session.demo = None;
+            }
+        }
+        ("stats", 0) if t > 1.2 => {
+            let graph = session.canvas.read(cx).editor().graph().clone();
+            if let Some(edge) = graph.edges.first().cloned() {
+                let edge_id = edge.id.clone();
+                session.canvas.update(cx, |canvas, cx| {
+                    canvas.select_only(edge_id.clone(), cx);
+                });
+                session.preview_wire(&edge_id, cx);
+                session.arm_poll(window, cx);
+                session.demo = Some((name, 1));
+            } else {
+                session.demo = None;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2042,6 +2466,14 @@ fn load_demo(
     let Some(demo) = demo else {
         return;
     };
+    if demo == "states" {
+        load_states_demo(canvas, cx);
+        return;
+    }
+    if demo == "stats" {
+        load_stats_demo(canvas, cx);
+        return;
+    }
     if demo == "frames" {
         load_frames_demo(canvas, cx, false);
         return;
@@ -4242,6 +4674,7 @@ impl Render for InspectorPanel {
                     }
                 }),
         );
+        body = body.child(execute_header(self.session.clone(), &node));
         if let Some(fitted) = node.fitted.clone() {
             body = body.child(fit_summary(&fitted));
         }
@@ -4910,6 +5343,43 @@ fn chart_limitation(node: &graph::Node) -> String {
     }
 }
 
+/// One readable reason for the hollow ring, mirroring the rules of
+/// `ExecState::configured`. The first missing thing wins.
+fn not_configured_reason(graph: &graph::Graph, id: &str) -> Option<String> {
+    let node = graph.node(id)?;
+    if node.unknown {
+        return Some(format!("unknown feature {}", node.feature));
+    }
+    let optional: &[&str] = node.def().map(|def| def.optional_inputs).unwrap_or(&[]);
+    for port in node.input_ports() {
+        if optional.contains(&port.name.as_str()) {
+            continue;
+        }
+        if graph.edges_into(id, &port.name).next().is_none() {
+            return Some(format!("the {} input is unwired", port.name));
+        }
+    }
+    for param in node.def().map(|def| def.params).unwrap_or(&[]) {
+        let required = param.name == "path" || matches!(param.kind, graph::ParamKind::Code);
+        if !required {
+            continue;
+        }
+        let wired = node.wired.contains(param.name);
+        if wired && graph.edges_into(id, param.name).next().is_some() {
+            continue;
+        }
+        let empty = match node.params.get(param.name) {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => text.is_empty(),
+            _ => false,
+        };
+        if empty {
+            return Some(format!("{} is empty", field_label(param.name)));
+        }
+    }
+    None
+}
+
 fn writer_note(graph: &graph::Graph, id: &str, rows: u64) -> Option<String> {
     let node = graph.node(id)?;
     if !matches!(
@@ -5180,8 +5650,12 @@ impl BasePanel for PreviewPanel {
     }
 }
 impl Panel for PreviewPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "Preview"
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.session
+            .read(cx)
+            .preview_label
+            .clone()
+            .unwrap_or_else(|| "Preview".into())
     }
 }
 impl Render for PreviewPanel {
@@ -5189,7 +5663,31 @@ impl Render for PreviewPanel {
         let status = self.session.read(cx).status.clone();
         let running = self.session.read(cx).running;
         let has_rows = !self.session.read(cx).rows.is_empty();
+        let stats_open = self.session.read(cx).stats_open;
+        let has_stats = self.session.read(cx).stats.is_some();
+        let stats = self.session.read(cx).stats.clone();
         let session = self.session.clone();
+        let tabs = {
+            let session = session.clone();
+            gpui_kit::component::tab::TabBar::new("preview-tabs")
+                .segmented()
+                .child(
+                    gpui_kit::component::tab::Tab::new()
+                        .label("Table")
+                        .selected(!stats_open),
+                )
+                .child(
+                    gpui_kit::component::tab::Tab::new()
+                        .label("Stats")
+                        .selected(stats_open),
+                )
+                .on_click(move |index, _, cx| {
+                    session.update(cx, |session, cx| {
+                        session.stats_open = *index == 1;
+                        cx.notify();
+                    })
+                })
+        };
         div()
             .size_full()
             .flex()
@@ -5198,9 +5696,20 @@ impl Render for PreviewPanel {
                 div()
                     .px_3()
                     .py_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(status),
+                    )
+                    .when(has_stats, |row| row.child(tabs)),
             )
             .child(
                 div()
@@ -5235,7 +5744,22 @@ impl Render for PreviewPanel {
                         )
                     }),
             )
-            .child(if has_rows {
+            .child(if stats_open && has_stats {
+                crate::stats_view::stats_view(
+                    stats.as_deref().unwrap_or(&[]),
+                    cx,
+                )
+            } else if stats_open && !has_stats {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Click a wire or an output port to see column stats")
+                    .into_any_element()
+            } else if has_rows {
                 div()
                     .flex_1()
                     .min_h(px(0.))
@@ -5397,6 +5921,8 @@ pub fn run_gui(options: GuiOptions) {
                 gpui_kit::KeyBinding::new("ctrl-s", SaveFile, None),
                 gpui_kit::KeyBinding::new("ctrl-enter", RunPreview, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-enter", RunFull, None),
+                gpui_kit::KeyBinding::new("f7", ExecuteNode, None),
+                gpui_kit::KeyBinding::new("shift-f7", ResetNode, None),
                 gpui_kit::KeyBinding::new("ctrl-z", UndoEdit, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-z", RedoEdit, None),
                 gpui_kit::KeyBinding::new("ctrl-y", RedoEdit, None),
