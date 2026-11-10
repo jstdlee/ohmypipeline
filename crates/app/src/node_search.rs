@@ -235,6 +235,31 @@ impl Workspace {
             });
         }
         let screen = state.screen;
+        // Clamp the popover inside the canvas panel: flip to the left or
+        // above the pointer when the window has no room for it, so the
+        // 300x360 sheet never clips at an edge.
+        const POPOVER_W: f32 = 300.0;
+        const POPOVER_H: f32 = 360.0;
+        const INSET: f32 = 8.0;
+        let mut left = screen.x.as_f32();
+        let mut top = screen.y.as_f32();
+        let panel = self.session.read(cx).canvas.read(cx).panel_bounds();
+        if let Some(panel) = panel {
+            let panel_left = panel.origin.x.as_f32();
+            let panel_top = panel.origin.y.as_f32();
+            let panel_right = panel_left + panel.size.width.as_f32();
+            let panel_bottom = panel_top + panel.size.height.as_f32();
+            if left + POPOVER_W > panel_right {
+                // No room to the right: open to the left of the pointer.
+                left = (screen.x.as_f32() - POPOVER_W).min(panel_right - POPOVER_W);
+            }
+            if top + POPOVER_H > panel_bottom {
+                // No room below: open above the pointer.
+                top = (screen.y.as_f32() - POPOVER_H).min(panel_bottom - POPOVER_H);
+            }
+            left = left.max(panel_left + INSET);
+            top = top.max(panel_top + INSET);
+        }
         let slide = 2.0 * (1.0 - t);
         let matches = self.search_matches(cx);
         let highlight = self.node_search.as_ref().map(|s| s.highlight).unwrap_or(0);
@@ -366,8 +391,8 @@ impl Workspace {
             .child(
                 div()
                     .absolute()
-                    .left(px(screen.x.as_f32()))
-                    .top(px((screen.y.as_f32() + slide).max(8.0)))
+                    .left(px(left))
+                    .top(px((top + slide).max(8.0)))
                     .w(px(300.0))
                     .max_h(px(360.0))
                     .flex()

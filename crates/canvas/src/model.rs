@@ -18,8 +18,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px,
 };
 use graph::{
-    Camera, Document, Edge, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX, SnapCandidate, TypeName,
-    card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
+    Camera, Document, Edge, Frame, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX, SnapCandidate,
+    TypeName, card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
 };
 
 use crate::layout::{self, Detail, Side, card_height, port_slots};
@@ -35,6 +35,8 @@ pub enum Tool {
     Label,
     Note,
     Button,
+    /// Drag out an empty group frame.
+    Frame,
 }
 
 impl Tool {
@@ -119,6 +121,37 @@ enum Drag {
     Pan {
         last: GPoint<Pixels>,
     },
+    /// Dragging out an empty frame with the Frame tool.
+    FrameDraw {
+        start: Point,
+        current: Point,
+    },
+    /// Header drag. The frame and its members move together, live.
+    FrameMove {
+        id: String,
+        last: Point,
+    },
+    /// A resize handle on the bottom-right edges of a selected frame.
+    FrameResize {
+        id: String,
+        origin_local: GPoint<Pixels>,
+        start_size: [f32; 2],
+        edge: crate::frames::ResizeEdge,
+    },
+}
+
+/// What the inline text input edits: a mark's text or a frame's title.
+#[derive(Clone, Debug)]
+enum EditTarget {
+    Mark(String),
+    Frame(String),
+}
+
+/// Collapse or expand animation of one frame's visible height.
+struct FrameAnim {
+    /// Height when the animation started, in canvas pixels.
+    from: f32,
+    started: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,12 +173,18 @@ pub struct CanvasModel {
     focus: FocusHandle,
     editor: Document,
     dots: BTreeMap<String, Dot>,
-    selection: Vec<String>,
+    pub(crate) selection: Vec<String>,
     tool: Tool,
     space_hand: bool,
     drag: Option<Drag>,
     settle: Option<Settle>,
     camera_anim: Option<CameraAnim>,
+    /// Visible-height animation of collapsing or expanding frames.
+    frame_anim: BTreeMap<String, FrameAnim>,
+    /// Drag in progress on the minimap; the camera follows immediately.
+    minimap_drag: bool,
+    /// When the minimap fade started, with the direction it heads.
+    minimap_fade: Option<(bool, Instant)>,
     frame_armed: bool,
     hovered: Option<String>,
     /// Wire the pointer is over, with the nearest segment.
@@ -161,7 +200,7 @@ pub struct CanvasModel {
     flow: f32,
     clip: Option<Clip>,
     label_input: Entity<gpui_kit::component::input::InputState>,
-    editing: Option<String>,
+    editing: Option<EditTarget>,
     frames: BTreeMap<String, FrameView>,
     notes: BTreeMap<String, String>,
     reduced_motion: bool,
@@ -175,15 +214,20 @@ impl CanvasModel {
         cx.subscribe(
             &label_input,
             |this, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                if matches!(event, gpui_kit::component::input::InputEvent::Blur)
-                    && this.editing.is_some()
-                {
-                    let text = input.read(cx).value().to_string();
-                    if let Some(id) = this.editing.clone() {
-                        this.editor.set_mark_text(&id, text);
-                        this.editing = None;
-                        this.changed(cx);
+                match event {
+                    gpui_kit::component::input::InputEvent::Blur => {
+                        if this.editing.is_some() {
+                            this.commit_edit_target(&input, cx);
+                        }
                     }
+                    // Enter commits the inline edit; the input keeps newline
+                    // handling for multi-line marks.
+                    gpui_kit::component::input::InputEvent::PressEnter { .. }
+                        if this.editing.is_some() =>
+                    {
+                        this.commit_edit_target(&input, cx);
+                    }
+                    _ => {}
                 }
             },
         )
@@ -198,6 +242,9 @@ impl CanvasModel {
             drag: None,
             settle: None,
             camera_anim: None,
+            frame_anim: BTreeMap::new(),
+            minimap_drag: false,
+            minimap_fade: None,
             frame_armed: false,
             hovered: None,
             hover_wire: None,
@@ -355,6 +402,9 @@ impl CanvasModel {
         self.drag = None;
         self.settle = None;
         self.camera_anim = None;
+        self.frame_anim.clear();
+        self.minimap_drag = false;
+        self.minimap_fade = None;
         self.hover_wire = None;
         self.hover_reroute = None;
         self.picked_reroute = None;
@@ -408,19 +458,22 @@ impl CanvasModel {
             return;
         }
         let (nodes, marks) = self.split_selection();
+        let frames = self.selected_frames();
         let edges: Vec<String> = self
             .selection
             .iter()
             .filter(|id| self.editor.graph().edges.iter().any(|edge| &edge.id == *id))
             .cloned()
             .collect();
-        if nodes.is_empty() && marks.is_empty() && edges.is_empty() {
+        if nodes.is_empty() && marks.is_empty() && edges.is_empty() && frames.is_empty() {
             return;
         }
         self.editor.begin_gesture();
         for edge in &edges {
             self.editor.detach(edge);
         }
+        // Deleting a frame removes the group only; its members stay.
+        self.editor.delete_frames(&frames);
         self.editor.delete(&nodes, &marks);
         self.editor.commit_gesture();
         self.selection.clear();
@@ -606,8 +659,55 @@ impl CanvasModel {
         self.label_input.update(cx, |state, cx| {
             state.set_value(text, window, cx);
         });
-        self.editing = Some(id);
+        let handle = self.label_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.editing = Some(EditTarget::Mark(id));
         cx.notify();
+    }
+
+    /// Inline rename of a frame title. Enter commits, Escape cancels.
+    pub fn start_frame_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let text = frame.title.clone();
+        self.label_input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+        });
+        let handle = self.label_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.editing = Some(EditTarget::Frame(id.to_string()));
+        cx.notify();
+    }
+
+    /// Commit the inline edit to whichever target is being renamed.
+    fn commit_edit_target(
+        &mut self,
+        input: &Entity<gpui_kit::component::input::InputState>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.editing.take() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        match target {
+            EditTarget::Mark(id) => self.editor.set_mark_text(&id, text),
+            EditTarget::Frame(id) => self.editor.set_frame_title(&id, text),
+        }
+        self.changed(cx);
+    }
+
+    /// Escape pressed while renaming: drop the edit without writing.
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn set_frames(
@@ -635,12 +735,17 @@ impl CanvasModel {
     }
 
     pub fn commit_label(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.editing.clone() else {
+        if self.editing.is_none() {
+            return;
+        }
+        let text = self.label_input.read(cx).value().to_string();
+        let Some(target) = self.editing.take() else {
             return;
         };
-        let text = self.label_input.read(cx).value().to_string();
-        self.editor.set_mark_text(&id, text);
-        self.editing = None;
+        match target {
+            EditTarget::Mark(id) => self.editor.set_mark_text(&id, text),
+            EditTarget::Frame(id) => self.editor.set_frame_title(&id, text),
+        }
         self.changed(cx);
     }
 
@@ -771,7 +876,11 @@ impl CanvasModel {
 
     fn select_hit(&mut self, local: GPoint<Pixels>) {
         let canvas = self.canvas_of(local);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         for node in self.editor.graph().nodes.iter().rev() {
+            if hidden.contains_key(&node.id) {
+                continue;
+            }
             let at = node.position_point();
             let height = card_height(node);
             if canvas.x >= at.x
@@ -812,6 +921,297 @@ impl CanvasModel {
 
     fn changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(CanvasEvent::Edited);
+        cx.notify();
+    }
+
+    /// Public emit for menu handlers that live outside this module.
+    pub fn notify_edited(&mut self, cx: &mut Context<Self>) {
+        self.changed(cx);
+    }
+
+    /// Window-space bounds of the canvas panel, for popovers that must stay
+    /// inside it.
+    pub fn panel_bounds(&self) -> Option<Bounds<Pixels>> {
+        *self.viewport.borrow()
+    }
+
+    /// Frame ids in the selection.
+    fn selected_frames(&self) -> Vec<String> {
+        self.selection
+            .iter()
+            .filter(|id| self.editor.graph().frames.iter().any(|f| f.id == **id))
+            .cloned()
+            .collect()
+    }
+
+    /// Group the selection with 24 px of padding around it.
+    pub fn group_selection(&mut self, cx: &mut Context<Self>) {
+        let (nodes, marks) = self.split_selection();
+        if nodes.is_empty() && marks.is_empty() {
+            return;
+        }
+        let Some(id) = self
+            .editor
+            .frame_around(&nodes, &marks, crate::frames::GROUP_PAD)
+        else {
+            return;
+        };
+        self.selection = vec![id.clone()];
+        self.changed(cx);
+        cx.emit(CanvasEvent::SelectionChanged);
+    }
+
+    /// Layered left-to-right layout of the selection, or of everything when
+    /// fewer than two nodes are selected. One undo step, animated.
+    pub fn auto_layout(&mut self, cx: &mut Context<Self>) {
+        if self.editor.is_readonly() {
+            return;
+        }
+        let (nodes, _) = self.split_selection();
+        let ids: Vec<String> = if nodes.len() >= 2 {
+            nodes
+        } else {
+            self.editor
+                .graph()
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect()
+        };
+        if ids.len() < 2 {
+            return;
+        }
+        let placed = crate::autolayout::layered_layout(self.editor.graph(), &ids);
+        if placed.is_empty() {
+            return;
+        }
+        let mut offsets = BTreeMap::new();
+        for (id, next) in &placed {
+            if let Some(node) = self.editor.graph().node(id) {
+                offsets.insert(
+                    id.clone(),
+                    Point::new(node.position[0] - next.x, node.position[1] - next.y),
+                );
+            }
+        }
+        self.editor.place_many(&placed);
+        if !self.reduced_motion
+            && offsets
+                .values()
+                .any(|offset| offset.x.abs() + offset.y.abs() > 0.5)
+        {
+            self.settle = Some(Settle {
+                offsets,
+                started: Instant::now(),
+                duration: motion::LAYOUT,
+            });
+        }
+        // Fit the camera to the laid-out result.
+        let view = self
+            .viewport
+            .borrow()
+            .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+        if let Some((w, h)) = view {
+            let rect = graph::bounds_of(self.editor.graph(), &ids, card_height);
+            if let Some(rect) = rect {
+                self.animate_camera(graph::fit_camera(w, h, rect, 72.0), cx);
+            }
+        }
+        self.changed(cx);
+    }
+
+    /// Flip the minimap on or off. The flag lives in the document view, so
+    /// the next open remembers it; no undo step is written.
+    pub fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
+        let mut view = self.editor.graph().view;
+        view.minimap = !view.minimap;
+        self.editor.set_view(view);
+        self.minimap_fade = Some((view.minimap, Instant::now()));
+        self.changed(cx);
+    }
+
+    /// Opacity of the minimap during its fade, 1 when steady.
+    fn minimap_alpha(&self, showing: bool) -> f32 {
+        let Some((target, started)) = self.minimap_fade else {
+            return u8::from(showing) as f32;
+        };
+        let t = (started.elapsed().as_secs_f32() / motion::FADE.as_secs_f32()).clamp(0.0, 1.0);
+        let t = 1.0 - (1.0 - t).powi(3);
+        if target { t } else { 1.0 - t }
+    }
+
+    fn minimap_point(&self, event_position: GPoint<Pixels>) -> Option<Point> {
+        let bounds = (*self.viewport.borrow())?;
+        let local = event_position - bounds.origin;
+        let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+        let content = crate::minimap::content_bounds(self.editor.graph(), card_height, view);
+        let map = crate::minimap::Map::fit(content, crate::minimap::SIZE);
+        let panel = Point::new(
+            local.x.as_f32() - (view.0 - crate::minimap::SIZE[0] - crate::minimap::MARGIN),
+            local.y.as_f32() - (view.1 - crate::minimap::SIZE[1] - crate::minimap::MARGIN),
+        );
+        Some(map.to_canvas(panel))
+    }
+
+    /// Click on the minimap: animate the camera so the point centers.
+    pub fn minimap_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(canvas) = self.minimap_point(event.position) else {
+            return;
+        };
+        self.minimap_drag = true;
+        self.center_camera_on(canvas, true, cx);
+    }
+
+    /// Drag on the minimap: the camera follows the pointer immediately.
+    pub fn minimap_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.minimap_drag {
+            return;
+        }
+        if let Some(canvas) = self.minimap_point(event.position) {
+            self.center_camera_on(canvas, false, cx);
+        }
+    }
+
+    /// Camera of the viewport centered on `at`, keeping the current zoom.
+    fn center_camera_on(&mut self, at: Point, animate: bool, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.viewport.borrow() else {
+            return;
+        };
+        let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+        let zoom = self.editor.graph().camera.zoom;
+        let camera = Camera {
+            x: view.0 * 0.5 - at.x * zoom,
+            y: view.1 * 0.5 - at.y * zoom,
+            zoom,
+        };
+        if animate {
+            self.animate_camera(camera, cx);
+        } else {
+            self.camera_anim = None;
+            self.editor.set_camera(camera);
+            cx.emit(CanvasEvent::Edited);
+            cx.notify();
+        }
+    }
+
+    /// Press on a frame header: select the frame and open a move gesture.
+    pub fn frame_header_down(
+        &mut self,
+        id: &str,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || self.editor.is_readonly() {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        if !self.selection.iter().any(|item| item == id) {
+            self.selection = vec![id.to_string()];
+            cx.emit(CanvasEvent::SelectionChanged);
+        }
+        let Some(_frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let last = self.canvas_of(self.local_of(event.position));
+        self.editor.begin_gesture();
+        self.drag = Some(Drag::FrameMove {
+            id: id.to_string(),
+            last,
+        });
+        cx.notify();
+    }
+
+    /// Press on a resize handle: open a frame resize gesture.
+    pub fn frame_resize_down(
+        &mut self,
+        id: &str,
+        edge: crate::frames::ResizeEdge,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || self.editor.is_readonly() {
+            return;
+        }
+        let start_size = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+            .map(|frame| frame.size);
+        let Some(start_size) = start_size else {
+            return;
+        };
+        let origin_local = self.local_of(event.position);
+        self.editor.begin_gesture();
+        self.drag = Some(Drag::FrameResize {
+            id: id.to_string(),
+            origin_local,
+            start_size,
+            edge,
+        });
+        cx.notify();
+    }
+
+    /// Collapse or expand a frame, animating the height.
+    pub fn toggle_frame_collapsed(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let target = !frame.collapsed;
+        let from = self.frame_height(frame);
+        self.editor.set_frame_collapsed(id, target);
+        if !self.reduced_motion {
+            self.frame_anim.insert(
+                id.to_string(),
+                FrameAnim {
+                    from,
+                    started: Instant::now(),
+                },
+            );
+        } else {
+            self.frame_anim.remove(id);
+        }
+        self.changed(cx);
+    }
+
+    /// Visible height of a frame, honoring the collapse animation.
+    fn frame_height(&self, frame: &Frame) -> f32 {
+        let target = if frame.collapsed {
+            crate::frames::HEADER_H
+        } else {
+            frame.size[1]
+        };
+        if self.reduced_motion {
+            return target;
+        }
+        match self.frame_anim.get(&frame.id) {
+            Some(anim) => {
+                let t = (anim.started.elapsed().as_secs_f32() / motion::COLLAPSE.as_secs_f32())
+                    .clamp(0.0, 1.0);
+                motion::lerp(anim.from, target, t)
+            }
+            None => target,
+        }
+    }
+
+    /// Select every node the frame covers.
+    pub fn select_frame_members(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.selection = graph::frame_members(self.editor.graph(), id);
+        cx.emit(CanvasEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -876,6 +1276,19 @@ impl CanvasModel {
             // The mark itself is created on release, after this gesture is cancelled.
             self.drag = Some(Drag::Mark {
                 kind: mark_kind(self.tool),
+                start: canvas,
+                current: canvas,
+            });
+            cx.notify();
+            return;
+        }
+        if self.tool == Tool::Frame {
+            if self.editor.is_readonly() {
+                return;
+            }
+            let canvas = self.canvas_of(local);
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::FrameDraw {
                 start: canvas,
                 current: canvas,
             });
@@ -1171,6 +1584,33 @@ impl CanvasModel {
                 }
                 self.editor.resize_mark(&id, [width, height]);
             }
+            Drag::FrameDraw { current, .. } => {
+                *current = self.canvas_of(local);
+            }
+            Drag::FrameMove { id, last } => {
+                let at = self.canvas_of(local);
+                let delta = Point::new(at.x - last.x, at.y - last.y);
+                *last = at;
+                self.editor.move_frame(id, delta);
+            }
+            Drag::FrameResize {
+                id,
+                origin_local,
+                start_size,
+                edge,
+            } => {
+                let zoom = self.editor.graph().camera.zoom.max(0.05);
+                let dx = (local.x.as_f32() - origin_local.x.as_f32()) / zoom;
+                let dy = (local.y.as_f32() - origin_local.y.as_f32()) / zoom;
+                let mut size = *start_size;
+                if *edge != crate::frames::ResizeEdge::Bottom {
+                    size[0] = (start_size[0] + dx).max(24.0);
+                }
+                if *edge != crate::frames::ResizeEdge::Right {
+                    size[1] = (start_size[1] + dy).max(24.0);
+                }
+                self.editor.resize_frame(id, size);
+            }
         }
         self.drag = Some(drag);
         if refresh_link {
@@ -1197,6 +1637,7 @@ impl CanvasModel {
 
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         let local = self.local_of(event.position);
+        self.minimap_drag = false;
         let drag = self.drag.take();
         match drag {
             Some(Drag::Pan { .. }) => {}
@@ -1375,8 +1816,12 @@ impl CanvasModel {
                         cx.emit(CanvasEvent::SelectionChanged);
                     }
                 } else {
+                    let hidden = crate::frames::collapsed_members(self.editor.graph());
                     let mut hits = Vec::new();
                     for node in &self.editor.graph().nodes {
+                        if hidden.contains_key(&node.id) {
+                            continue;
+                        }
                         let origin = node.position_point();
                         let window = self.editor.graph().camera.to_window(origin);
                         let zoom = self.editor.graph().camera.zoom;
@@ -1411,6 +1856,31 @@ impl CanvasModel {
                 self.editor.commit_gesture();
                 self.changed(cx);
             }
+            Some(Drag::FrameDraw { start, current }) => {
+                self.editor.cancel_gesture();
+                let x = start.x.min(current.x);
+                let y = start.y.min(current.y);
+                let w = (start.x - current.x).abs().max(0.0);
+                let h = (start.y - current.y).abs().max(0.0);
+                if w >= 24.0
+                    && h >= 24.0
+                    && let Some(id) = self
+                        .editor
+                        .add_frame(String::new(), Point::new(x, y), [w, h])
+                {
+                    self.selection = vec![id];
+                    cx.emit(CanvasEvent::SelectionChanged);
+                }
+                self.changed(cx);
+            }
+            Some(Drag::FrameMove { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
+            Some(Drag::FrameResize { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
             Some(Drag::Mark {
                 kind,
                 start,
@@ -1438,9 +1908,10 @@ impl CanvasModel {
 
     fn snap_at(&self, pointer: Point, from: &str, from_port: &str) -> Option<(String, String)> {
         let zoom = self.editor.graph().camera.zoom.max(0.05);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         let mut candidates = Vec::new();
         for node in &self.editor.graph().nodes {
-            if node.id == from {
+            if node.id == from || hidden.contains_key(&node.id) {
                 continue;
             }
             for slot in port_slots(node) {
@@ -1520,9 +1991,10 @@ impl CanvasModel {
         from_port: &str,
     ) -> Option<(String, String, Reject)> {
         let zoom = self.editor.graph().camera.zoom.max(0.05);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         let mut best: Option<(f32, String, String, Reject)> = None;
         for node in &self.editor.graph().nodes {
-            if node.id == from {
+            if node.id == from || hidden.contains_key(&node.id) {
                 continue;
             }
             for slot in port_slots(node) {
@@ -1586,6 +2058,8 @@ impl CanvasModel {
     fn motion_active(&self) -> bool {
         self.settle.is_some()
             || self.camera_anim.is_some()
+            || !self.frame_anim.is_empty()
+            || self.minimap_fade.is_some()
             || (self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion)
     }
 
@@ -1594,6 +2068,13 @@ impl CanvasModel {
             && settle.started.elapsed() >= settle.duration
         {
             self.settle = None;
+        }
+        self.frame_anim
+            .retain(|_, anim| anim.started.elapsed() < motion::COLLAPSE);
+        if let Some((_, started)) = &self.minimap_fade
+            && started.elapsed() >= motion::FADE
+        {
+            self.minimap_fade = None;
         }
         if let Some(anim) = &self.camera_anim {
             let t = (anim.started.elapsed().as_secs_f32() / motion::CAMERA.as_secs_f32())
@@ -1738,11 +2219,15 @@ impl CanvasModel {
     }
 
     /// Nearest wire segment within 8 screen px, as edge id and segment index.
+    /// Wires route through collapsed frame headers, and wires with both ends
+    /// hidden do not hit at all.
     fn wire_hit_at(&self, canvas: Point) -> Option<(String, usize)> {
         let graph = self.editor.graph();
+        let hidden = crate::frames::collapsed_members(graph);
         let radius = 8.0 / self.zoom();
         for edge in graph.edges.iter().rev() {
-            if let Some(path) = layout::edge_wire_path(&graph.nodes, edge)
+            if let Some(path) =
+                crate::frames::edge_wire_path_routed(&graph.nodes, &graph.frames, &hidden, edge)
                 && let Some(segment) = layout::wire_hit(&path, canvas, radius)
             {
                 return Some((edge.id.clone(), segment));
@@ -1776,6 +2261,7 @@ impl CanvasModel {
     fn output_drop_at(&self, pointer: Point, origin: &str) -> Option<(String, String)> {
         let graph = self.editor.graph();
         let zoom = self.zoom();
+        let hidden = crate::frames::collapsed_members(graph);
         let origin_types = if origin.is_empty() {
             Vec::new()
         } else {
@@ -1783,7 +2269,7 @@ impl CanvasModel {
         };
         let mut candidates = Vec::new();
         for node in &graph.nodes {
-            if node.id == origin {
+            if node.id == origin || hidden.contains_key(&node.id) {
                 continue;
             }
             for slot in port_slots(node) {
@@ -1836,11 +2322,14 @@ impl CanvasModel {
             return;
         };
         let radius = 8.0 / self.zoom();
+        let hidden = crate::frames::collapsed_members(graph);
         for edge in &graph.edges {
             if edge.from == node_id || edge.to == node_id {
                 continue;
             }
-            let Some(path) = layout::edge_wire_path(&graph.nodes, edge) else {
+            let Some(path) =
+                crate::frames::edge_wire_path_routed(&graph.nodes, &graph.frames, &hidden, edge)
+            else {
                 continue;
             };
             if layout::wire_hit(&path, pointer, radius).is_none() {
@@ -1975,6 +2464,25 @@ impl Render for CanvasModel {
         };
         let graph = self.editor.graph().clone();
         let hovered = self.hovered.clone();
+        let hidden = crate::frames::collapsed_members(&graph);
+        let frame_paints: Vec<crate::frames::FramePaint> = graph
+            .frames
+            .iter()
+            .map(|frame| crate::frames::FramePaint {
+                color: crate::frames::swatch_color(&frame.swatch, &chart, theme_muted),
+                height: self.frame_height(frame),
+                selected: selection.iter().any(|id| id == &frame.id),
+                members: graph::frame_members(&graph, &frame.id).len(),
+                frame: frame.clone(),
+            })
+            .collect();
+        let frame_draw = match &self.drag {
+            Some(Drag::FrameDraw { start, current }) => Some((*start, *current)),
+            _ => None,
+        };
+        let minimap_on = self.editor.graph().view.minimap;
+        let minimap_alpha = self.minimap_alpha(minimap_on);
+        let _minimap_animating = self.minimap_fade.is_some();
 
         let entity = cx.entity();
         div()
@@ -2017,6 +2525,15 @@ impl Render for CanvasModel {
                     this.align("hcenter", cx);
                 } else if platform && event.keystroke.modifiers.shift && key == "h" {
                     this.align("distribute-h", cx);
+                } else if platform && key == "g" {
+                    this.group_selection(cx);
+                } else if !platform
+                    && event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && key == "l"
+                {
+                    this.auto_layout(cx);
                 } else if !platform
                     && !event.keystroke.modifiers.control
                     && !event.keystroke.modifiers.alt
@@ -2029,11 +2546,16 @@ impl Render for CanvasModel {
                         "o" => Some(Tool::Circle),
                         "t" => Some(Tool::Label),
                         "n" => Some(Tool::Note),
+                        "f" => Some(Tool::Frame),
                         _ => None,
                     };
                     if let Some(next) = next {
                         this.tool = next;
                         cx.notify();
+                    } else if key == "m" {
+                        this.toggle_minimap(cx);
+                    } else if key == "escape" {
+                        this.cancel_edit(cx);
                     }
                 }
             }))
@@ -2118,6 +2640,8 @@ impl Render for CanvasModel {
                 let painted_settle = settle_ids.clone();
                 let painted_link = link.clone();
                 let painted_overlay = overlay.clone();
+                let painted_frames = frame_paints.clone();
+                let painted_hidden = hidden.clone();
                 canvas(
                     move |bounds, _, _| {
                         *viewport.borrow_mut() = Some(bounds);
@@ -2139,6 +2663,8 @@ impl Render for CanvasModel {
                             theme_border,
                             &painted_overlay,
                             &painted_chart,
+                            &painted_frames,
+                            &painted_hidden,
                             window,
                             cx,
                         );
@@ -2147,47 +2673,70 @@ impl Render for CanvasModel {
                 .absolute()
                 .size_full()
             })
-            .children(self.editor.graph().nodes.iter().map(|node| {
-                let offset = settle_ids
-                    .iter()
-                    .find(|(id, _)| id == &node.id)
-                    .map(|(_, offset)| *offset)
-                    .unwrap_or_else(|| Point::new(0.0, 0.0));
-                card_element(
+            // Frame headers sit above the painted bodies and wires but below
+            // the cards, so a card overlapping a header stays on top.
+            .children(frame_paints.iter().map(|paint| {
+                crate::frames::frame_element(
                     entity.clone(),
-                    node,
-                    &graph,
-                    self.dots.get(&node.id).copied().unwrap_or(if node.unknown {
-                        Dot::Danger
-                    } else {
-                        Dot::Muted
-                    }),
-                    self.reduced_motion,
-                    camera,
-                    offset,
-                    selection.iter().any(|id| id == &node.id),
-                    hovered.as_deref() == Some(node.id.as_str()),
-                    dragging.iter().any(|id| id == &node.id),
-                    link_from.clone(),
-                    snap_target.clone(),
-                    CardPaint {
-                        card: theme_card,
-                        raised: theme_raised,
+                    paint.clone(),
+                    crate::frames::FrameTheme {
                         fg: theme_fg,
                         muted: theme_muted,
-                        primary: theme_primary,
-                        border: theme_border,
-                        success: theme_success,
-                        warning: theme_warning,
-                        danger: theme_danger,
-                        chart,
-                        radius,
-                        mono: mono.to_string(),
-                        frame: self.frames.get(&node.id).cloned(),
-                        note: self.notes.get(&node.id).cloned(),
+                        accent: theme_primary,
+                        card: theme_raised,
                     },
+                    camera,
+                    paint.frame.collapsed,
                 )
             }))
+            .children(
+                self.editor
+                    .graph()
+                    .nodes
+                    .iter()
+                    .filter(|node| !hidden.contains_key(&node.id))
+                    .map(|node| {
+                        let offset = settle_ids
+                            .iter()
+                            .find(|(id, _)| id == &node.id)
+                            .map(|(_, offset)| *offset)
+                            .unwrap_or_else(|| Point::new(0.0, 0.0));
+                        card_element(
+                            entity.clone(),
+                            node,
+                            &graph,
+                            self.dots.get(&node.id).copied().unwrap_or(if node.unknown {
+                                Dot::Danger
+                            } else {
+                                Dot::Muted
+                            }),
+                            self.reduced_motion,
+                            camera,
+                            offset,
+                            selection.iter().any(|id| id == &node.id),
+                            hovered.as_deref() == Some(node.id.as_str()),
+                            dragging.iter().any(|id| id == &node.id),
+                            link_from.clone(),
+                            snap_target.clone(),
+                            CardPaint {
+                                card: theme_card,
+                                raised: theme_raised,
+                                fg: theme_fg,
+                                muted: theme_muted,
+                                primary: theme_primary,
+                                border: theme_border,
+                                success: theme_success,
+                                warning: theme_warning,
+                                danger: theme_danger,
+                                chart,
+                                radius,
+                                mono: mono.to_string(),
+                                frame: self.frames.get(&node.id).cloned(),
+                                note: self.notes.get(&node.id).cloned(),
+                            },
+                        )
+                    }),
+            )
             .children(mark_views.iter().map(|mark| {
                 mark_element(
                     entity.clone(),
@@ -2201,12 +2750,57 @@ impl Render for CanvasModel {
                     theme_primary,
                 )
             }))
-            .when_some(self.editing.clone(), |this, id| {
-                let Some(mark) = self.editor.graph().mark(&id) else {
-                    return this;
+            .when_some(self.editing.clone(), |this, target| {
+                let (at, width) = match &target {
+                    EditTarget::Mark(id) => {
+                        let Some(mark) = self.editor.graph().mark(id) else {
+                            return this;
+                        };
+                        let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+                        let width = mark.size.map(|size| size[0]).unwrap_or(168.0) * camera.zoom;
+                        (at, width)
+                    }
+                    EditTarget::Frame(id) => {
+                        let Some(frame) = self
+                            .editor
+                            .graph()
+                            .frames
+                            .iter()
+                            .find(|frame| frame.id == *id)
+                        else {
+                            return this;
+                        };
+                        let at = camera.to_window(Point::new(frame.position[0], frame.position[1]));
+                        let width = (frame.size[0] * camera.zoom).max(px(160.0).as_f32());
+                        (Point::new(at.x + 4.0, at.y + 4.0), (width - 8.0).max(120.0))
+                    }
                 };
-                let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
-                let width = mark.size.map(|size| size[0]).unwrap_or(168.0) * camera.zoom;
+                // Escape drops the edit. The catcher registers a capture
+                // phase key listener for as long as the overlay paints, so
+                // Escape is seen before the focused input.
+                let cancel = cx.entity().downgrade();
+                let escape_catcher = gpui_kit::canvas(
+                    move |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_key_event(
+                            move |event: &gpui_kit::KeyDownEvent,
+                                  phase: gpui_kit::DispatchPhase,
+                                  _window,
+                                  cx| {
+                                if phase != gpui_kit::DispatchPhase::Capture {
+                                    return;
+                                }
+                                if event.keystroke.key == "escape" {
+                                    let _ = cancel.update(cx, |this, cx| {
+                                        this.cancel_edit(cx);
+                                    });
+                                }
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .size_full();
                 this.child(
                     div()
                         .absolute()
@@ -2220,6 +2814,7 @@ impl Render for CanvasModel {
                         .p_1()
                         .child(Input::new(&self.label_input)),
                 )
+                .child(escape_catcher)
             })
             .children(
                 if self.editor.graph().nodes.is_empty() && self.editor.graph().marks.is_empty() {
@@ -2282,6 +2877,44 @@ impl Render for CanvasModel {
                     )
                 },
             )
+            .when_some(frame_draw, |this, (start, current)| {
+                let at =
+                    camera.to_window(Point::new(start.x.min(current.x), start.y.min(current.y)));
+                let w = (start.x - current.x).abs() * camera.zoom;
+                let h = (start.y - current.y).abs() * camera.zoom;
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(at.x))
+                        .top(px(at.y))
+                        .w(px(w))
+                        .h(px(h))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme_muted.opacity(0.35))
+                        .bg(theme_muted.opacity(0.06)),
+                )
+            })
+            .when(minimap_on || minimap_alpha > 0.001, |this| {
+                let Some(bounds) = *self.viewport.borrow() else {
+                    return this;
+                };
+                let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                let content = crate::minimap::content_bounds(&graph, card_height, view);
+                let map = crate::minimap::Map::fit(content, crate::minimap::SIZE);
+                let entity = entity.clone();
+                let graph = graph.clone();
+                let selection = selection.clone();
+                this.child(crate::minimap::minimap_element(
+                    entity,
+                    &graph,
+                    &selection,
+                    map,
+                    minimap_alpha,
+                    view,
+                    cx,
+                ))
+            })
             .context_menu({
                 let entity = cx.entity();
                 move |menu, _, cx| canvas_menu(menu, entity.clone(), cx)
@@ -2334,6 +2967,16 @@ fn canvas_menu(
                 });
             }),
         );
+    let group = entity.clone();
+    let layout = entity.clone();
+    menu = menu
+        .separator()
+        .item(PopupMenuItem::new("Group").on_click(move |_, _, cx| {
+            group.update(cx, |this, cx| this.group_selection(cx));
+        }))
+        .item(PopupMenuItem::new("Auto-layout").on_click(move |_, _, cx| {
+            layout.update(cx, |this, cx| this.auto_layout(cx));
+        }));
     // A right click on a wire adds bend commands to the same menu.
     if let Some((edge, at, segment)) = entity.read(cx).wire_pick.clone() {
         let add = entity.clone();
@@ -2481,6 +3124,8 @@ fn paint_scene(
     border: gpui_kit::Hsla,
     overlay: &WireOverlay,
     chart: &[gpui_kit::Hsla; 6],
+    frames: &[crate::frames::FramePaint],
+    hidden: &std::collections::BTreeMap<String, String>,
     window: &mut Window,
     _cx: &mut App,
 ) {
@@ -2513,9 +3158,15 @@ fn paint_scene(
         }
     }
 
+    // Frames paint behind the wires, cards, and marks. Only the body and the
+    // header strip paint here; the interactive header is a DOM element.
+    crate::frames::paint_frames(frames, zoom, origin, primary, window);
+
     let placed = shifted(nodes, settle);
+    let frame_list: Vec<graph::Frame> = frames.iter().map(|paint| paint.frame.clone()).collect();
     for edge in edges {
-        let Some(path) = layout::edge_wire_path(&placed, edge) else {
+        let Some(path) = crate::frames::edge_wire_path_routed(&placed, &frame_list, hidden, edge)
+        else {
             continue;
         };
         let selected = selection.iter().any(|id| id == &edge.id);

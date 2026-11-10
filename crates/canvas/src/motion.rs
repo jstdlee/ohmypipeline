@@ -12,6 +12,12 @@ pub const HOVER: Duration = Duration::from_millis(140);
 pub const SETTLE: Duration = Duration::from_millis(180);
 pub const ENTER: Duration = Duration::from_millis(220);
 pub const CAMERA: Duration = Duration::from_millis(280);
+/// A frame collapsing or expanding.
+pub const COLLAPSE: Duration = Duration::from_millis(180);
+/// Auto-layout travel. A longer settle reads as a re-arrangement, not a drop.
+pub const LAYOUT: Duration = Duration::from_millis(260);
+/// The minimap fade.
+pub const FADE: Duration = Duration::from_millis(140);
 
 /// `cubic-bezier(0.22, 1, 0.36, 1)` approximated as a fast ease-out.
 /// Interrupt a running animation by replacing its target; this curve has no loop.

@@ -389,6 +389,22 @@ impl Document {
         }
     }
 
+    /// Place nodes at absolute positions as one undo step. Used by
+    /// auto-layout, which computes every new position up front.
+    pub fn place_many(&mut self, positions: &BTreeMap<String, Point>) -> bool {
+        if self.readonly || positions.is_empty() {
+            return false;
+        }
+        self.mutate(|graph| {
+            for node in &mut graph.nodes {
+                if let Some(point) = positions.get(&node.id) {
+                    node.position = [point.x, point.y];
+                }
+            }
+        });
+        true
+    }
+
     pub fn delete(&mut self, node_ids: &[String], mark_ids: &[String]) {
         self.mutate(|graph| {
             let node_set: BTreeSet<_> = node_ids.iter().cloned().collect();
@@ -1362,6 +1378,7 @@ fn can_write(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::connect::Reject;
+    use crate::model::VarKind;
 
     fn doc_with_chain() -> (Document, String, String) {
         let mut doc = Document::new();
@@ -1893,5 +1910,120 @@ mod tests {
         assert_eq!(doc.graph().edges.len(), 1);
         assert!(doc.undo());
         assert_eq!(doc.graph().edges[0].reroutes.len(), 2);
+    }
+
+    /// One undo must restore the whole graph exactly; redo must re-apply it.
+    fn assert_one_undo_round_trip(doc: &mut Document, before: &Graph, after: &Graph) {
+        assert_eq!(doc.graph(), after, "the edit did not apply as expected");
+        assert!(doc.undo());
+        assert_eq!(doc.graph(), before, "one undo must restore the prior graph");
+        assert!(doc.redo());
+        assert_eq!(doc.graph(), after, "redo must re-apply the edit");
+    }
+
+    fn undo_restores_after<F: FnOnce(&mut Document)>(body: F) {
+        let mut doc = Document::new();
+        doc.add_node("read_csv", Point::new(0.0, 0.0)).unwrap();
+        doc.add_node("head", Point::new(300.0, 0.0)).unwrap();
+        let before = doc.graph().clone();
+        body(&mut doc);
+        let after = doc.graph().clone();
+        assert_one_undo_round_trip(&mut doc, &before, &after);
+    }
+
+    #[test]
+    fn adding_a_node_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            doc.add_node("head", Point::new(320.0, 64.0)).unwrap();
+        });
+    }
+
+    #[test]
+    fn moving_nodes_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let ids: Vec<String> = doc.graph().nodes.iter().map(|n| n.id.clone()).collect();
+            doc.move_nodes(&ids, Point::new(32.0, -16.0), false);
+        });
+    }
+
+    #[test]
+    fn connecting_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let a = doc.graph().nodes[0].id.clone();
+            let b = doc.graph().nodes[1].id.clone();
+            doc.connect(&a, "out", &b, "in").unwrap();
+        });
+    }
+
+    #[test]
+    fn detaching_is_one_undo_step() {
+        let (mut doc, _a, _b) = doc_with_chain();
+        let edge = doc.graph().edges[0].id.clone();
+        let before = doc.graph().clone();
+        doc.detach(&edge);
+        let after = doc.graph().clone();
+        assert_one_undo_round_trip(&mut doc, &before, &after);
+    }
+
+    #[test]
+    fn setting_a_param_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let id = doc.graph().nodes[0].id.clone();
+            doc.set_param(&id, "path", json!("orders.csv"));
+        });
+    }
+
+    #[test]
+    fn setting_a_label_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let id = doc.graph().nodes[0].id.clone();
+            doc.set_label(&id, "Orders".into());
+        });
+    }
+
+    #[test]
+    fn setting_notes_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let id = doc.graph().nodes[0].id.clone();
+            doc.set_notes(&id, "Reads the raw file".into());
+        });
+    }
+
+    #[test]
+    fn adding_a_mark_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            doc.add_mark(MarkKind::Label, Point::new(48.0, 48.0), Some([160.0, 32.0]))
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn placing_many_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            let positions: BTreeMap<String, Point> = doc
+                .graph()
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    (
+                        node.id.clone(),
+                        Point::new(64.0 + index as f32 * 320.0, 48.0),
+                    )
+                })
+                .collect();
+            doc.place_many(&positions);
+        });
+    }
+
+    #[test]
+    fn setting_a_variable_is_one_undo_step() {
+        undo_restores_after(|doc| {
+            doc.set_variable(Variable {
+                name: "city".into(),
+                kind: VarKind::String,
+                value: json!("Paris"),
+            });
+        });
     }
 }

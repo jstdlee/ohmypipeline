@@ -456,7 +456,7 @@ impl Workspace {
         // would overwrite it.
         let keep_camera = matches!(
             options.demo.as_deref(),
-            Some("zoom") | Some("zoom-in") | Some("toolbar")
+            Some("zoom") | Some("zoom-in") | Some("toolbar") | Some("minimap")
         );
         let session = workspace.session.clone();
         window.on_next_frame(move |window, _cx| {
@@ -512,12 +512,27 @@ impl Workspace {
                             return;
                         };
                         session.canvas.update(cx, |canvas, cx| {
-                            canvas.seed_search_drop(
-                                &id,
-                                "out",
-                                graph::Point::new(880.0, 140.0),
-                                cx,
+                            // Drop just right of the last card, clamped into
+                            // the visible viewport so the popover opens over
+                            // canvas the user can see.
+                            let Some(node) = canvas.editor().graph().nodes.last().cloned() else {
+                                return;
+                            };
+                            let camera = canvas.editor().graph().camera;
+                            let view = canvas
+                                .panel_bounds()
+                                .map(|bounds| {
+                                    (bounds.size.width.as_f32(), bounds.size.height.as_f32())
+                                })
+                                .unwrap_or((1280.0, 720.0));
+                            let right =
+                                camera.to_canvas(graph::Point::new(view.0, view.1)).x - 340.0;
+                            let at = graph::Point::new(
+                                (node.position[0] + graph::card_width(&node.feature) + 80.0)
+                                    .min(right.max(node.position[0] + 320.0)),
+                                node.position[1] + 16.0,
                             );
+                            canvas.seed_search_drop(&id, "out", at, cx);
                         });
                     });
                 });
@@ -1769,6 +1784,138 @@ fn load_batch_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     });
 }
 
+/// A six-node pipeline under three frames: two readers in "Load", the clean
+/// chain in "Clean", and one node parked in a collapsed "Archive".
+fn load_frames_demo(canvas: &Entity<CanvasModel>, cx: &mut App, minimap: bool) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let csv = root.join("examples/orders.csv");
+    let csv = csv.canonicalize().unwrap_or(csv);
+    let people = root.join("examples/people.csv");
+    let people = people.canonicalize().unwrap_or(people);
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 96.0))
+            .unwrap();
+        doc.set_param(&read, "path", json!(csv.display().to_string()));
+        doc.set_label(&read, "orders.csv".into());
+        let read2 = doc
+            .add_node("read_csv", graph::Point::new(48.0, 320.0))
+            .unwrap();
+        doc.set_param(&read2, "path", json!(people.display().to_string()));
+        doc.set_label(&read2, "people.csv".into());
+        let dropna = doc
+            .add_node("dropna", graph::Point::new(360.0, 96.0))
+            .unwrap();
+        doc.set_label(&dropna, "Drop blanks".into());
+        let head = doc
+            .add_node("head", graph::Point::new(640.0, 96.0))
+            .unwrap();
+        doc.set_param(&head, "n", json!(5));
+        let headers = doc
+            .add_node("change_headers", graph::Point::new(920.0, 96.0))
+            .unwrap();
+        doc.set_param(
+            &headers,
+            "mapping",
+            json!([{"from": "amount", "to": "revenue"}]),
+        );
+        let head2 = doc
+            .add_node("head", graph::Point::new(360.0, 320.0))
+            .unwrap();
+        doc.set_param(&head2, "n", json!(10));
+        let _ = doc.connect(&read, "out", &dropna, "in");
+        let _ = doc.connect(&dropna, "out", &head, "in");
+        let _ = doc.connect(&head, "out", &headers, "in");
+        let _ = doc.connect(&read2, "out", &head2, "in");
+        // Frames sized around their members with the group padding.
+        if let Some(load) = doc.frame_around(&[read.clone(), read2.clone()], &[], 24.0) {
+            doc.set_frame_title(&load, "Load".into());
+            doc.set_frame_swatch(&load, "c2".into());
+        }
+        if let Some(clean) =
+            doc.frame_around(&[dropna.clone(), head.clone(), headers.clone()], &[], 24.0)
+        {
+            doc.set_frame_title(&clean, "Clean".into());
+            doc.set_frame_swatch(&clean, "c4".into());
+        }
+        if let Some(archive) = doc.frame_around(std::slice::from_ref(&head2), &[], 24.0) {
+            doc.set_frame_title(&archive, "Archive".into());
+            doc.set_frame_swatch(&archive, "c5".into());
+            doc.set_frame_collapsed(&archive, true);
+        }
+        if minimap {
+            let mut view = doc.graph().view;
+            view.minimap = true;
+            doc.set_view(view);
+        }
+        doc.set_camera(graph::Camera {
+            x: -24.0,
+            y: -48.0,
+            zoom: 1.4,
+        });
+        canvas.load_document(doc, cx);
+        canvas.select_only(&headers, cx);
+    });
+}
+
+/// Eight connected nodes scattered deterministically, laid out only when
+/// `after` is set so before and after screenshots show the same graph.
+fn load_layout_demo(after: bool, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 64.0))
+            .unwrap();
+        doc.set_label(&read, "orders.csv".into());
+        let dropna = doc
+            .add_node("dropna", graph::Point::new(520.0, 320.0))
+            .unwrap();
+        let head = doc
+            .add_node("head", graph::Point::new(120.0, 460.0))
+            .unwrap();
+        doc.set_param(&head, "n", json!(20));
+        let headers = doc
+            .add_node("change_headers", graph::Point::new(880.0, 140.0))
+            .unwrap();
+        let query = doc
+            .add_node("query", graph::Point::new(400.0, 600.0))
+            .unwrap();
+        doc.set_param(&query, "expr", json!("amount > 0"));
+        let sort = doc
+            .add_node("sort_values", graph::Point::new(960.0, 480.0))
+            .unwrap();
+        doc.set_param(&sort, "by", json!("amount"));
+        let concat = doc
+            .add_node("concat", graph::Point::new(1180.0, 260.0))
+            .unwrap();
+        let write = doc
+            .add_node("to_csv", graph::Point::new(1420.0, 300.0))
+            .unwrap();
+        doc.set_param(&write, "path", json!("/tmp/ompp-layout.csv"));
+        let _ = doc.connect(&read, "out", &dropna, "in");
+        let _ = doc.connect(&dropna, "out", &head, "in");
+        let _ = doc.connect(&head, "out", &headers, "in");
+        let _ = doc.connect(&dropna, "out", &query, "in");
+        let _ = doc.connect(&query, "out", &sort, "in");
+        let _ = doc.connect(&headers, "out", &concat, "in");
+        let _ = doc.connect(&sort, "out", &concat, "in");
+        let _ = doc.connect(&concat, "out", &write, "in");
+        let ids: Vec<String> = doc
+            .graph()
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        if after {
+            let placed = canvas::layered_layout(doc.graph(), &ids);
+            doc.place_many(&placed);
+        }
+        canvas.load_document(doc, cx);
+        canvas.select_only(&write, cx);
+    });
+}
+
 fn load_sales_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let csv = root.join("examples/sales.csv");
@@ -1832,6 +1979,18 @@ fn load_demo(
     let Some(demo) = demo else {
         return;
     };
+    if demo == "frames" {
+        load_frames_demo(canvas, cx, false);
+        return;
+    }
+    if demo == "minimap" {
+        load_frames_demo(canvas, cx, true);
+        return;
+    }
+    if demo == "layout-before" || demo == "layout-after" {
+        load_layout_demo(demo == "layout-after", canvas, cx);
+        return;
+    }
     if demo == "dark" {
         gpui_kit::component::theme::Theme::change(
             gpui_kit::component::theme::ThemeMode::Dark,
@@ -2440,6 +2599,9 @@ impl Panel for GraphPanel {
 impl Render for GraphPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tool = self.canvas.read(cx).tool();
+        let minimap_on = self.canvas.read(cx).editor().graph().view.minimap;
+        let can_undo = self.canvas.read(cx).editor().can_undo();
+        let can_redo = self.canvas.read(cx).editor().can_redo();
         let canvas = self.canvas.clone();
         let theme = cx.theme();
         div()
@@ -2534,12 +2696,24 @@ impl Render for GraphPanel {
                                 theme.accent_foreground,
                                 Tool::Note,
                             ))
+                            .child(toolbar_button(
+                                &canvas,
+                                "tool-frame",
+                                IconName::Frame,
+                                "Frame (F)",
+                                "Frame · F",
+                                tool == Tool::Frame,
+                                theme.accent,
+                                theme.accent_foreground,
+                                Tool::Frame,
+                            ))
                             .child(div().w(px(1.0)).h(px(18.0)).mx_1().bg(theme.border))
                             .child(history_toolbar_button(
                                 &canvas,
                                 "tool-undo",
                                 IconName::Undo2,
                                 "Undo",
+                                can_undo,
                                 |canvas, cx| canvas.undo(cx),
                             ))
                             .child(history_toolbar_button(
@@ -2547,6 +2721,7 @@ impl Render for GraphPanel {
                                 "tool-redo",
                                 IconName::Redo2,
                                 "Redo",
+                                can_redo,
                                 |canvas, cx| canvas.redo(cx),
                             ))
                             .child(history_toolbar_button(
@@ -2554,7 +2729,27 @@ impl Render for GraphPanel {
                                 "tool-fit",
                                 IconName::Maximize,
                                 "Zoom to fit",
+                                true,
                                 |canvas, cx| canvas.fit_all(cx),
+                            ))
+                            .child(toggle_toolbar_button(
+                                &canvas,
+                                "tool-minimap",
+                                IconName::Map,
+                                "Minimap (M)",
+                                "Minimap · M",
+                                minimap_on,
+                                theme.accent,
+                                theme.accent_foreground,
+                                |canvas, cx| canvas.toggle_minimap(cx),
+                            ))
+                            .child(action_toolbar_button(
+                                &canvas,
+                                "tool-layout",
+                                IconName::Network,
+                                "Auto-layout (Shift+L)",
+                                "Auto-layout · Shift+L",
+                                |canvas, cx| canvas.auto_layout(cx),
                             )),
                     ),
             )
@@ -2588,11 +2783,66 @@ fn toolbar_button(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn toggle_toolbar_button<F>(
+    canvas: &Entity<CanvasModel>,
+    id: &str,
+    icon: IconName,
+    label: &str,
+    tooltip: &str,
+    selected: bool,
+    accent: gpui_kit::Hsla,
+    accent_foreground: gpui_kit::Hsla,
+    run: F,
+) -> gpui_kit::component::button::Button
+where
+    F: Fn(&mut CanvasModel, &mut gpui_kit::Context<CanvasModel>) + 'static,
+{
+    let canvas = canvas.clone();
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .with_size(px(28.0))
+        .icon(icon)
+        .tooltip(tooltip.to_string())
+        .accessibility_label(label.to_string())
+        .when(selected, |button| {
+            button.bg(accent).text_color(accent_foreground)
+        })
+        .on_click(move |_, _, cx| {
+            canvas.update(cx, |canvas, cx| run(canvas, cx));
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_toolbar_button<F>(
+    canvas: &Entity<CanvasModel>,
+    id: &str,
+    icon: IconName,
+    label: &str,
+    tooltip: &str,
+    run: F,
+) -> gpui_kit::component::button::Button
+where
+    F: Fn(&mut CanvasModel, &mut gpui_kit::Context<CanvasModel>) + 'static,
+{
+    let canvas = canvas.clone();
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .with_size(px(28.0))
+        .icon(icon)
+        .tooltip(tooltip.to_string())
+        .accessibility_label(label.to_string())
+        .on_click(move |_, _, cx| {
+            canvas.update(cx, |canvas, cx| run(canvas, cx));
+        })
+}
+
 fn history_toolbar_button<F>(
     canvas: &Entity<CanvasModel>,
     id: &str,
     icon: IconName,
     label: &str,
+    enabled: bool,
     run: F,
 ) -> gpui_kit::component::button::Button
 where
@@ -2605,6 +2855,7 @@ where
         .icon(icon)
         .tooltip(label.to_string())
         .accessibility_label(label.to_string())
+        .disabled(!enabled)
         .on_click(move |_, _, cx| {
             canvas.update(cx, |canvas, cx| run(canvas, cx));
         })
@@ -5081,6 +5332,7 @@ pub fn run_gui(options: GuiOptions) {
                 gpui_kit::KeyBinding::new("ctrl-shift-enter", RunFull, None),
                 gpui_kit::KeyBinding::new("ctrl-z", UndoEdit, None),
                 gpui_kit::KeyBinding::new("ctrl-shift-z", RedoEdit, None),
+                gpui_kit::KeyBinding::new("ctrl-y", RedoEdit, None),
                 gpui_kit::KeyBinding::new("backspace", DeleteSelection, None),
                 gpui_kit::KeyBinding::new("ctrl-d", DuplicateSelection, None),
                 gpui_kit::KeyBinding::new("ctrl-0", FitView, None),
