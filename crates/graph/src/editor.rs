@@ -7,7 +7,9 @@ use crate::connect::{Reject, try_connect};
 use crate::feature::{self, FeatureDef};
 use crate::file::{self, FileError};
 use crate::geom::{Point, snap_grid};
-use crate::model::{Edge, Graph, Mark, MarkKind, Node, PortRecord};
+use crate::model::{
+    Edge, Graph, Mark, MarkKind, Node, PortRecord, Variable, bounds_of, frame_members,
+};
 use crate::types::TypeName;
 
 #[derive(Clone, Debug)]
@@ -15,6 +17,8 @@ struct Snapshot {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     marks: Vec<Mark>,
+    frames: Vec<crate::model::Frame>,
+    variables: Vec<crate::model::Variable>,
 }
 
 impl Snapshot {
@@ -23,17 +27,25 @@ impl Snapshot {
             nodes: graph.nodes.clone(),
             edges: graph.edges.clone(),
             marks: graph.marks.clone(),
+            frames: graph.frames.clone(),
+            variables: graph.variables.clone(),
         }
     }
 
     fn same(&self, graph: &Graph) -> bool {
-        self.nodes == graph.nodes && self.edges == graph.edges && self.marks == graph.marks
+        self.nodes == graph.nodes
+            && self.edges == graph.edges
+            && self.marks == graph.marks
+            && self.frames == graph.frames
+            && self.variables == graph.variables
     }
 
     fn restore(&self, graph: &mut Graph) {
         graph.nodes = self.nodes.clone();
         graph.edges = self.edges.clone();
         graph.marks = self.marks.clone();
+        graph.frames = self.frames.clone();
+        graph.variables = self.variables.clone();
     }
 }
 
@@ -738,6 +750,240 @@ impl Document {
         });
     }
 
+    pub fn add_frame(&mut self, title: String, position: Point, size: [f32; 2]) -> Option<String> {
+        if self.readonly {
+            return None;
+        }
+        let id = self.graph.alloc_frame_id();
+        let position = snap_grid(position);
+        self.mutate(|graph| {
+            graph.frames.push(crate::model::Frame {
+                id: id.clone(),
+                title,
+                swatch: "neutral".to_string(),
+                position: [position.x, position.y],
+                size,
+                collapsed: false,
+            });
+        });
+        Some(id)
+    }
+
+    /// Size a frame around the selection. The top grows by `HEADER_ALLOWANCE`
+    /// so a frame placed over a group shows a header above the cards.
+    pub fn frame_around(
+        &mut self,
+        node_ids: &[String],
+        mark_ids: &[String],
+        padding: f32,
+    ) -> Option<String> {
+        if self.readonly {
+            return None;
+        }
+        let ids: Vec<String> = node_ids.iter().chain(mark_ids.iter()).cloned().collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let bounds = bounds_of(&self.graph, &ids, estimated_card_height)?;
+        let position = snap_grid(Point::new(
+            bounds.x - padding,
+            bounds.y - HEADER_ALLOWANCE - padding,
+        ));
+        let size = [
+            (bounds.w + 2.0 * padding).max(MIN_FRAME_SIZE[0]),
+            (bounds.h + HEADER_ALLOWANCE + 2.0 * padding).max(MIN_FRAME_SIZE[1]),
+        ];
+        let id = self.graph.alloc_frame_id();
+        self.mutate(|graph| {
+            graph.frames.push(crate::model::Frame {
+                id: id.clone(),
+                title: String::new(),
+                swatch: "neutral".to_string(),
+                position: [position.x, position.y],
+                size,
+                collapsed: false,
+            });
+        });
+        Some(id)
+    }
+
+    /// Move a frame and its members in one gesture so the group stays whole.
+    pub fn move_frame(&mut self, id: &str, delta: Point) {
+        if self.readonly {
+            return;
+        }
+        let members = frame_members(&self.graph, id);
+        self.mutate(|graph| {
+            if let Some(frame) = graph.frames.iter_mut().find(|frame| frame.id == id) {
+                frame.position[0] += delta.x;
+                frame.position[1] += delta.y;
+            }
+            for node in &mut graph.nodes {
+                if members.iter().any(|member| member == &node.id) {
+                    node.position[0] += delta.x;
+                    node.position[1] += delta.y;
+                }
+            }
+        });
+    }
+
+    pub fn resize_frame(&mut self, id: &str, size: [f32; 2]) {
+        let open = self.history.open.is_some();
+        let apply = |graph: &mut Graph| {
+            if let Some(frame) = graph.frames.iter_mut().find(|frame| frame.id == id) {
+                frame.size = [
+                    size[0].max(MIN_FRAME_SIZE[0]),
+                    size[1].max(MIN_FRAME_SIZE[1]),
+                ];
+            }
+        };
+        if open {
+            apply(&mut self.graph);
+        } else {
+            self.mutate(apply);
+        }
+    }
+
+    pub fn set_frame_title(&mut self, id: &str, title: String) {
+        self.mutate(|graph| {
+            if let Some(frame) = graph.frames.iter_mut().find(|frame| frame.id == id) {
+                frame.title = title;
+            }
+        });
+    }
+
+    pub fn set_frame_swatch(&mut self, id: &str, swatch: String) {
+        self.mutate(|graph| {
+            if let Some(frame) = graph.frames.iter_mut().find(|frame| frame.id == id) {
+                frame.swatch = swatch;
+            }
+        });
+    }
+
+    pub fn set_frame_collapsed(&mut self, id: &str, collapsed: bool) {
+        self.mutate(|graph| {
+            if let Some(frame) = graph.frames.iter_mut().find(|frame| frame.id == id) {
+                frame.collapsed = collapsed;
+            }
+        });
+    }
+
+    /// Remove frames only. Frame members stay in the document.
+    pub fn delete_frames(&mut self, ids: &[String]) {
+        if self.readonly || ids.is_empty() {
+            return;
+        }
+        self.mutate(|graph| {
+            let set: BTreeSet<_> = ids.iter().cloned().collect();
+            graph.frames.retain(|frame| !set.contains(&frame.id));
+        });
+    }
+
+    /// Insert a bend point into a wire at `index`. Past the end appends.
+    pub fn add_reroute(&mut self, edge_id: &str, index: usize, point: Point) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            if let Some(edge) = graph.edges.iter_mut().find(|edge| edge.id == edge_id) {
+                let index = index.min(edge.reroutes.len());
+                edge.reroutes.insert(index, [point.x, point.y]);
+            }
+        });
+    }
+
+    pub fn move_reroute(&mut self, edge_id: &str, index: usize, point: Point) {
+        let open = self.history.open.is_some();
+        let apply = |graph: &mut Graph| {
+            if let Some(reroute) = graph
+                .edges
+                .iter_mut()
+                .find(|edge| edge.id == edge_id)
+                .and_then(|edge| edge.reroutes.get_mut(index))
+            {
+                *reroute = [point.x, point.y];
+            }
+        };
+        if open {
+            apply(&mut self.graph);
+        } else {
+            self.mutate(apply);
+        }
+    }
+
+    pub fn remove_reroute(&mut self, edge_id: &str, index: usize) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            for edge in &mut graph.edges {
+                if edge.id != edge_id {
+                    continue;
+                }
+                if index < edge.reroutes.len() {
+                    edge.reroutes.remove(index);
+                }
+            }
+        });
+    }
+
+    /// Insert by name or replace the existing entry with the same name.
+    pub fn set_variable(&mut self, variable: Variable) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            if let Some(found) = graph
+                .variables
+                .iter_mut()
+                .find(|found| found.name == variable.name)
+            {
+                *found = variable;
+            } else {
+                graph.variables.push(variable);
+            }
+        });
+    }
+
+    pub fn rename_variable(&mut self, old: &str, new: &str) -> bool {
+        if self.readonly || old == new || new.is_empty() || !crate::file::is_variable_name(new) {
+            return false;
+        }
+        let taken = self
+            .graph
+            .variables
+            .iter()
+            .any(|variable| variable.name == new);
+        if taken {
+            return false;
+        }
+        self.mutate(|graph| {
+            if let Some(variable) = graph
+                .variables
+                .iter_mut()
+                .find(|variable| variable.name == old)
+            {
+                variable.name = new.to_string();
+            }
+        });
+        true
+    }
+
+    pub fn remove_variable(&mut self, name: &str) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            graph.variables.retain(|variable| variable.name != name);
+        });
+    }
+
+    /// Window layout only. It marks the document dirty but writes no undo step.
+    pub fn set_view(&mut self, view: crate::model::View) {
+        self.graph.view = view;
+        self.dirty = true;
+    }
+
     pub fn paste_copies(
         &mut self,
         nodes: Vec<Node>,
@@ -961,6 +1207,23 @@ impl Document {
     }
 }
 
+/// Header strip a frame draws on top of its members.
+const HEADER_ALLOWANCE: f32 = 36.0;
+/// Smallest frame the inspector keeps on screen.
+const MIN_FRAME_SIZE: [f32; 2] = [120.0, 60.0];
+
+/// The file sizes cards exactly, but the card layout lives in `canvas`.
+/// Frame sizing only needs a generous estimate: port rows plus a body
+/// allowance, always a little taller than the canvas would draw.
+fn estimated_card_height(node: &Node) -> f32 {
+    let rows = node
+        .input_ports()
+        .len()
+        .max(usize::from(node.output_port().is_some()))
+        .max(1) as f32;
+    28.0 + 16.0 + 8.0 + 22.0 * rows + 8.0 + 96.0
+}
+
 fn can_write(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1081,6 +1344,219 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.graph().node(&id).unwrap().position, [0.0, 0.0]);
         assert!(doc.graph().node(&id).is_some());
+    }
+
+    fn a_document_with_a_frame_and_members() -> (Document, String, String, String) {
+        let mut doc = Document::new();
+        let a = doc.add_node("read_csv", Point::new(64.0, 64.0)).unwrap();
+        let b = doc.add_node("head", Point::new(320.0, 64.0)).unwrap();
+        let c = doc.add_node("query", Point::new(640.0, 400.0)).unwrap();
+        let id = doc
+            .frame_around(&[a.clone(), b.clone()], &[], 16.0)
+            .unwrap();
+        (doc, id, b, c)
+    }
+
+    #[test]
+    fn frame_around_sizes_a_rectangle_over_the_selection() {
+        let (doc, frame_id, _, _) = a_document_with_a_frame_and_members();
+        let frame = &doc.graph().frames[0];
+        // The two nodes covered by the selection are members, the third is not.
+        let expected: Vec<String> = doc
+            .graph()
+            .nodes
+            .iter()
+            .take(2)
+            .map(|node| node.id.clone())
+            .collect();
+        assert_eq!(frame_members(doc.graph(), &frame_id), expected);
+        // The header allowance lifts the rectangle above the cards.
+        let card = &doc.graph().nodes[0];
+        assert!(frame.position[0] <= card.position[0]);
+        assert!(frame.position[1] < card.position[1]);
+        assert!(!frame.collapsed);
+        assert_eq!(frame.swatch, "neutral");
+    }
+
+    #[test]
+    fn set_view_marks_dirty_but_writes_no_undo_step() {
+        let mut doc = Document::from_graph(Graph::default());
+        assert!(!doc.is_dirty());
+        assert!(!doc.can_undo());
+        doc.set_view(crate::model::View {
+            minimap: true,
+            ..crate::model::View::default()
+        });
+        assert!(doc.is_dirty());
+        assert!(!doc.can_undo());
+        doc.undo();
+        assert!(doc.graph().view.minimap, "undo must not revert the view");
+    }
+
+    #[test]
+    fn adding_a_frame_is_one_undo_step() {
+        let (mut doc, _, _, _) = a_document_with_a_frame_and_members();
+        assert_eq!(doc.graph().frames.len(), 1);
+        assert!(doc.undo());
+        assert!(doc.graph().frames.is_empty());
+        assert!(doc.redo());
+        assert_eq!(doc.graph().frames.len(), 1);
+    }
+
+    #[test]
+    fn moving_a_frame_moves_its_members_and_undo_restores_both() {
+        let (mut doc, frame_id, b, c) = a_document_with_a_frame_and_members();
+        let frame_before = doc.graph().frames[0].position;
+        let inside_before = doc.graph().node(&b).unwrap().position;
+        let outside_before = doc.graph().node(&c).unwrap().position;
+        doc.move_frame(&frame_id, Point::new(-16.0, 32.0));
+        let frame_after = doc.graph().frames[0].position;
+        assert_eq!(
+            frame_after,
+            [frame_before[0] - 16.0, frame_before[1] + 32.0]
+        );
+        assert_eq!(
+            doc.graph().node(&b).unwrap().position,
+            [inside_before[0] - 16.0, inside_before[1] + 32.0]
+        );
+        assert_eq!(doc.graph().node(&c).unwrap().position, outside_before);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().frames[0].position, frame_before);
+        assert_eq!(doc.graph().node(&b).unwrap().position, inside_before);
+        assert_eq!(doc.graph().node(&c).unwrap().position, outside_before);
+    }
+
+    #[test]
+    fn resizing_a_frame_clamps_to_a_minimum_and_undo_restores_it() {
+        let (mut doc, frame_id, _, _) = a_document_with_a_frame_and_members();
+        let before = doc.graph().frames[0].size;
+        doc.resize_frame(&frame_id, [10.0, 10.0]);
+        assert_eq!(doc.graph().frames[0].size, [120.0, 60.0]);
+        doc.resize_frame(&frame_id, [480.0, 320.0]);
+        assert_eq!(doc.graph().frames[0].size, [480.0, 320.0]);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().frames[0].size, [120.0, 60.0]);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().frames[0].size, before);
+    }
+
+    #[test]
+    fn collapsing_a_frame_is_one_undo_step() {
+        let (mut doc, frame_id, _, _) = a_document_with_a_frame_and_members();
+        doc.set_frame_collapsed(&frame_id, true);
+        assert!(doc.graph().frames[0].collapsed);
+        assert!(doc.undo());
+        assert!(!doc.graph().frames[0].collapsed);
+        doc.set_frame_title(&frame_id, "Triage".to_string());
+        doc.set_frame_swatch(&frame_id, "c4".to_string());
+        // Title and swatch are two separate edits; the first undo only
+        // reverts the swatch.
+        assert!(doc.undo());
+        assert_eq!(doc.graph().frames[0].title, "Triage");
+        assert_eq!(doc.graph().frames[0].swatch, "neutral");
+        assert!(doc.undo());
+        assert_eq!(doc.graph().frames[0].title, "");
+        assert!(!doc.graph().frames[0].collapsed);
+    }
+
+    #[test]
+    fn deleting_frames_leaves_the_members() {
+        let (mut doc, frame_id, b, c) = a_document_with_a_frame_and_members();
+        doc.delete_frames(&[frame_id.clone(), "f99".to_string()]);
+        assert!(doc.graph().frames.is_empty());
+        assert!(doc.graph().node(&b).is_some());
+        assert!(doc.graph().node(&c).is_some());
+        assert!(doc.undo());
+        assert!(doc.graph().frames.iter().any(|f| f.id == frame_id));
+    }
+
+    #[test]
+    fn deleting_a_node_removes_its_edges_but_keeps_frames() {
+        let (mut doc, frame_id, b, _) = a_document_with_a_frame_and_members();
+        let a = doc.graph().nodes[0].id.clone();
+        doc.connect(&a, "out", &b, "in").unwrap();
+        assert!(!doc.graph().edges.is_empty());
+        doc.delete(std::slice::from_ref(&a), &[]);
+        assert!(doc.graph().edges.is_empty());
+        assert!(doc.graph().frames.iter().any(|frame| frame.id == frame_id));
+    }
+
+    #[test]
+    fn add_move_and_remove_reroutes_are_each_one_undo_step() {
+        let (mut doc, _, _) = doc_with_chain();
+        let edge = doc.graph().edges[0].id.clone();
+        doc.add_reroute(&edge, 0, Point::new(160.0, 100.0));
+        assert_eq!(doc.graph().edges[0].reroutes, [[160.0, 100.0]]);
+        doc.add_reroute(&edge, 99, Point::new(240.0, 100.0));
+        assert_eq!(doc.graph().edges[0].reroutes.len(), 2);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().edges[0].reroutes, [[160.0, 100.0]]);
+        doc.move_reroute(&edge, 0, Point::new(208.0, 128.0));
+        assert_eq!(doc.graph().edges[0].reroutes, [[208.0, 128.0]]);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().edges[0].reroutes, [[160.0, 100.0]]);
+        doc.remove_reroute(&edge, 0);
+        assert!(doc.graph().edges[0].reroutes.is_empty());
+        assert!(doc.undo());
+        assert_eq!(doc.graph().edges[0].reroutes, [[160.0, 100.0]]);
+        doc.remove_reroute(&edge, 7);
+        assert_eq!(doc.graph().edges[0].reroutes, [[160.0, 100.0]]);
+    }
+
+    #[test]
+    fn variables_undo_one_step_at_a_time() {
+        let mut doc = Document::new();
+        doc.set_variable(crate::model::Variable {
+            name: "city".into(),
+            kind: crate::model::VarKind::String,
+            value: serde_json::json!("Paris"),
+        });
+        doc.set_variable(crate::model::Variable {
+            name: "top".into(),
+            kind: crate::model::VarKind::Int,
+            value: serde_json::json!(5),
+        });
+        assert_eq!(doc.graph().variables.len(), 2);
+        doc.set_variable(crate::model::Variable {
+            name: "city".into(),
+            kind: crate::model::VarKind::Path,
+            value: serde_json::json!("orders.csv"),
+        });
+        assert_eq!(
+            (
+                doc.graph().variables[0].kind,
+                doc.graph().variables[0].value.clone()
+            ),
+            (crate::model::VarKind::Path, serde_json::json!("orders.csv"))
+        );
+        assert!(doc.undo());
+        assert_eq!(doc.graph().variables[0].value, serde_json::json!("Paris"));
+        assert!(
+            !doc.rename_variable("top", "city"),
+            "a rename must not collide"
+        );
+        assert!(doc.rename_variable("top", "row_cap"));
+        assert!(doc.graph().variables.iter().any(|v| v.name == "row_cap"));
+        assert!(doc.undo());
+        assert!(doc.graph().variables.iter().any(|v| v.name == "top"));
+        doc.remove_variable("top");
+        assert_eq!(doc.graph().variables.len(), 1);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().variables.len(), 2);
+    }
+
+    #[test]
+    fn frame_ids_never_clash() {
+        let mut doc = Document::new();
+        let one = doc
+            .add_frame("One".into(), Point::new(0.0, 0.0), [300.0, 200.0])
+            .unwrap();
+        let two = doc
+            .add_frame("Two".into(), Point::new(0.0, 0.0), [300.0, 200.0])
+            .unwrap();
+        assert_ne!(one, two);
+        assert_eq!(one, "f1");
+        assert_eq!(two, "f2");
     }
 
     #[test]

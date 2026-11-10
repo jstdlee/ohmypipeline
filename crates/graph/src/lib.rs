@@ -25,9 +25,9 @@ pub use geom::{
     Camera, GRID_PX, Point, Rect, SNAP_RADIUS_PX, fit_camera, point_in_rect, snap_grid, zoom_toward,
 };
 pub use model::{
-    Anchor, Edge, Graph, HEADER_PAIRS, Mark, MarkKind, Node, Placed, PortRecord, Presentation,
-    ancestors, bounds_of, dependency_key, duplicate_headers, empty_mapping, header_pairs,
-    python_arg_names, run_fingerprint, sinks,
+    Anchor, DockSizes, Edge, Frame, Graph, HEADER_PAIRS, Mark, MarkKind, Node, Placed, PortRecord,
+    Presentation, VarKind, Variable, ancestors, bounds_of, dependency_key, duplicate_headers,
+    empty_mapping, frame_members, header_pairs, python_arg_names, run_fingerprint, sinks,
 };
 pub use protocol::{
     CHART_POINT_CAP, CellText, Job, JobOp, PREVIEW_ROW_CAP, Reply, RunMode, TABLE_WINDOW,
@@ -40,7 +40,9 @@ pub use template::{
 pub use types::TypeName;
 
 pub const FORMAT: &str = "ohmypipeline";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+/// Oldest file version `load_str` accepts.
+pub const MIN_VERSION: u32 = 1;
 pub const CARD_WIDTH: f32 = 220.0;
 
 /// Output nodes are wider so a table or a plot can sit on the card.

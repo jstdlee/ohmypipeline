@@ -148,6 +148,9 @@ pub struct Edge {
     pub from_port: String,
     pub to: String,
     pub to_port: String,
+    /// Canvas-space bend points along the wire, in wire order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reroutes: Vec<[f32; 2]>,
 }
 
 impl Edge {
@@ -158,6 +161,7 @@ impl Edge {
             from_port: from_port.to_string(),
             to: to.to_string(),
             to_port: to_port.to_string(),
+            reroutes: Vec::new(),
         }
     }
 }
@@ -214,6 +218,69 @@ fn de_size<'de, D: serde::Deserializer<'de>>(
     Option::<[f32; 2]>::deserialize(deserializer)
 }
 
+/// A group frame drawn around nodes. Membership is derived, not stored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub id: String,
+    pub title: String,
+    #[serde(default = "neutral_swatch")]
+    pub swatch: String,
+    #[serde(serialize_with = "ser_point", deserialize_with = "de_point")]
+    pub position: [f32; 2],
+    #[serde(serialize_with = "ser_point", deserialize_with = "de_point")]
+    pub size: [f32; 2],
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VarKind {
+    String,
+    Int,
+    Float,
+    Bool,
+    Path,
+}
+
+/// A typed pipeline variable. `value` is a JSON literal of `kind`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Variable {
+    pub name: String,
+    pub kind: VarKind,
+    #[serde(default)]
+    pub value: Value,
+}
+
+/// The dock sizes and minimap flag the user left behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DockSizes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct View {
+    #[serde(default)]
+    pub dock: DockSizes,
+    #[serde(default)]
+    pub minimap: bool,
+}
+
+impl View {
+    /// True when nothing was saved, so the field stays out of the file.
+    pub fn is_default(&self) -> bool {
+        self.dock.left.is_none()
+            && self.dock.right.is_none()
+            && self.dock.bottom.is_none()
+            && !self.minimap
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     #[serde(default = "default_format")]
@@ -226,6 +293,15 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     #[serde(default)]
     pub marks: Vec<Mark>,
+    /// Grouping frames. Membership is derived from positions, not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<Frame>,
+    /// Typed pipeline variables for `${name}` substitution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<Variable>,
+    /// Window layout the user expects back on the next open.
+    #[serde(default, skip_serializing_if = "View::is_default")]
+    pub view: View,
     #[serde(default)]
     pub camera: Camera,
 }
@@ -246,6 +322,9 @@ impl Default for Graph {
             nodes: Vec::new(),
             edges: Vec::new(),
             marks: Vec::new(),
+            frames: Vec::new(),
+            variables: Vec::new(),
+            view: View::default(),
             camera: Camera::default(),
         }
     }
@@ -280,6 +359,10 @@ impl Graph {
 
     pub fn alloc_mark_id(&self) -> String {
         alloc_id(self.marks.iter().map(|mark| mark.id.as_str()), 'm')
+    }
+
+    pub fn alloc_frame_id(&self) -> String {
+        alloc_id(self.frames.iter().map(|frame| frame.id.as_str()), 'f')
     }
 }
 
@@ -636,6 +719,26 @@ pub fn sinks(graph: &Graph) -> Vec<String> {
         .nodes
         .iter()
         .filter(|node| !graph.edges.iter().any(|edge| edge.from == node.id))
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+/// Nodes of `graph` whose top-left corner lies inside the frame rectangle.
+/// Membership is derived from positions so the file has one source of truth.
+pub fn frame_members(graph: &Graph, frame_id: &str) -> Vec<String> {
+    let Some(frame) = graph.frames.iter().find(|frame| frame.id == frame_id) else {
+        return Vec::new();
+    };
+    let rect = Rect {
+        x: frame.position[0],
+        y: frame.position[1],
+        w: frame.size[0],
+        h: frame.size[1],
+    };
+    graph
+        .nodes
+        .iter()
+        .filter(|node| rect.contains(node.position_point()))
         .map(|node| node.id.clone())
         .collect()
 }
