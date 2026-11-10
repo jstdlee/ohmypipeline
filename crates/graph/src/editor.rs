@@ -307,6 +307,33 @@ impl Document {
         Some(id)
     }
 
+    /// Adds a paired loop start and end, 400 px apart, as one undo step.
+    /// The end stores the start's id in its `pair` param. The body goes
+    /// between them.
+    pub fn add_loop(&mut self, position: Point) -> Option<(String, String)> {
+        if feature::feature("loop_start").is_none() || feature::feature("loop_end").is_none() {
+            return None;
+        }
+        let start_id = self.graph.alloc_node_id();
+        // The graph does not change between allocations, so the second id is
+        // the one right after the first.
+        let next: usize = start_id[1..].parse::<usize>().ok()? + 1;
+        let end_id = format!("n{next}");
+        let start = snap_grid(position);
+        let end = snap_grid(Point::new(position.x + 400.0, position.y));
+        self.mutate(|graph| {
+            graph
+                .nodes
+                .push(Node::new(start_id.clone(), "loop_start", start));
+            let mut end_node = Node::new(end_id.clone(), "loop_end", end);
+            end_node
+                .params
+                .insert("pair".to_string(), json!(start_id.clone()));
+            graph.nodes.push(end_node);
+        });
+        Some((start_id, end_id))
+    }
+
     pub fn add_after(&mut self, selected: &str, feature_id: &str) -> Option<String> {
         let source = self.graph.node(selected)?.clone();
         let position = snap_grid(Point::new(
@@ -1648,5 +1675,24 @@ mod tests {
         let names =
             crate::model::python_arg_names("def run(amount: object, region):\n    return amount\n");
         assert_eq!(names, vec!["amount".to_string(), "region".to_string()]);
+    }
+
+    #[test]
+    fn add_loop_pairs_a_start_and_an_end_in_one_undo_step() {
+        let mut doc = Document::new();
+        let (start, end) = doc.add_loop(Point::new(48.0, 64.0)).unwrap();
+        assert_ne!(start, end);
+        let start_node = doc.graph().node(&start).unwrap();
+        let end_node = doc.graph().node(&end).unwrap();
+        assert_eq!(start_node.feature, "loop_start");
+        assert_eq!(end_node.feature, "loop_end");
+        assert_eq!(end_node.param_str("pair"), start);
+        assert_eq!(start_node.position[1], end_node.position[1]);
+        assert_eq!(end_node.position[0] - start_node.position[0], 400.0);
+        assert!(doc.graph().edges.is_empty(), "the body goes between them");
+        assert!(doc.undo());
+        assert!(doc.graph().nodes.is_empty(), "one undo removes both");
+        assert!(doc.redo());
+        assert_eq!(doc.graph().nodes.len(), 2);
     }
 }

@@ -385,6 +385,14 @@ Each node carries a state the canvas draws as a badge. `NotConfigured` when a re
 
 A pipeline can declare typed variables: `string`, `int`, `float`, `bool`, `path`. Any string param may contain `${name}`; a param that is exactly `${name}` takes the typed value, so an int variable works for `n`. `$${` is a literal `${`. The worker substitutes before executing a node, an unknown name is an error on that node, and python nodes receive the values as a `vars` dict in their namespace instead of substituted code. A change to a variable makes only the nodes that read it, plus their descendants, stale. The CLI sets values per run with `ompp run f.pp --set name=value`, validated against the declared kinds.
 
+## Flow control
+
+Four features in the Flow group: `loop_start`, `loop_end`, `if_switch`, `end_if`. The body of a loop is the nodes on any path from the start to its paired end. The end stores the start's id in its `pair` param; "Add loop" places the pair 400 px apart as one undo step.
+
+`loop_start` runs the body once per iteration in one of three modes: `files` (a glob relative to the pipeline, sorted), `groups` (sorted unique values of a column of its input), or `values` (a comma list, which may be `${name}`). Each iteration binds the loop variable named by the `name` param (default `loop_value`) and `loop_index`, so a `read_csv` in the body can take `${loop_value}` as its path. `loop_end` concatenates the per-iteration frames and, when `add_column` is on, inserts that column with the iteration value first. Preview runs at most the first 3 iterations and says so: `preview · first 3 of 5 iterations`. Requesting a body node directly computes one iteration and claims `first iteration`. An error inside the loop is reported on the failing node and names the iteration: `iteration 4 (sales_2024.csv): …`.
+
+`if_switch` has a `condition` param and two outputs, `true` and `false`. The condition is a small grammar — variables, `rows`, `columns`, numbers, quoted strings, comparisons, `and`/`or`/`not`, parentheses — parsed, never evaluated as code. The selected output carries the input; the other carries a skip token. Any node fed by a skip token is skipped without executing and drawn inactive; `end_if` takes both branches and passes whichever is active. The reply lists the skipped node ids in `inactive`, and asking for a node on the inactive branch returns zero rows with the claim `inactive branch`. Per-iteration cache keys include the loop bindings, so iterations never share cached results.
+
 ## Auto update
 
 GPUI gives the window, the task, and the widgets. The release system is ours. Identity is stable: display name Ohmypipeline, binary `ompp`, bundle id `com.ohmypipeline.app`. User documents and settings are not in the install directory.

@@ -7,6 +7,7 @@ mod connect;
 mod editor;
 mod feature;
 mod file;
+mod flow;
 mod geom;
 mod model;
 mod protocol;
@@ -23,6 +24,7 @@ pub use connect::{
 pub use editor::Document;
 pub use feature::{CATALOG, FeatureDef, ParamDef, ParamKind, feature, features_in, groups};
 pub use file::{FileError, load_path, load_str, recovery_path, save_atomic, to_json};
+pub use flow::validate_condition;
 pub use geom::{
     Camera, GRID_PX, Point, Rect, SNAP_RADIUS_PX, fit_camera, point_in_rect, snap_grid, zoom_toward,
 };

@@ -481,6 +481,20 @@ impl Node {
         ports
     }
 
+    /// All output ports. Most features have one; `if_switch` has `true` and
+    /// `false`. Falls back to the single output for every existing feature.
+    pub fn output_ports(&self) -> Vec<PortRecord> {
+        if self.feature == "chart" || self.unknown {
+            return Vec::new();
+        }
+        if let Some(def) = self.def()
+            && !def.outputs.is_empty()
+        {
+            return def.outputs.iter().map(PortRecord::from_def).collect();
+        }
+        self.output_port().into_iter().collect()
+    }
+
     pub fn output_port(&self) -> Option<PortRecord> {
         if self.feature == "chart" || self.unknown {
             return None;
@@ -639,6 +653,29 @@ impl Node {
             "merge" => format!("how={}", self.param_str("how")),
             "concat" => "concat".to_string(),
             "to_frame" => "series to frame".to_string(),
+            "loop_start" => {
+                let mode = self.param_str("mode");
+                let detail = match mode.as_str() {
+                    "groups" => self.param_str("column"),
+                    "values" => self.param_str("values"),
+                    _ => self.param_str("pattern"),
+                };
+                if detail.is_empty() {
+                    mode
+                } else {
+                    format!("{mode} {detail}")
+                }
+            }
+            "loop_end" => "collect".to_string(),
+            "if_switch" => {
+                let condition = self.param_str("condition");
+                if condition.is_empty() {
+                    "no condition".to_string()
+                } else {
+                    condition
+                }
+            }
+            "end_if" => "merge branches".to_string(),
             _ => self.feature.clone(),
         }
     }

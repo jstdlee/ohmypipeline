@@ -69,7 +69,11 @@ impl ExecState {
                 required.push(port.name.clone());
             }
         }
+        let optional: &[&str] = node.def().map(|def| def.optional_inputs).unwrap_or(&[]);
         for port in &required {
+            if optional.contains(&port.as_str()) {
+                continue;
+            }
             if graph.edges_into(id, port).next().is_none() {
                 return false;
             }
