@@ -1,8 +1,9 @@
 //! Group frames: geometry, collapse routing, and the header element.
 //!
 //! A frame is a visual group only. Membership is derived from positions, so
-//! the file stores one rectangle and a title. Frames paint behind marks,
-//! wires, and cards; the header strip carries the interactions.
+//! the file stores one rectangle and a title. The frame paints as one element
+//! layer: a rounded body with a 28 px header strip, both placed behind the
+//! cards, so the translucent tint still shows the wires running through it.
 
 use std::collections::BTreeMap;
 
@@ -11,10 +12,10 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
-    Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
-    SharedString, Styled as _, div, px,
+    Entity, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, SharedString,
+    Styled as _, div, px,
 };
-use graph::{Edge, Frame, Graph, Node, Point, Rect, frame_members};
+use graph::{Edge, Frame, Graph, Node, Point, frame_members};
 
 /// Height of the header strip, in canvas pixels.
 pub const HEADER_H: f32 = 28.0;
@@ -127,32 +128,42 @@ pub fn edge_wire_path_routed(
     Some(crate::layout::wire_path(from, &reroutes, to))
 }
 
-/// Polygon points of a rounded rectangle, already mapped to the window.
-pub fn rounded_rect(
-    rect: Rect,
-    radius: f32,
-    zoom: f32,
-    origin: gpui_kit::Point<Pixels>,
-) -> Vec<gpui_kit::Point<Pixels>> {
-    let radius = radius.min(rect.w * 0.5).min(rect.h * 0.5) * zoom;
-    let left = origin.x.as_f32() + rect.x * zoom;
-    let top = origin.y.as_f32() + rect.y * zoom;
-    let right = left + rect.w * zoom;
-    let bottom = top + rect.h * zoom;
-    let quarter = |cx: f32, cy: f32, steps: usize| -> Vec<gpui_kit::Point<Pixels>> {
-        (0..=steps)
-            .map(|step| {
-                let angle = std::f32::consts::FRAC_PI_2 * step as f32 / steps as f32;
-                gpui_kit::point(px(cx + angle.cos() * radius), px(cy + angle.sin() * radius))
-            })
-            .collect()
+/// Endpoint centers an edge connects in canvas space, substituting the header
+/// edge point for a hidden card. `None` when both ends live in collapsed
+/// frames or a port is missing.
+pub fn edge_endpoints(
+    nodes: &[Node],
+    frames: &[Frame],
+    hidden: &BTreeMap<String, String>,
+    edge: &Edge,
+) -> Option<(Point, Point)> {
+    if hidden.contains_key(&edge.from) && hidden.contains_key(&edge.to) {
+        return None;
+    }
+    let source = nodes.iter().find(|node| node.id == edge.from)?;
+    let target = nodes.iter().find(|node| node.id == edge.to)?;
+    let source_slot = crate::layout::port_slots(source)
+        .into_iter()
+        .find(|slot| slot.name == edge.from_port && slot.side == crate::layout::Side::Out)?
+        .center;
+    let target_slot = crate::layout::port_slots(target)
+        .into_iter()
+        .find(|slot| slot.name == edge.to_port && slot.side == crate::layout::Side::In)?
+        .center;
+    let frame_of = |id: &str| -> Option<&Frame> {
+        hidden
+            .get(id)
+            .and_then(|frame_id| frames.iter().find(|frame| &frame.id == frame_id))
     };
-    let mut points = Vec::with_capacity(16);
-    points.extend(quarter(right - radius, top + radius, 3));
-    points.extend(quarter(right - radius, bottom - radius, 3));
-    points.extend(quarter(left + radius, bottom - radius, 3));
-    points.extend(quarter(left + radius, top + radius, 3));
-    points
+    let from = match frame_of(&edge.from) {
+        Some(frame) => header_edge_point(frame, target_slot),
+        None => source_slot,
+    };
+    let to = match frame_of(&edge.to) {
+        Some(frame) => header_edge_point(frame, source_slot),
+        None => target_slot,
+    };
+    Some((from, to))
 }
 
 /// Which part of a frame the drag-out started on.
@@ -163,7 +174,7 @@ pub enum ResizeEdge {
     Bottom,
 }
 
-/// Data the header element needs, computed once per render.
+/// Data the frame element needs, computed once per render.
 #[derive(Clone)]
 pub struct FramePaint {
     pub frame: Frame,
@@ -181,9 +192,10 @@ pub struct FrameTheme {
     pub card: gpui_kit::Hsla,
 }
 
-/// The header strip: title, chevron, member count, and resize handles. The
-/// body paints behind the wires, so this element only covers the top 28
-/// canvas pixels plus the handles along the bottom-right edges.
+/// The whole frame in one element layer: a rounded, bordered body with the
+/// translucent tint, topped by the 28 canvas pixel header strip with the
+/// title, chevron, and resize handles. The element sits behind the cards in
+/// paint order, so the body never covers its members.
 pub fn frame_element(
     entity: Entity<crate::model::CanvasModel>,
     paint: FramePaint,
@@ -194,7 +206,9 @@ pub fn frame_element(
     let zoom = camera.zoom;
     let at = camera.to_window(Point::new(paint.frame.position[0], paint.frame.position[1]));
     let width = px(paint.frame.size[0] * zoom);
+    let height = px(paint.height * zoom);
     let header_h = px(HEADER_H * zoom);
+    let radius = px(RADIUS * zoom);
     let id = paint.frame.id.clone();
     let (title_size, title_line) = crate::layout::text_with_zoom(crate::layout::TITLE_TEXT, zoom);
     let chevron = if paint.frame.collapsed {
@@ -202,21 +216,29 @@ pub fn frame_element(
     } else {
         IconName::ChevronDown
     };
+    let border_color = if paint.selected {
+        theme.accent.opacity(0.9)
+    } else {
+        paint.color.opacity(BORDER_OPACITY)
+    };
 
     let mut header = div()
         .id(SharedString::from(format!("frame-header-{id}")))
         .absolute()
-        .left(px(at.x))
-        .top(px(at.y))
-        .w(width)
+        .left(px(0.0))
+        .top(px(0.0))
+        .right(px(0.0))
         .h(header_h)
         .flex()
         .flex_row()
         .items_center()
         .px(px(10.0 * zoom))
         .gap(px(6.0 * zoom))
-        .rounded_tl(px(RADIUS))
-        .rounded_tr(px(RADIUS))
+        .bg(paint.color.opacity(HEADER_OPACITY))
+        .border_b_1()
+        .border_color(paint.color.opacity(BORDER_OPACITY))
+        .rounded_tl(radius)
+        .rounded_tr(radius)
         .cursor(gpui_kit::CursorStyle::Arrow)
         .on_mouse_down(MouseButton::Left, {
             let entity = entity.clone();
@@ -298,6 +320,19 @@ pub fn frame_element(
         .left(px(at.x))
         .top(px(at.y))
         .w(width)
+        .h(height)
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .rounded(radius)
+                .bg(paint.color.opacity(BODY_OPACITY))
+                .border_1()
+                .border_color(border_color),
+        )
         .child(header);
     if paint.selected {
         let right_strip = div()
@@ -443,106 +478,4 @@ fn frame_menu(
             }),
         );
     menu
-}
-
-/// Paint the frame body, header strip, and border into the scene, behind the
-/// wires.
-pub fn paint_frames(
-    frames: &[FramePaint],
-    zoom: f32,
-    origin: gpui_kit::Point<Pixels>,
-    accent: gpui_kit::Hsla,
-    window: &mut gpui_kit::Window,
-) {
-    for paint in frames {
-        let _color = if paint.selected { accent } else { paint.color };
-        let rect = Rect {
-            x: paint.frame.position[0],
-            y: paint.frame.position[1],
-            w: paint.frame.size[0],
-            h: paint.height,
-        };
-        if let Ok(path) = polygon_path(rounded_rect(rect, RADIUS, zoom, origin)) {
-            window.paint_path(path, paint.color.opacity(BODY_OPACITY));
-        }
-        let border_color = if paint.selected {
-            accent.opacity(0.9)
-        } else {
-            paint.color.opacity(BORDER_OPACITY)
-        };
-        if let Ok(path) = stroke_path(&rounded_rect(rect, RADIUS, zoom, origin), px(1.0)) {
-            window.paint_path(path, border_color);
-        }
-        // Header strip: a slightly stronger fill plus the separator line.
-        let header = Rect {
-            h: HEADER_H,
-            ..rect
-        };
-        if let Ok(path) = polygon_path(rounded_rect_top(header, RADIUS, zoom, origin)) {
-            window.paint_path(path, paint.color.opacity(HEADER_OPACITY));
-        }
-        let sep = [
-            gpui_kit::point(
-                origin.x + px(rect.x * zoom),
-                origin.y + px((rect.y + HEADER_H) * zoom),
-            ),
-            gpui_kit::point(
-                origin.x + px((rect.x + rect.w) * zoom),
-                origin.y + px((rect.y + HEADER_H) * zoom),
-            ),
-        ];
-        if let Ok(path) = stroke_path(&sep, px(1.0)) {
-            window.paint_path(path, paint.color.opacity(BORDER_OPACITY));
-        }
-    }
-}
-
-/// The header polygon, rounded only on the top corners.
-fn rounded_rect_top(
-    rect: Rect,
-    radius: f32,
-    zoom: f32,
-    origin: gpui_kit::Point<Pixels>,
-) -> Vec<gpui_kit::Point<Pixels>> {
-    let radius = radius.min(rect.w * 0.5) * zoom;
-    let left = origin.x.as_f32() + rect.x * zoom;
-    let top = origin.y.as_f32() + rect.y * zoom;
-    let right = left + rect.w * zoom;
-    let bottom = top + rect.h * zoom;
-    let quarter = |cx: f32, cy: f32, steps: usize| -> Vec<gpui_kit::Point<Pixels>> {
-        (0..=steps)
-            .map(|step| {
-                let angle = std::f32::consts::FRAC_PI_2 * step as f32 / steps as f32;
-                gpui_kit::point(px(cx + angle.cos() * radius), px(cy + angle.sin() * radius))
-            })
-            .collect()
-    };
-    let mut points = Vec::with_capacity(12);
-    points.extend(quarter(right - radius, top + radius, 3));
-    points.push(gpui_kit::point(px(right), px(bottom)));
-    points.push(gpui_kit::point(px(left), px(bottom)));
-    points.extend(quarter(left + radius, top + radius, 3));
-    points
-}
-
-fn polygon_path(points: Vec<gpui_kit::Point<Pixels>>) -> Result<gpui_kit::Path<Pixels>, ()> {
-    let mut builder = gpui_kit::PathBuilder::fill();
-    builder.add_polygon(&points, true);
-    builder.build().map_err(|_| ())
-}
-
-fn stroke_path(
-    points: &[gpui_kit::Point<Pixels>],
-    width: gpui_kit::Pixels,
-) -> Result<gpui_kit::Path<Pixels>, ()> {
-    let mut builder = gpui_kit::PathBuilder::stroke(width);
-    for (index, point) in points.iter().enumerate() {
-        if index == 0 {
-            builder.move_to(*point);
-        } else {
-            builder.line_to(*point);
-        }
-    }
-    builder.close();
-    builder.build().map_err(|_| ())
 }

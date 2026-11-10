@@ -453,10 +453,16 @@ impl Workspace {
             workspace.run(RunMode::Preview, window, cx);
         }
         // The zoom and toolbar demos pin the camera themselves; the auto fit
-        // would overwrite it.
+        // would overwrite it. The big demos park the camera too: big on the
+        // first layers, big-out on the whole 400 node graph.
         let keep_camera = matches!(
             options.demo.as_deref(),
-            Some("zoom") | Some("zoom-in") | Some("toolbar") | Some("minimap")
+            Some("zoom")
+                | Some("zoom-in")
+                | Some("toolbar")
+                | Some("minimap")
+                | Some("big")
+                | Some("big-out")
         );
         let session = workspace.session.clone();
         window.on_next_frame(move |window, _cx| {
@@ -1916,6 +1922,63 @@ fn load_layout_demo(after: bool, canvas: &Entity<CanvasModel>, cx: &mut App) {
     });
 }
 
+/// Synthetic 400 node layered DAG for the performance check. `first` parks
+/// the camera on the first layers at zoom 0.8; otherwise the whole graph
+/// fits, which exercises the Title detail level.
+fn load_big_demo(first: bool, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let doc = graph::Document::from_graph(canvas::perf::synthetic_graph(400, 7));
+    canvas.update(cx, |canvas, cx| {
+        canvas.load_document(doc, cx);
+        if first {
+            let graph = canvas.editor().graph();
+            let ids: Vec<String> = graph
+                .nodes
+                .iter()
+                .take(30)
+                .map(|node| node.id.clone())
+                .collect();
+            let rect = graph::bounds_of(graph, &ids, canvas::card_height).unwrap_or(graph::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1400.0,
+                h: 900.0,
+            });
+            let view = canvas.panel_bounds();
+            let (w, h) = view
+                .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()))
+                .unwrap_or((1400.0, 900.0));
+            let center = graph::Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+            canvas.editor_mut().set_camera(graph::Camera {
+                x: w * 0.5 - center.x * 0.8,
+                y: h * 0.5 - center.y * 0.8,
+                zoom: 0.8,
+            });
+        } else {
+            // Fit everything directly: the 400 node graph is far wider than
+            // the zoom clamp allows, so the standard animated fit floors out.
+            let graph = canvas.editor().graph();
+            let rect = graph::bounds_of(graph, &[], canvas::card_height).unwrap_or(graph::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1400.0,
+                h: 900.0,
+            });
+            let (w, h) = canvas
+                .panel_bounds()
+                .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()))
+                .unwrap_or((1400.0, 900.0));
+            let zoom = ((w - 144.0) / rect.w).min((h - 144.0) / rect.h).max(0.05);
+            let center = graph::Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+            canvas.editor_mut().set_camera(graph::Camera {
+                x: w * 0.5 - center.x * zoom,
+                y: h * 0.5 - center.y * zoom,
+                zoom,
+            });
+        }
+        cx.notify();
+    });
+}
+
 fn load_sales_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let csv = root.join("examples/sales.csv");
@@ -1981,6 +2044,10 @@ fn load_demo(
     };
     if demo == "frames" {
         load_frames_demo(canvas, cx, false);
+        return;
+    }
+    if demo == "big" || demo == "big-out" {
+        load_big_demo(demo == "big", canvas, cx);
         return;
     }
     if demo == "minimap" {

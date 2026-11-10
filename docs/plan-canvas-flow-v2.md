@@ -83,6 +83,7 @@ Each milestone is one commit (or a few) and must pass `cargo fmt --all --check`,
 - Cull cards and marks whose rect is outside the viewport plus a 64 px margin; cull wires whose bounding box is outside.
 - Cache wire cubics per edge keyed on endpoint positions, reroutes, and camera; drop the cache on edit.
 - `canvas` bench: `cargo test -p canvas --release -- --ignored bench_500` builds a 500-node, 600-edge graph and asserts layout + hit-test of a frame under a budget (logged, generous threshold for CI). A `--demo big` loads it for a visual check.
+- Run the bench with `cargo test -p canvas --release --test perf -- --ignored --nocapture`. `--demo big` parks on the first layers at zoom 0.8; `--demo big-out` fits all 400 nodes.
 
 ### M6 Execution model and wire data view (items 10, 11)
 

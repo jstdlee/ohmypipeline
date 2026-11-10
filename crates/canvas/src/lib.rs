@@ -9,6 +9,7 @@ mod layout;
 mod minimap;
 mod model;
 mod motion;
+pub mod perf;
 mod plot;
 
 pub use autolayout::layered_layout;

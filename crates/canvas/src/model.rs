@@ -2,9 +2,10 @@
 //! decides which rule a gesture is asking for.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme as _;
@@ -69,6 +70,31 @@ struct Settle {
     offsets: BTreeMap<String, Point>,
     started: Instant,
     duration: Duration,
+}
+
+/// Identity of a wire's shape in canvas space. Any change re-derives the
+/// chain; panning and zooming leave it untouched, only the projection moves.
+#[derive(Clone, PartialEq)]
+struct WireKey {
+    from: Point,
+    to: Point,
+    reroutes: Vec<Point>,
+}
+
+/// A chain waiting for the next paint. Corrected whenever its input key no
+/// longer matches, and dropped wholesale on a document edit.
+struct CachedWire {
+    key: WireKey,
+    path: Arc<Vec<layout::Cubic>>,
+}
+
+/// Data the paint scene needs per wire, resolved once per render so the
+/// hot loop does no graph lookups or vector building.
+struct WirePaint {
+    id: String,
+    reroutes: Vec<Point>,
+    path: Arc<Vec<layout::Cubic>>,
+    source_color: gpui_kit::Hsla,
 }
 
 struct CameraAnim {
@@ -206,6 +232,7 @@ pub struct CanvasModel {
     reduced_motion: bool,
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    wire_cache: HashMap<String, CachedWire>,
 }
 
 impl CanvasModel {
@@ -261,6 +288,7 @@ impl CanvasModel {
             reduced_motion: false,
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
+            wire_cache: HashMap::new(),
         }
         .with_focus(window)
     }
@@ -403,6 +431,7 @@ impl CanvasModel {
         self.settle = None;
         self.camera_anim = None;
         self.frame_anim.clear();
+        self.wire_cache.clear();
         self.minimap_drag = false;
         self.minimap_fade = None;
         self.hover_wire = None;
@@ -920,6 +949,9 @@ impl CanvasModel {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        // Wire shapes derive from the document; an edit invalidates every
+        // cached chain. Camera-only updates skip this and keep theirs.
+        self.wire_cache.clear();
         cx.emit(CanvasEvent::Edited);
         cx.notify();
     }
@@ -2465,6 +2497,58 @@ impl Render for CanvasModel {
         let graph = self.editor.graph().clone();
         let hovered = self.hovered.clone();
         let hidden = crate::frames::collapsed_members(&graph);
+        // Visible slice of the viewport, in element window space. Culling is
+        // a render-time optimization: selection and gestures stay model based.
+        let view_rect = self.viewport.borrow().map(|bounds| graph::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: bounds.size.width.as_f32(),
+            h: bounds.size.height.as_f32(),
+        });
+        let placed = shifted(&nodes, &settle_ids);
+        // Probe graph with the drawn positions so the pure culling helpers
+        // see exactly what the paint will see, settle offsets included.
+        let placed_graph = graph::Graph {
+            nodes: placed,
+            ..graph::Graph::default()
+        };
+        let card_on = if view_rect.is_some() {
+            let mut flags = vec![false; nodes.len()];
+            for index in crate::perf::visible_nodes(
+                &placed_graph,
+                &camera,
+                view_rect.unwrap_or(graph::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                }),
+                crate::perf::MARGIN_PX,
+            ) {
+                flags[index] = true;
+            }
+            flags
+        } else {
+            vec![true; nodes.len()]
+        };
+        let wire_paints: Vec<WirePaint> = {
+            let mut cache = std::mem::take(&mut self.wire_cache);
+            let mut paints: Vec<WirePaint> = Vec::with_capacity(edges.len());
+            build_wire_paints(
+                &placed_graph.nodes,
+                &graph,
+                &hidden,
+                &edges,
+                camera,
+                view_rect,
+                &chart,
+                theme_muted,
+                &mut cache,
+                &mut paints,
+            );
+            self.wire_cache = cache;
+            paints
+        };
         let frame_paints: Vec<crate::frames::FramePaint> = graph
             .frames
             .iter()
@@ -2637,11 +2721,10 @@ impl Render for CanvasModel {
             .child({
                 let painted_selection = selection.clone();
                 let painted_chart = chart;
-                let painted_settle = settle_ids.clone();
                 let painted_link = link.clone();
                 let painted_overlay = overlay.clone();
-                let painted_frames = frame_paints.clone();
-                let painted_hidden = hidden.clone();
+                let painted_placed = placed_graph.nodes;
+                let painted_wires = wire_paints;
                 canvas(
                     move |bounds, _, _| {
                         *viewport.borrow_mut() = Some(bounds);
@@ -2650,11 +2733,8 @@ impl Render for CanvasModel {
                         paint_scene(
                             bounds,
                             camera,
-                            &nodes,
-                            &edges,
-                            &marks,
+                            &painted_placed,
                             &painted_selection,
-                            &painted_settle,
                             painted_link.as_ref(),
                             flow,
                             theme_muted,
@@ -2663,8 +2743,7 @@ impl Render for CanvasModel {
                             theme_border,
                             &painted_overlay,
                             &painted_chart,
-                            &painted_frames,
-                            &painted_hidden,
+                            &painted_wires,
                             window,
                             cx,
                         );
@@ -2673,29 +2752,53 @@ impl Render for CanvasModel {
                 .absolute()
                 .size_full()
             })
-            // Frame headers sit above the painted bodies and wires but below
-            // the cards, so a card overlapping a header stays on top.
-            .children(frame_paints.iter().map(|paint| {
-                crate::frames::frame_element(
-                    entity.clone(),
-                    paint.clone(),
-                    crate::frames::FrameTheme {
-                        fg: theme_fg,
-                        muted: theme_muted,
-                        accent: theme_primary,
-                        card: theme_raised,
-                    },
-                    camera,
-                    paint.frame.collapsed,
-                )
-            }))
+            // Frame layers sit above the wires but below the cards, so a
+            // card overlapping a frame stays on top. Off-screen frames are
+            // culled entirely, members included.
+            .children(
+                frame_paints
+                    .iter()
+                    .filter(|paint| {
+                        let at = camera.to_window(Point::new(
+                            paint.frame.position[0],
+                            paint.frame.position[1],
+                        ));
+                        let rect = graph::Rect {
+                            x: at.x,
+                            y: at.y,
+                            w: paint.frame.size[0] * camera.zoom,
+                            h: paint.height * camera.zoom,
+                        };
+                        view_rect.is_none_or(|view| {
+                            crate::perf::rects_intersect(
+                                rect,
+                                crate::perf::grow(view, crate::perf::MARGIN_PX),
+                            )
+                        })
+                    })
+                    .map(|paint| {
+                        crate::frames::frame_element(
+                            entity.clone(),
+                            paint.clone(),
+                            crate::frames::FrameTheme {
+                                fg: theme_fg,
+                                muted: theme_muted,
+                                accent: theme_primary,
+                                card: theme_raised,
+                            },
+                            camera,
+                            paint.frame.collapsed,
+                        )
+                    }),
+            )
             .children(
                 self.editor
                     .graph()
                     .nodes
                     .iter()
-                    .filter(|node| !hidden.contains_key(&node.id))
-                    .map(|node| {
+                    .enumerate()
+                    .filter(|(index, node)| card_on[*index] && !hidden.contains_key(&node.id))
+                    .map(|(_, node)| {
                         let offset = settle_ids
                             .iter()
                             .find(|(id, _)| id == &node.id)
@@ -2737,19 +2840,42 @@ impl Render for CanvasModel {
                         )
                     }),
             )
-            .children(mark_views.iter().map(|mark| {
-                mark_element(
-                    entity.clone(),
-                    mark,
-                    camera,
-                    selection.iter().any(|id| id == &mark.id),
-                    theme_fg,
-                    theme_muted,
-                    theme_border,
-                    theme_card,
-                    theme_primary,
-                )
-            }))
+            .children(
+                mark_views
+                    .iter()
+                    .filter(|mark| {
+                        let size = mark.size.unwrap_or(match mark.kind {
+                            MarkKind::Label | MarkKind::Note | MarkKind::Button => [168.0, 36.0],
+                            MarkKind::Rectangle | MarkKind::Circle => [140.0, 88.0],
+                        });
+                        let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+                        let rect = graph::Rect {
+                            x: at.x,
+                            y: at.y,
+                            w: size[0] * camera.zoom,
+                            h: size[1] * camera.zoom,
+                        };
+                        view_rect.is_none_or(|view| {
+                            crate::perf::rects_intersect(
+                                rect,
+                                crate::perf::grow(view, crate::perf::MARGIN_PX),
+                            )
+                        })
+                    })
+                    .map(|mark| {
+                        mark_element(
+                            entity.clone(),
+                            mark,
+                            camera,
+                            selection.iter().any(|id| id == &mark.id),
+                            theme_fg,
+                            theme_muted,
+                            theme_border,
+                            theme_card,
+                            theme_primary,
+                        )
+                    }),
+            )
             .when_some(self.editing.clone(), |this, target| {
                 let (at, width) = match &target {
                     EditTarget::Mark(id) => {
@@ -3112,10 +3238,7 @@ fn paint_scene(
     bounds: Bounds<Pixels>,
     camera: Camera,
     nodes: &[Node],
-    edges: &[Edge],
-    _marks: &[graph::Mark],
     selection: &[String],
-    settle: &[(String, Point)],
     link: Option<&LinkVisual>,
     flow: Option<f32>,
     muted: gpui_kit::Hsla,
@@ -3124,8 +3247,7 @@ fn paint_scene(
     border: gpui_kit::Hsla,
     overlay: &WireOverlay,
     chart: &[gpui_kit::Hsla; 6],
-    frames: &[crate::frames::FramePaint],
-    hidden: &std::collections::BTreeMap<String, String>,
+    wires: &[WirePaint],
     window: &mut Window,
     _cx: &mut App,
 ) {
@@ -3158,57 +3280,45 @@ fn paint_scene(
         }
     }
 
-    // Frames paint behind the wires, cards, and marks. Only the body and the
-    // header strip paint here; the interactive header is a DOM element.
-    crate::frames::paint_frames(frames, zoom, origin, primary, window);
-
-    let placed = shifted(nodes, settle);
-    let frame_list: Vec<graph::Frame> = frames.iter().map(|paint| paint.frame.clone()).collect();
-    for edge in edges {
-        let Some(path) = crate::frames::edge_wire_path_routed(&placed, &frame_list, hidden, edge)
-        else {
-            continue;
-        };
-        let selected = selection.iter().any(|id| id == &edge.id);
-        let hovered = overlay.hover.as_deref() == Some(edge.id.as_str());
-        let hinted = overlay.hint.as_deref() == Some(edge.id.as_str());
-        let ty = output_types_first(nodes, &edge.from);
-        let base = ty
-            .map(|ty| type_color(ty, chart))
-            .unwrap_or(muted)
-            .opacity(if selected { 1.0 } else { 0.85 });
+    // Wires paint behind the frames, cards, and marks. Frames arrive as
+    // translucent element layers above this scene.
+    for wire in wires {
+        let selected = selection.iter().any(|id| id == &wire.id);
+        let hovered = overlay.hover.as_deref() == Some(wire.id.as_str());
+        let hinted = overlay.hint.as_deref() == Some(wire.id.as_str());
+        let base = wire.source_color.opacity(if selected { 1.0 } else { 0.85 });
         let (color, width) = if hinted {
             (primary, 2.5)
         } else if selected {
-            (base, 1.75)
+            (wire.source_color, 1.75)
         } else {
             (base, 1.25)
         };
-        for cubic in &path {
-            paint_cubic(origin, camera, *cubic, color, px(width), window);
+        for cubic in wire.path.iter().copied() {
+            paint_cubic(origin, camera, cubic, color, px(width), window);
         }
         if let Some(phase) = flow {
-            let at = layout::cubic_point(path[0], phase);
+            let at = layout::cubic_point(wire.path[0], phase);
             paint_dot(origin, camera, at, 3.0, color, window);
         }
         // Bend points show when they matter: near the camera, or when the
         // wire or one of the points is being looked at.
-        if edge.reroutes.is_empty() {
+        if wire.reroutes.is_empty() {
             continue;
         }
         let is_picked = |index: usize| {
             overlay
                 .picked
                 .as_ref()
-                .is_some_and(|(id, i)| id == &edge.id && *i == index)
+                .is_some_and(|(id, i)| id == &wire.id && *i == index)
         };
         let is_hover_point = |index: usize| {
             overlay
                 .hover_point
                 .as_ref()
-                .is_some_and(|(id, i)| id == &edge.id && *i == index)
+                .is_some_and(|(id, i)| id == &wire.id && *i == index)
         };
-        for (index, point) in edge.reroutes.iter().enumerate() {
+        for (index, point) in wire.reroutes.iter().copied().enumerate() {
             let active = selected || hovered || is_picked(index) || is_hover_point(index);
             if zoom < 0.55 && !active {
                 continue;
@@ -3217,7 +3327,7 @@ fn paint_scene(
             paint_dot(
                 origin,
                 camera,
-                Point::new(point[0], point[1]),
+                point,
                 3.5,
                 if accent { primary } else { border },
                 window,
@@ -3238,6 +3348,83 @@ fn paint_scene(
             let cubic = layout::wire_cubic(start, link.to);
             paint_cubic(origin, camera, cubic, color, px(1.5), window);
         }
+    }
+}
+
+/// Resolve the visible wires for the next paint. Each edge gets its chain
+/// from the cache when the key still matches, so panning and zooming only
+/// re-project; an edit clears the cache and everything rebuilds once. Wires
+/// whose control box falls outside the viewport plus the margin are skipped,
+/// but their cache entries survive so panning them back in is free.
+#[allow(clippy::too_many_arguments)]
+fn build_wire_paints(
+    placed: &[Node],
+    graph: &graph::Graph,
+    hidden: &std::collections::BTreeMap<String, String>,
+    edges: &[Edge],
+    camera: Camera,
+    viewport: Option<graph::Rect>,
+    chart: &[gpui_kit::Hsla; 6],
+    muted: gpui_kit::Hsla,
+    cache: &mut HashMap<String, CachedWire>,
+    out: &mut Vec<WirePaint>,
+) {
+    let view = viewport.map(|rect| crate::perf::grow(rect, crate::perf::MARGIN_PX));
+    for edge in edges {
+        let Some((from, to)) = crate::frames::edge_endpoints(placed, &graph.frames, hidden, edge)
+        else {
+            continue;
+        };
+        let reroutes: Vec<Point> = edge
+            .reroutes
+            .iter()
+            .map(|point| Point::new(point[0], point[1]))
+            .collect();
+        let key = WireKey { from, to, reroutes };
+        let chain = match cache.get(&edge.id) {
+            Some(cached) if cached.key == key => cached.path.clone(),
+            _ => {
+                let path = Arc::new(layout::wire_path(from, &key.reroutes, to));
+                cache.insert(
+                    edge.id.clone(),
+                    CachedWire {
+                        key: key.clone(),
+                        path: path.clone(),
+                    },
+                );
+                path
+            }
+        };
+        let rect = crate::perf::chain_window_box(&chain, camera);
+        let Some(view) = view else {
+            out.push(wire_paint(edge, chain, key, graph, chart, muted));
+            continue;
+        };
+        if !crate::perf::rects_intersect(rect, view) {
+            continue;
+        }
+        out.push(wire_paint(edge, chain, key, graph, chart, muted));
+    }
+}
+
+fn wire_paint(
+    edge: &Edge,
+    chain: Arc<Vec<layout::Cubic>>,
+    key: WireKey,
+    graph: &graph::Graph,
+    chart: &[gpui_kit::Hsla; 6],
+    muted: gpui_kit::Hsla,
+) -> WirePaint {
+    let source_color = output_types(graph, &edge.from)
+        .into_iter()
+        .next()
+        .map(|ty| type_color(ty, chart))
+        .unwrap_or(muted);
+    WirePaint {
+        id: edge.id.clone(),
+        reroutes: key.reroutes,
+        path: chain,
+        source_color,
     }
 }
 
