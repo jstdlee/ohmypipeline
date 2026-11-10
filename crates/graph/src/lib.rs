@@ -11,8 +11,10 @@ mod geom;
 mod model;
 mod protocol;
 mod sniff;
+mod state;
 mod template;
 mod types;
+mod vars;
 
 pub use connect::{
     LinkEnd, Reject, SnapCandidate, edge_problem, output_types, pick_snap, produced_type,
@@ -26,18 +28,22 @@ pub use geom::{
 };
 pub use model::{
     Anchor, DockSizes, Edge, Frame, Graph, HEADER_PAIRS, Mark, MarkKind, Node, Placed, PortRecord,
-    Presentation, VarKind, Variable, ancestors, bounds_of, dependency_key, duplicate_headers,
-    empty_mapping, frame_members, header_pairs, python_arg_names, run_fingerprint, sinks,
+    Presentation, VarKind, Variable, ancestors, bounds_of, dependency_key, descendants,
+    duplicate_headers, empty_mapping, frame_members, header_pairs, python_arg_names,
+    run_fingerprint, sinks,
 };
 pub use protocol::{
-    CHART_POINT_CAP, CellText, Job, JobOp, PREVIEW_ROW_CAP, Reply, RunMode, TABLE_WINDOW,
-    WorkerError, cell_text, decode_frame, encode_frame, read_frame, status_line, write_frame,
+    CHART_POINT_CAP, CellText, ColumnStats, Job, JobOp, PREVIEW_ROW_CAP, Reply, RunMode,
+    TABLE_WINDOW, WorkerError, cell_text, decode_frame, encode_frame, read_frame, status_line,
+    write_frame,
 };
 pub use sniff::{csv_headers, csv_headers_after, sniff_separator};
+pub use state::{ExecState, NodeState};
 pub use template::{
     NodeTemplate, TEMPLATE_FORMAT, TEMPLATE_VERSION, TemplateParam, TemplatePort, load_template,
 };
 pub use types::TypeName;
+pub use vars::{apply_overrides, parse_value, referenced_vars, substitute};
 
 pub const FORMAT: &str = "ohmypipeline";
 pub const VERSION: u32 = 2;

@@ -589,6 +589,9 @@ impl Workspace {
             op: JobOp::Preview,
             output: None,
             window: Some(window),
+            stats: false,
+            nodes: Vec::new(),
+            overrides: BTreeMap::new(),
         };
         self.session.update(cx, |session, cx| {
             session.generation = generation;

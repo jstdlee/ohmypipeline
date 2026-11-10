@@ -1093,5 +1093,238 @@ class MoreTests(unittest.TestCase):
         self.assertIn("file not found", missing["error"]["message"])
 
 
+class VarsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+        self.csv = self.tmp / "vars_orders.csv"
+        self.csv.write_text("amount,region\n12,N\n8,S\n15,N\n3,E\n", encoding="utf-8")
+
+    def document(self, params_n="${rows}", path="${data}", variables=None, extra=None):
+        declared = variables if variables is not None else [
+            {"name": "data", "kind": "path", "value": "vars_orders.csv"},
+            {"name": "rows", "kind": "int", "value": 3},
+        ]
+        return {
+            "format": "ohmypipeline",
+            "version": 2,
+            "nodes": [
+                node("n1", "read_csv", {"path": path}),
+                node("n2", "head", {"n": params_n}),
+            ],
+            "edges": [edge("n1", "n2")],
+            "variables": declared,
+            **(extra or {}),
+        }
+
+    def job(self, document, **extra):
+        return run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": document,
+                "node": "n2",
+                "base_dir": str(self.tmp),
+                **extra,
+            }
+        )
+
+    def test_substitution_uses_the_declared_variables(self):
+        reply = self.job(self.document())
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 3)
+        self.assertEqual(reply["computed"], ["n1", "n2"])
+
+    def test_an_override_changes_the_value_for_this_run(self):
+        reply = self.job(self.document(), overrides={"rows": "2"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 2)
+
+    def test_an_override_does_not_return_a_stale_cached_result(self):
+        document = self.document()
+        before = stats["computed"]
+        first = self.job(document)
+        self.assertEqual(first["n"], 3)
+        overridden = self.job(document, overrides={"rows": "1"})
+        self.assertEqual(overridden["n"], 1)
+        self.assertGreater(stats["computed"], before, "the override must recompute")
+
+    def test_an_unknown_variable_is_a_node_error(self):
+        document = self.document(params_n="${nope}")
+        reply = self.job(document)
+        self.assertIsNotNone(reply["error"])
+        self.assertEqual(reply["error"]["node"], "n2")
+        self.assertEqual(reply["error"]["message"], "unknown variable ${nope}")
+
+    def test_a_string_variable_in_a_numeric_param_is_a_type_error(self):
+        document = self.document(
+            variables=[
+                {"name": "data", "kind": "path", "value": "vars_orders.csv"},
+                {"name": "rows", "kind": "string", "value": "many"},
+            ]
+        )
+        reply = self.job(document)
+        self.assertIsNotNone(reply["error"])
+        self.assertEqual(reply["error"]["node"], "n2")
+        self.assertEqual(reply["error"]["message"], "variable ${rows} must be an int")
+
+    def test_a_text_param_takes_the_value_as_text(self):
+        document = self.document()
+        document["nodes"][0]["params"] = {"path": "${data}.csv"}
+        document["variables"] = [
+            {"name": "data", "kind": "string", "value": "vars_orders"},
+            {"name": "rows", "kind": "int", "value": 3},
+        ]
+        reply = self.job(document)
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 3)
+
+    def test_the_job_graph_is_not_mutated_by_substitution(self):
+        import copy
+
+        document = self.document()
+        original = copy.deepcopy(document)
+        self.job(document, overrides={"rows": "2"})
+        self.assertEqual(document, original)
+
+    def test_python_nodes_get_vars_and_an_unsubstituted_code_param(self):
+        code = "def run(df):\n    return df.head(vars['rows'])\n"
+        document = self.document()
+        document["nodes"] = [
+            node("n1", "read_csv", {"path": "${data}"}),
+            node(
+                "n2",
+                "python",
+                {"code": code},
+                inputs=[{"name": "df", "accepts": ["dataframe"]}],
+            ),
+        ]
+        document["edges"] = [edge("n1", "n2", dst_port="df")]
+        reply = self.job(document)
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 3)
+
+    def test_a_reset_drops_the_cache_of_the_given_nodes(self):
+        document = self.document()
+        self.job(document)
+        before = stats["computed"]
+        self.job(document)
+        self.assertEqual(stats["computed"], before, "warm cache serves the second run")
+        reset = self.job(document, op="reset", nodes=["n1"])
+        self.assertIsNone(reset["error"])
+        self.assertEqual(stats["computed"], before, "the reset itself computes nothing")
+        self.job(document)
+        self.assertGreater(stats["computed"], before, "reset dropped the cache")
+
+
+class StatsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+
+    def run_with_stats(self, nodes, edges, node_id):
+        document = graph_of(nodes, edges)
+        document["variables"] = document.get("variables", [])
+        return run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": document,
+                "node": node_id,
+                "base_dir": str(self.tmp),
+                "stats": True,
+            }
+        )
+
+    def test_stats_cover_the_whole_frame_for_several_dtypes(self):
+        csv_path = self.tmp / "stats.csv"
+        csv_path.write_text(
+            "qty,score,city,when,flag\n1,1.5,N,2024-01-01,true\n2,,S,2024-01-03,false\n3,2.5,N,2024-01-06,true\n",
+            encoding="utf-8",
+        )
+        reply = self.run_with_stats(
+            [node("n1", "read_csv", {"path": str(csv_path)})], [], "n1"
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        columns = {item["name"]: item for item in reply["stats"]}
+        self.assertEqual([item["name"] for item in reply["stats"]], ["qty", "score", "city", "when", "flag"])
+        qty = columns["qty"]
+        self.assertEqual(qty["count"], 3)
+        self.assertEqual(qty["nulls"], 0)
+        self.assertEqual(qty["null_pct"], 0.0)
+        self.assertEqual(qty["unique"], 3)
+        self.assertEqual(qty["min"], 1)
+        self.assertEqual(qty["max"], 3)
+        self.assertAlmostEqual(qty["mean"], 2.0)
+        self.assertEqual(len(qty["hist"]), 12)
+        self.assertEqual(sum(qty["hist"]), 3)
+        score = columns["score"]
+        self.assertEqual(score["nulls"], 1)
+        self.assertEqual(score["null_pct"], 33.3)
+        self.assertAlmostEqual(score["mean"], 2.0)
+        self.assertEqual(score["top"], [])
+        city = columns["city"]
+        self.assertEqual(city["min"], "N")
+        self.assertEqual(city["max"], "S")
+        self.assertEqual(city["hist"], [])
+        self.assertEqual(city["top"], [["N", 2], ["S", 1]])
+        when = columns["when"]
+        self.assertEqual(when["min"], "2024-01-01")
+        self.assertEqual(when["max"], "2024-01-06")
+        flag = columns["flag"]
+        self.assertEqual(flag["min"], False)
+        self.assertEqual(flag["max"], True)
+        self.assertEqual(flag["hist"], [])
+
+    def test_stats_are_robust_to_all_null_and_empty(self):
+        csv_path = self.tmp / "stats_holes.csv"
+        csv_path.write_text("empty,mixed\n,\n,\n", encoding="utf-8")
+        reply = self.run_with_stats(
+            [node("n1", "read_csv", {"path": str(csv_path)})], [], "n1"
+        )
+        columns = {item["name"]: item for item in reply["stats"]}
+        empty = columns["empty"]
+        self.assertEqual(empty["count"], 2)
+        self.assertEqual(empty["nulls"], 2)
+        self.assertEqual(empty["null_pct"], 100.0)
+        self.assertIsNone(empty["min"])
+        self.assertIsNone(empty["mean"])
+        self.assertEqual(empty["hist"], [])
+        self.assertEqual(empty["unique"], 0)
+        mixed = columns["mixed"]
+        self.assertIsNone(mixed["min"])
+        self.assertEqual(mixed["hist"], [])
+
+    def test_stats_of_a_series_name_the_column(self):
+        csv_path = self.tmp / "one.csv"
+        csv_path.write_text("qty\n2\n4\n6\n", encoding="utf-8")
+        reply = self.run_with_stats(
+            [node("n1", "read_csv", {"path": str(csv_path)}), node("n2", "column", {"name": "qty"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(len(reply["stats"]), 1)
+        stats = reply["stats"][0]
+        self.assertEqual(stats["name"], "qty")
+        self.assertEqual(stats["count"], 3)
+        self.assertAlmostEqual(stats["mean"], 4.0)
+        # A series with no name is one column called value.
+        unnamed = self.run_with_stats(
+            [node("n1", "read_csv", {"path": str(csv_path)}), node("n2", "nunique", {})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(unnamed["stats"][0]["name"], "value")
+
+    def test_a_reply_without_stats_has_none(self):
+        csv_path = self.tmp / "plain.csv"
+        csv_path.write_text("a\n1\n", encoding="utf-8")
+        document = graph_of([node("n1", "read_csv", {"path": str(csv_path)})])
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n1"})
+        self.assertNotIn("stats", reply)
+        self.assertEqual(reply["computed"], ["n1"])
+
+
 if __name__ == "__main__":
     unittest.main()

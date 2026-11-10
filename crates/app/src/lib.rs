@@ -8,5 +8,5 @@ mod node_search;
 mod worker;
 mod workspace;
 
-pub use headless::{CliRequest, run_pipeline, usage, version_line};
+pub use headless::{CliRequest, run_pipeline, run_usage, usage, version_line};
 pub use workspace::{GuiOptions, run_gui};
