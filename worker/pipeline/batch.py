@@ -364,11 +364,14 @@ def _rolling(node_id: str, frame: Any, params: dict[str, Any]):
     if window < 1:
         raise NodeError(node_id, "window must be at least 1")
     agg = str(params.get("agg") or "mean")
-    if agg not in ("mean", "sum", "min", "max", "std", "median"):
+    if agg not in ("mean", "sum", "min", "max", "std", "median", "quantile"):
         raise NodeError(node_id, f"unknown rolling aggregation {agg}")
 
     def roll(values: pd.Series) -> pd.Series:
-        return getattr(values.rolling(window, min_periods=1), agg)()
+        windowed = values.rolling(window, min_periods=1)
+        if agg == "quantile":
+            return windowed.quantile(float(params.get("q") or 0.5))
+        return getattr(windowed, agg)()
 
     column = str(params.get("column") or "")
     if isinstance(frame, pd.Series):

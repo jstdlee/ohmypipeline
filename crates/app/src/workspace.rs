@@ -370,6 +370,11 @@ impl Workspace {
                 | Some("clean")
                 | Some("reshape")
                 | Some("window")
+                | Some("time")
+                | Some("bins")
+                | Some("compute")
+                | Some("readers")
+                | Some("wide")
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
@@ -1271,6 +1276,117 @@ fn reel_run(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) 
     }
 }
 
+fn load_more_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples");
+    let file = |name: &str| {
+        let path = root.join(name);
+        path.canonicalize().unwrap_or(path).display().to_string()
+    };
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let selected = match demo {
+            "time" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 96.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("times.csv")));
+                doc.set_label(&read, "times.csv".into());
+                let sample = doc
+                    .add_node("resample", graph::Point::new(340.0, 96.0))
+                    .unwrap();
+                doc.set_label(&sample, "Weekly sum".into());
+                doc.set_param(&sample, "column", json!("when"));
+                doc.set_param(&sample, "freq", json!("W"));
+                doc.set_param(&sample, "agg", json!("sum"));
+                doc.set_param(&sample, "fill", json!("none"));
+                let _ = doc.connect(&read, "out", &sample, "in");
+                sample
+            }
+            "bins" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 120.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("bins.csv")));
+                doc.set_label(&read, "bins.csv".into());
+                let cut = doc.add_node("cut", graph::Point::new(340.0, 48.0)).unwrap();
+                doc.set_label(&cut, "Qty bands".into());
+                doc.set_param(&cut, "column", json!("qty"));
+                doc.set_param(&cut, "bins", json!("0,5,10"));
+                let dummies = doc
+                    .add_node("get_dummies", graph::Point::new(340.0, 240.0))
+                    .unwrap();
+                doc.set_label(&dummies, "Flag dummies".into());
+                doc.set_param(&dummies, "column", json!("flag"));
+                let _ = doc.connect(&read, "out", &cut, "in");
+                let _ = doc.connect(&read, "out", &dummies, "in");
+                cut
+            }
+            "compute" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 120.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("bins.csv")));
+                doc.set_label(&read, "bins.csv".into());
+                let arith = doc
+                    .add_node("arith", graph::Point::new(360.0, 48.0))
+                    .unwrap();
+                doc.set_label(&arith, "Double qty".into());
+                doc.set_param(&arith, "op", json!("mul"));
+                doc.set_param(&arith, "value", json!("2"));
+                let apply = doc
+                    .add_node("apply", graph::Point::new(360.0, 260.0))
+                    .unwrap();
+                doc.set_label(&apply, "Sum columns".into());
+                doc.set_param(&apply, "fn", json!("sum"));
+                doc.set_param(&apply, "axis", json!("0"));
+                let _ = doc.connect(&read, "out", &arith, "in");
+                let _ = doc.connect(&read, "out", &apply, "in");
+                arith
+            }
+            "wide" => {
+                let read = doc
+                    .add_node("read_csv", graph::Point::new(48.0, 96.0))
+                    .unwrap();
+                doc.set_param(&read, "path", json!(file("wide.csv")));
+                doc.set_label(&read, "wide.csv".into());
+                let long = doc
+                    .add_node("wide_to_long", graph::Point::new(340.0, 96.0))
+                    .unwrap();
+                doc.set_label(&long, "A by year".into());
+                doc.set_param(&long, "stubnames", json!("A"));
+                doc.set_param(&long, "i", json!("id"));
+                doc.set_param(&long, "j", json!("year"));
+                doc.set_param(&long, "sep", json!(""));
+                let _ = doc.connect(&read, "out", &long, "in");
+                long
+            }
+            _ => {
+                let html = doc
+                    .add_node("read_html", graph::Point::new(48.0, 80.0))
+                    .unwrap();
+                doc.set_label(&html, "page.html".into());
+                doc.set_param(&html, "path", json!(file("page.html")));
+                doc.set_param(&html, "which", json!(0));
+                let xml = doc
+                    .add_node("read_xml", graph::Point::new(360.0, 80.0))
+                    .unwrap();
+                doc.set_label(&xml, "rows.xml".into());
+                doc.set_param(&xml, "path", json!(file("rows.xml")));
+                let json_node = doc
+                    .add_node("json_normalize", graph::Point::new(680.0, 80.0))
+                    .unwrap();
+                doc.set_label(&json_node, "nested.json".into());
+                doc.set_param(&json_node, "path", json!(file("nested.json")));
+                html
+            }
+        };
+        canvas.load_document(doc, cx);
+        canvas.select_only(selected, cx);
+    });
+}
+
 fn load_batch_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let people = root.join("examples/people.csv");
@@ -1479,6 +1595,13 @@ fn load_demo(
         "text" | "export" | "select" | "clean" | "reshape" | "window"
     ) {
         load_batch_demo(demo, canvas, cx);
+        return;
+    }
+    if matches!(
+        demo.as_str(),
+        "time" | "bins" | "compute" | "readers" | "wide"
+    ) {
+        load_more_demo(demo, canvas, cx);
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1812,7 +1935,9 @@ impl Render for PalettePanel {
 
 fn feature_icon(id: &str) -> IconName {
     match id {
-        "read_csv" | "read_excel" => IconName::FileSpreadsheet,
+        "read_csv" | "read_excel" | "read_table" | "read_fwf" | "read_html" | "read_xml" => {
+            IconName::FileSpreadsheet
+        }
         "read_sql" => IconName::Database,
         "head" => IconName::ListFilter,
         "change_headers" => IconName::Type,
@@ -1826,7 +1951,8 @@ fn feature_icon(id: &str) -> IconName {
         "python" => IconName::Code,
         "chart" => IconName::ChartColumn,
         "preview_table" => IconName::Table,
-        "read_json" => IconName::Code,
+        "read_json" | "json_normalize" => IconName::Code,
+        "read_parquet" => IconName::Database,
         "pivot" | "groupby" | "melt" => IconName::Table,
         "assign" | "astype" => IconName::Type,
         "sum" | "mean" | "min" | "max" | "count" | "median" | "std" | "nunique" | "describe"
@@ -1845,7 +1971,15 @@ fn feature_icon(id: &str) -> IconName {
         "transpose" => IconName::ArrowLeftRight,
         "stack" | "unstack" => IconName::Layers,
         "crosstab" | "join" | "merge_asof" => IconName::Table,
-        "rolling" => IconName::Activity,
+        "rolling" | "expanding" | "ewm" | "resample" | "asfreq" => IconName::Activity,
+        "date_range" | "tz_localize" | "tz_convert" | "to_timedelta" => IconName::Clock,
+        "cut" | "qcut" => IconName::Scissors,
+        "get_dummies" | "factorize" | "wide_to_long" => IconName::Layers,
+        "arith" => IconName::Diff,
+        "apply" | "map" => IconName::Code,
+        "rank" | "corr" | "cov" | "unique" | "quantile" => IconName::Hash,
+        "reindex" | "sort_index" => IconName::ArrowDownWideNarrow,
+        "combine_first" => IconName::GitMerge,
         "diff" => IconName::Diff,
         "pct_change" => IconName::Percent,
         _ => IconName::Square,
@@ -2779,6 +2913,8 @@ impl Render for InspectorPanel {
                 "Sort by".to_string()
             } else if node.feature == "pivot" && field.name == "columns" {
                 "Columns".to_string()
+            } else if node.feature == "groupby" && field.name == "how" {
+                "Using".to_string()
             } else if node.feature == "shift" && field.name == "n" {
                 "Periods".to_string()
             } else if matches!(
@@ -3124,6 +3260,14 @@ fn field_applies(node: &graph::Node, name: &str) -> bool {
         ("str", "sep") => method == "cat",
         ("dt", "freq") => matches!(accessor.as_str(), "floor" | "ceil" | "round"),
         ("dt", "fmt") => accessor == "strftime",
+        ("groupby", "aggs") => node.param_str("how").is_empty() || node.param_str("how") == "agg",
+        ("groupby", "column" | "filter_op" | "filter_value") => node.param_str("how") == "filter",
+        ("groupby", "q") => node.param_str("agg") == "quantile",
+        ("rolling" | "expanding" | "resample" | "apply" | "map", "q") => {
+            node.param_str("agg") == "quantile" || node.param_str("fn") == "quantile"
+        }
+        ("apply" | "map", "code") => node.param_str("fn") == "code",
+        ("apply", "axis") => node.param_str("fn") != "code",
         _ => true,
     }
 }
@@ -3203,6 +3347,27 @@ fn field_label(name: &str) -> String {
         "orient" => "Layout".into(),
         "table" => "Table".into(),
         "sheet" => "Sheet".into(),
+        "span" => "Span".into(),
+        "tz" => "Time zone".into(),
+        "unit" => "Unit".into(),
+        "labels" => "Labels".into(),
+        "q" => "Quantile".into(),
+        "prefix" => "Prefix".into(),
+        "stubnames" => "Stub names".into(),
+        "i" => "Id column".into(),
+        "j" => "Suffix name".into(),
+        "colspecs" => "Column spans".into(),
+        "which" => "Table number".into(),
+        "xpath" => "XPath".into(),
+        "record_path" => "Record path".into(),
+        "meta" => "Meta fields".into(),
+        "fn" => "Function".into(),
+        "op" => "Operation".into(),
+        "axis" => "Axis".into(),
+        "order" => "Order".into(),
+        "filter_op" => "Compare".into(),
+        "filter_value" => "Threshold".into(),
+        "end" => "End".into(),
         other => other.into(),
     }
 }
@@ -3217,6 +3382,8 @@ fn field_help(feature: &str, name: &str) -> &'static str {
         ("crosstab", "columns") => "The column that becomes the new headers.",
         ("crosstab", "values") => "Optional numbers to aggregate. Empty counts the rows.",
         ("isin", "values") => "Comma-separated values to keep.",
+        ("resample" | "asfreq" | "date_range", "freq") => "A pandas offset such as D, W, or h.",
+        ("cut", "bins") => "An integer count, or edges such as 0,5,10.",
         ("pivot", "index") => "Row labels of the pivot.",
         ("pivot", "columns") => "The column that becomes the new headers.",
         ("pivot", "values") => "Numbers to aggregate.",
@@ -3267,8 +3434,12 @@ fn coerce(name: &str, text: &str) -> Value {
             | "stop"
             | "width"
             | "limit"
+            | "which"
+            | "span"
     ) {
         json!(text.parse::<i64>().unwrap_or(0))
+    } else if name == "q" {
+        json!(text.parse::<f64>().unwrap_or(0.5))
     } else if name == "ascending" {
         json!(text == "true")
     } else if name == "mapping" {

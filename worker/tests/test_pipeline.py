@@ -700,5 +700,285 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(merged["rows"][2][price], 12)
 
 
+class MoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+
+    def job(self, nodes, edges, node_id):
+        reply = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(nodes, edges),
+                "node": node_id,
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        return reply
+
+    def rejected(self, nodes, edges, node_id):
+        return run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of(nodes, edges),
+                "node": node_id,
+                "base_dir": str(self.tmp),
+            }
+        )
+
+    def test_resample_asfreq_expanding_ewm_and_dates(self):
+        path = self.tmp / "times.csv"
+        path.write_text("when,qty\n2024-01-01,1\n2024-01-02,3\n2024-01-08,4\n", encoding="utf-8")
+        read = node("n1", "read_csv", {"path": str(path)})
+        weekly = self.job(
+            [read, node("n2", "resample", {"column": "when", "freq": "W", "agg": "sum", "fill": "none"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertGreaterEqual(weekly["n"], 2)
+        self.assertIn("qty", weekly["columns"])
+        dense = self.job(
+            [read, node("n2", "asfreq", {"column": "when", "freq": "D", "fill": "ffill"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertGreater(dense["n"], 3)
+        expanded = self.job(
+            [read, node("n2", "expanding", {"window": 1, "agg": "sum", "column": "qty"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(expanded["rows"][2][expanded["columns"].index("qty")], 8)
+        smoothed = self.job(
+            [read, node("n2", "ewm", {"span": 2, "agg": "mean", "column": "qty"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(smoothed["n"], 3)
+        dates = self.job([node("n1", "date_range", {"start": "2024-01-01", "periods": 3, "freq": "D"})], [], "n1")
+        self.assertEqual(dates["n"], 3)
+        self.assertTrue(str(dates["rows"][0][0]).startswith("2024-01-01"))
+        missing = self.rejected(
+            [read, node("n2", "resample", {"column": "when", "freq": "", "agg": "mean"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("frequency", missing["error"]["message"])
+
+    def test_time_zones_and_timedelta(self):
+        path = self.tmp / "zones.csv"
+        path.write_text("when,qty\n2024-01-01 00:00,1\n2024-01-01 02:00,2\n", encoding="utf-8")
+        read = node("n1", "read_csv", {"path": str(path)})
+        local = self.job(
+            [read, node("n2", "tz_localize", {"column": "when", "tz": "UTC"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("+00:00", local["rows"][0][local["columns"].index("when")])
+        converted = self.job(
+            [
+                read,
+                node("n2", "tz_localize", {"column": "when", "tz": "UTC"}),
+                node("n3", "tz_convert", {"column": "when", "tz": "US/Eastern"}),
+            ],
+            [edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertIn("-05:00", converted["rows"][0][converted["columns"].index("when")])
+        naive = self.rejected(
+            [read, node("n2", "tz_convert", {"column": "when", "tz": "UTC"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("timezone-aware", naive["error"]["message"])
+        spans = self.job(
+            [read, node("n2", "to_timedelta", {"column": "qty", "unit": "h"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("0 days 01:00:00", spans["rows"][0][spans["columns"].index("qty")])
+
+    def test_cut_dummies_factorize_arith_apply_and_map(self):
+        path = self.tmp / "bins.csv"
+        path.write_text("name,qty,flag\nAda,1,a\nBea,6,b\nCal,9,a\n", encoding="utf-8")
+        read = node("n1", "read_csv", {"path": str(path)})
+        bands = self.job(
+            [read, node("n2", "cut", {"column": "qty", "bins": "0,5,10"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("5.0", bands["rows"][0][bands["columns"].index("qty")])
+        tiles = self.job(
+            [read, node("n2", "qcut", {"column": "qty", "q": 2})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(tiles["n"], 3)
+        dummies = self.job(
+            [read, node("n2", "get_dummies", {"column": "flag"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertIn("flag_a", dummies["columns"])
+        codes = self.job(
+            [read, node("n2", "factorize", {"column": "flag"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(codes["rows"][0][codes["columns"].index("flag")], 0)
+        added = self.job(
+            [read, node("n2", "arith", {"op": "mul", "value": "2"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(added["rows"][0][added["columns"].index("qty")], 2)
+        summed = self.job(
+            [read, node("n2", "apply", {"fn": "sum", "axis": "0"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(summed["rows"][summed["index"].index("qty")][0], 16)
+        mapped = self.job(
+            [
+                read,
+                node("n2", "map", {"fn": "code", "code": "def run(value):\n    return value\n"}),
+            ],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(mapped["rows"][0][mapped["columns"].index("name")], "Ada")
+        empty = self.rejected([read, node("n2", "cut", {"column": "qty", "bins": ""})], [edge("n1", "n2")], "n2")
+        self.assertIn("bins", empty["error"]["message"])
+
+    def test_rank_corr_unique_reindex_sort_wide_and_combine(self):
+        path = self.tmp / "pairs.csv"
+        path.write_text("name,x,y\nAda,1,3\nBea,2,2\nCal,3,1\n", encoding="utf-8")
+        read = node("n1", "read_csv", {"path": str(path)})
+        ranked = self.job(
+            [read, node("n2", "rank", {"column": "x", "method": "average"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(ranked["rows"][0][ranked["columns"].index("x")], 1)
+        related = self.job([read, node("n2", "corr", {})], [edge("n1", "n2")], "n2")
+        self.assertIn("x", related["columns"])
+        values = self.job(
+            [read, node("n2", "unique", {"column": "name"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(values["n"], 3)
+        ordered = self.job(
+            [read, node("n2", "sort_index", {"order": "descending", "axis": "0"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(ordered["rows"][0][ordered["columns"].index("name")], "Cal")
+        relabeled = self.job(
+            [read, node("n2", "reindex", {"columns": "name,y"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(relabeled["columns"], ["name", "y"])
+        wide = self.tmp / "wide_long.csv"
+        wide.write_text("id,A1,A2\n1,10,12\n2,8,9\n", encoding="utf-8")
+        long = self.job(
+            [
+                node("w", "read_csv", {"path": str(wide)}),
+                node("n2", "wide_to_long", {"stubnames": "A", "i": "id", "j": "year", "sep": ""}),
+            ],
+            [edge("w", "n2")],
+            "n2",
+        )
+        self.assertEqual(long["n"], 4)
+        self.assertIn("A", long["columns"])
+        left = node("l", "read_csv", {"path": str(path)})
+        other = self.tmp / "holes.csv"
+        other.write_text("name,x,y\nAda,,9\nBea,5,\n", encoding="utf-8")
+        filled = self.job(
+            [left, node("r", "read_csv", {"path": str(other)}), node("n2", "combine_first", {})],
+            [edge("l", "n2", dst_port="left"), edge("r", "n2", dst_port="right")],
+            "n2",
+        )
+        self.assertEqual(filled["rows"][0][filled["columns"].index("x")], 1)
+
+    def test_groupby_transform_filter_and_quantile(self):
+        path = self.tmp / "groups.csv"
+        path.write_text("city,qty\nNorth,10\nNorth,2\nSouth,4\n", encoding="utf-8")
+        read = node("n1", "read_csv", {"path": str(path)})
+        transformed = self.job(
+            [read, node("n2", "groupby", {"by": "city", "how": "transform", "agg": "sum", "column": "qty"})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(transformed["rows"][0][transformed["columns"].index("qty")], 12)
+        self.assertEqual(transformed["n"], 3)
+        kept = self.job(
+            [
+                read,
+                node(
+                    "n2",
+                    "groupby",
+                    {"by": "city", "how": "filter", "agg": "sum", "column": "qty", "filter_op": "gt", "filter_value": "5"},
+                ),
+            ],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(kept["n"], 2)
+        half = self.job(
+            [read, node("n2", "quantile", {"q": 0.5})],
+            [edge("n1", "n2")],
+            "n2",
+        )
+        self.assertEqual(half["rows"][half["index"].index("qty")][0], 4)
+
+    def test_readers_cap_preview_and_report_a_missing_file(self):
+        table = self.tmp / "table.tsv"
+        table.write_text("name\tqty\nAda\t1\n", encoding="utf-8")
+        read_table = self.job([node("n1", "read_table", {"path": str(table), "sep": "\t"})], [], "n1")
+        self.assertEqual(read_table["columns"], ["name", "qty"])
+        fixed = self.tmp / "fixed.txt"
+        fixed.write_text("Ada     0010\nBea     0004\n", encoding="utf-8")
+        fwf = self.job(
+            [node("n1", "read_fwf", {"path": str(fixed), "colspecs": "0:8,8:12", "header": "no header"})],
+            [],
+            "n1",
+        )
+        self.assertEqual(fwf["n"], 2)
+        page = self.tmp / "page.html"
+        page.write_text("<table><tr><th>name</th><th>qty</th></tr><tr><td>Ada</td><td>3</td></tr></table>", encoding="utf-8")
+        html = self.job([node("n1", "read_html", {"path": str(page), "which": 0})], [], "n1")
+        self.assertEqual(html["rows"][0][0], "Ada")
+        xml = self.tmp / "rows.xml"
+        xml.write_text("<data><row><name>Ada</name><qty>3</qty></row></data>", encoding="utf-8")
+        parsed = self.job([node("n1", "read_xml", {"path": str(xml)})], [], "n1")
+        self.assertIn("Ada", parsed["rows"][0])
+        blob = self.tmp / "nested.json"
+        blob.write_text('[{"name":"Ada","city":{"id":"N"}}]', encoding="utf-8")
+        normal = self.job([node("n1", "json_normalize", {"path": str(blob)})], [], "n1")
+        self.assertIn("city.id", normal["columns"])
+        frame = self.tmp / "ticks.parquet"
+        import pandas as pd
+
+        pd.DataFrame({"qty": list(range(12))}).to_parquet(frame, index=False)
+        preview = run_job(
+            {
+                "generation": 1,
+                "mode": "preview",
+                "graph": graph_of([node("n1", "read_parquet", {"path": str(frame)})]),
+                "node": "n1",
+                "base_dir": str(self.tmp),
+            }
+        )
+        self.assertIsNone(preview.get("error"), preview.get("error"))
+        self.assertEqual(preview["n"], 12)
+        missing = self.rejected([node("n1", "read_parquet", {"path": str(self.tmp / "nope.parquet")})], [], "n1")
+        self.assertIn("file not found", missing["error"]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

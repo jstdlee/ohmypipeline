@@ -219,6 +219,17 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         "read_excel",
         "read_sql",
         "read_json",
+        "read_parquet",
+        "read_table",
+        "read_fwf",
+        "read_html",
+        "read_xml",
+        "json_normalize",
+        "resample",
+        "asfreq",
+        "get_dummies",
+        "wide_to_long",
+        "combine_first",
         "change_headers",
         "query",
         "to_frame",
@@ -246,8 +257,27 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         return "dataframe"
     if kind == "str" and str((node.get("params") or {}).get("method") or "") == "extract":
         return "dataframe"
-    if kind in ("value_counts", "sum", "mean", "min", "max", "count", "median", "std", "nunique", "stack"):
+    if kind == "date_range":
+        return "index"
+    if kind in ("apply", "map") and str((node.get("params") or {}).get("fn") or "") != "code":
         return "series"
+    if kind in (
+        "value_counts",
+        "sum",
+        "mean",
+        "min",
+        "max",
+        "count",
+        "median",
+        "std",
+        "nunique",
+        "quantile",
+        "stack",
+        "unique",
+    ):
+        return "series"
+    if kind in ("corr", "cov", "map", "apply"):
+        return input_type(node, graph, values)
     if kind == "column":
         return "series"
     if kind == "literal":
@@ -466,6 +496,20 @@ def execute(
     batched = run_batch(kind, node_id, params, require_frame_or_series, base_dir)
     if batched is not _MISSING:
         return batched
+    from pipeline.more import run_more
+
+    extra_more = run_more(
+        kind,
+        node_id,
+        params,
+        base_dir,
+        preview,
+        require_frame_or_series,
+        wired,
+        overrides,
+    )
+    if extra_more is not _MISSING:
+        return extra_more
     extra = run_extra(kind, node_id, graph, params, wired, require_frame_or_series, preview, base_dir, overrides)
     if extra is not _MISSING:
         return extra
@@ -487,6 +531,56 @@ def _int_param(node_id: str, value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise NodeError(node_id, "expected an integer") from exc
+
+
+def _groupby_how(node_id: str, frame: pd.DataFrame, by: str, agg: str, how: str, params: dict[str, Any]):
+    column = str(params.get("column") or "")
+    grouped = frame.groupby(by)
+    q = float(params.get("q") or 0.5)
+
+    def statistic(values: pd.Series):
+        if agg == "quantile":
+            return values.quantile(q)
+        if agg not in ("sum", "mean", "min", "max", "count", "median", "std", "nunique"):
+            raise NodeError(node_id, f"unknown aggregation {agg}")
+        return getattr(values, agg)()
+
+    if how == "transform":
+        out = frame.copy()
+        if column:
+            if column not in out.columns:
+                raise NodeError(node_id, f"missing column {column}")
+            if agg == "quantile":
+                out[column] = grouped[column].transform(lambda values: values.quantile(q))
+            else:
+                out[column] = grouped[column].transform(agg)
+            return out
+        numeric = out.select_dtypes(include="number").columns
+        if agg == "quantile":
+            out[numeric] = grouped[numeric].transform(lambda values: values.quantile(q))
+        else:
+            out[numeric] = grouped[numeric].transform(agg)
+        return out
+    if not column:
+        raise NodeError(node_id, "filter needs a column")
+    if column not in frame.columns:
+        raise NodeError(node_id, f"missing column {column}")
+    op = str(params.get("filter_op") or "gt")
+    threshold = float(params.get("filter_value") or 0)
+    comparisons = {
+        "gt": lambda left, right: left > right,
+        "ge": lambda left, right: left >= right,
+        "lt": lambda left, right: left < right,
+        "le": lambda left, right: left <= right,
+        "eq": lambda left, right: left == right,
+    }
+    if op not in comparisons:
+        raise NodeError(node_id, f"unknown comparison {op}")
+
+    def keep(group: pd.DataFrame) -> bool:
+        return bool(comparisons[op](statistic(group[column]), threshold))
+
+    return grouped.filter(keep)
 
 
 def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, preview, base_dir, overrides):
@@ -527,6 +621,7 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
         "median",
         "std",
         "nunique",
+        "quantile",
         "abs",
         "round",
     }:
@@ -616,8 +711,11 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
             by = str(params.get("by") or "")
             agg = str(params.get("agg") or "sum")
             aggs = str(params.get("aggs") or "").strip()
+            how = str(params.get("how") or "agg")
             if by not in frame.columns:
                 raise NodeError(node_id, f"missing column {by}")
+            if how in ("transform", "filter"):
+                return _groupby_how(node_id, frame, by, agg, how, params)
             grouped = frame.groupby(by, as_index=False)
             if aggs:
                 spec: dict[str, list[str]] = {}
@@ -650,6 +748,8 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
                 return grouped.std(numeric_only=True)
             if agg == "nunique":
                 return grouped.nunique()
+            if agg == "quantile":
+                return grouped.quantile(float(params.get("q") or 0.5), numeric_only=True)
             return grouped.sum(numeric_only=True)
         if kind == "describe":
             return frame.describe()
@@ -659,6 +759,11 @@ def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, prev
                 raise NodeError(node_id, f"missing column {column}")
             counts = frame[column].value_counts()
             return counts.rename("count")
+        if kind == "quantile":
+            q = float(params.get("q") or 0.5)
+            if isinstance(frame, pd.Series):
+                return pd.Series([frame.quantile(q)], name=frame.name or "quantile")
+            return frame.quantile(q)
         if kind in ("sum", "mean", "min", "max", "count", "median", "std", "nunique"):
             if isinstance(frame, pd.Series):
                 value = getattr(frame, kind)()
@@ -918,6 +1023,8 @@ def payload_of(value: Any, window: int) -> dict[str, Any]:
             "rows": [[cell(item) for item in row] for row in view.itertuples(index=False, name=None)],
             "n": int(len(value)),
         }
+    if isinstance(value, pd.Index):
+        return payload_of(pd.Series(value, name=value.name or "value"), window)
     if isinstance(value, pd.Series):
         view = value.iloc[:window]
         name = "value" if value.name is None else str(value.name)

@@ -996,6 +996,299 @@ pub static CATALOG: &[FeatureDef] = &[
         &[],
         WRITE_SQL_PARAM,
     ),
+    feature_row(
+        "resample",
+        "Resample",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        Some(TypeName::Dataframe),
+        DF,
+        RESAMPLE_PARAM,
+    ),
+    feature_row(
+        "asfreq",
+        "As freq",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        Some(TypeName::Dataframe),
+        DF,
+        ASFREQ_PARAM,
+    ),
+    feature_row(
+        "expanding",
+        "Expanding",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        ROLLING_PARAM,
+    ),
+    feature_row(
+        "ewm",
+        "Ewm",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        EWM_PARAM,
+    ),
+    feature_row(
+        "date_range",
+        "Date range",
+        "Time",
+        &[],
+        Some(TypeName::Index),
+        &[TypeName::Index],
+        DATE_RANGE_PARAM,
+    ),
+    feature_row(
+        "tz_localize",
+        "Localize zone",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        TZ_PARAM,
+    ),
+    feature_row(
+        "tz_convert",
+        "Convert zone",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        TZ_PARAM,
+    ),
+    feature_row(
+        "to_timedelta",
+        "To timedelta",
+        "Time",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        TIMEDELTA_PARAM,
+    ),
+    feature_row(
+        "cut",
+        "Cut",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        CUT_PARAM,
+    ),
+    feature_row(
+        "qcut",
+        "Qcut",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        QCUT_PARAM,
+    ),
+    feature_row(
+        "get_dummies",
+        "Dummies",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        Some(TypeName::Dataframe),
+        DF,
+        DUMMIES_PARAM,
+    ),
+    feature_row(
+        "factorize",
+        "Factorize",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        COLUMN_OPTIONAL,
+    ),
+    feature_row(
+        "rank",
+        "Rank",
+        "Reduce",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        RANK_PARAM,
+    ),
+    feature_row(
+        "unique",
+        "Unique",
+        "Reduce",
+        &[IN_DF_OR_SERIES],
+        Some(TypeName::Series),
+        SERIES,
+        COLUMN_OPTIONAL,
+    ),
+    feature_row(
+        "quantile",
+        "Quantile",
+        "Reduce",
+        &[IN_DF_OR_SERIES],
+        Some(TypeName::Series),
+        SERIES,
+        Q_PARAM,
+    ),
+    feature_row(
+        "reindex",
+        "Reindex",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        REINDEX_PARAM,
+    ),
+    feature_row(
+        "sort_index",
+        "Sort index",
+        "Shape",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        SORT_INDEX_PARAM,
+    ),
+    feature_row(
+        "wide_to_long",
+        "Wide to long",
+        "Shape",
+        &[IN_DF],
+        Some(TypeName::Dataframe),
+        DF,
+        WIDE_PARAM,
+    ),
+    feature_row(
+        "read_parquet",
+        "Read Parquet",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        PATH_PARAM,
+    ),
+    feature_row(
+        "read_table",
+        "Read table",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        READ_TABLE_PARAM,
+    ),
+    feature_row(
+        "read_fwf",
+        "Read fixed width",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        READ_FWF_PARAM,
+    ),
+    feature_row(
+        "read_html",
+        "Read HTML",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        READ_HTML_PARAM,
+    ),
+    feature_row(
+        "read_xml",
+        "Read XML",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        READ_XML_PARAM,
+    ),
+    feature_row(
+        "json_normalize",
+        "Normalize JSON",
+        "IO",
+        &[],
+        Some(TypeName::Dataframe),
+        DF,
+        JSON_NORM_PARAM,
+    ),
+    feature_row(
+        "apply",
+        "Apply",
+        "Code",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        APPLY_PARAM,
+    ),
+    feature_row(
+        "map",
+        "Map",
+        "Code",
+        &[IN_DF_OR_SERIES],
+        None,
+        DF_OR_SERIES,
+        MAP_PARAM,
+    ),
+    FeatureDef {
+        id: "arith",
+        title: "Arithmetic",
+        group: "Code",
+        inputs: &[IN_DF_OR_SERIES, IN_OTHER],
+        output: None,
+        possible_outputs: DF_OR_SERIES,
+        output_name: "out",
+        params: ARITH_PARAM,
+        can_add_input: false,
+        inputs_are_user: false,
+    },
+    FeatureDef {
+        id: "corr",
+        title: "Correlation",
+        group: "Reduce",
+        inputs: &[IN_DF_OR_SERIES, IN_OTHER_SERIES],
+        output: None,
+        possible_outputs: DF_OR_SERIES,
+        output_name: "out",
+        params: &[],
+        can_add_input: false,
+        inputs_are_user: false,
+    },
+    FeatureDef {
+        id: "cov",
+        title: "Covariance",
+        group: "Reduce",
+        inputs: &[IN_DF_OR_SERIES, IN_OTHER_SERIES],
+        output: None,
+        possible_outputs: DF_OR_SERIES,
+        output_name: "out",
+        params: &[],
+        can_add_input: false,
+        inputs_are_user: false,
+    },
+    FeatureDef {
+        id: "combine_first",
+        title: "Combine first",
+        group: "Shape",
+        inputs: &[
+            PortDef {
+                name: "left",
+                accepts: DF,
+                multi: false,
+            },
+            PortDef {
+                name: "right",
+                accepts: DF,
+                multi: false,
+            },
+        ],
+        output: Some(TypeName::Dataframe),
+        possible_outputs: DF,
+        output_name: "out",
+        params: &[],
+        can_add_input: false,
+        inputs_are_user: false,
+    },
     FeatureDef {
         id: "join",
         title: "Join",
@@ -1240,9 +1533,35 @@ const GROUP_PARAM: &[ParamDef] = &[
         wireable: false,
         wire_types: &[],
         options: &[
-            "sum", "mean", "count", "min", "max", "median", "std", "nunique",
+            "sum", "mean", "count", "min", "max", "median", "std", "nunique", "quantile",
         ],
         default_json: "\"sum\"",
+    },
+    ParamDef {
+        name: "how",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["agg", "transform", "filter"],
+        default_json: "\"agg\"",
+    },
+    COLUMN_OPTIONAL[0],
+    ParamDef {
+        name: "filter_op",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["gt", "ge", "lt", "le", "eq"],
+        default_json: "\"gt\"",
+    },
+    text_param("filter_value"),
+    ParamDef {
+        name: "q",
+        kind: ParamKind::Float,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "0.5",
     },
     ParamDef {
         name: "aggs",
@@ -1471,10 +1790,18 @@ const ROLLING_PARAM: &[ParamDef] = &[
         kind: ParamKind::Enum,
         wireable: false,
         wire_types: &[],
-        options: &["mean", "sum", "min", "max", "std", "median"],
+        options: &["mean", "sum", "min", "max", "std", "median", "quantile"],
         default_json: "\"mean\"",
     },
     COLUMN_OPTIONAL[0],
+    ParamDef {
+        name: "q",
+        kind: ParamKind::Float,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "0.5",
+    },
 ];
 
 const PERIODS_PARAM: &[ParamDef] = &[int_param("periods", "1")];
@@ -1565,6 +1892,248 @@ const ASOF_PARAM: &[ParamDef] = &[
     },
 ];
 
+const OTHER_VALUE_TYPES: &[TypeName] = &[TypeName::Dataframe, TypeName::Series, TypeName::Scalar];
+const IN_OTHER: PortDef = PortDef {
+    name: "other",
+    accepts: OTHER_VALUE_TYPES,
+    multi: false,
+};
+const IN_OTHER_SERIES: PortDef = PortDef {
+    name: "other",
+    accepts: SERIES,
+    multi: false,
+};
+
+const AGG_NAMES: &[&str] = &[
+    "mean", "sum", "min", "max", "std", "median", "count", "nunique", "quantile",
+];
+
+const RESAMPLE_PARAM: &[ParamDef] = &[
+    text_param("freq"),
+    COLUMN_OPTIONAL[0],
+    ParamDef {
+        name: "agg",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: AGG_NAMES,
+        default_json: "\"mean\"",
+    },
+    ParamDef {
+        name: "fill",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["none", "ffill", "bfill"],
+        default_json: "\"none\"",
+    },
+    ParamDef {
+        name: "q",
+        kind: ParamKind::Float,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "0.5",
+    },
+];
+
+const ASFREQ_PARAM: &[ParamDef] = &[
+    text_param("freq"),
+    COLUMN_OPTIONAL[0],
+    ParamDef {
+        name: "fill",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["none", "ffill", "bfill"],
+        default_json: "\"none\"",
+    },
+];
+
+const EWM_PARAM: &[ParamDef] = &[
+    int_param("span", "3"),
+    ParamDef {
+        name: "agg",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["mean", "std"],
+        default_json: "\"mean\"",
+    },
+    COLUMN_OPTIONAL[0],
+];
+
+const DATE_RANGE_PARAM: &[ParamDef] = &[
+    text_param("start"),
+    text_param("end"),
+    text_param("freq"),
+    int_param("periods", "\"\""),
+];
+
+const TZ_PARAM: &[ParamDef] = &[text_param("tz"), COLUMN_OPTIONAL[0]];
+const TIMEDELTA_PARAM: &[ParamDef] = &[COLUMN_OPTIONAL[0], text_param("unit")];
+
+const CUT_PARAM: &[ParamDef] = &[COLUMN_OPTIONAL[0], text_param("bins"), text_param("labels")];
+const QCUT_PARAM: &[ParamDef] = &[
+    COLUMN_OPTIONAL[0],
+    int_param("q", "4"),
+    text_param("labels"),
+];
+const DUMMIES_PARAM: &[ParamDef] = &[COLUMN_OPTIONAL[0], text_param("prefix")];
+const RANK_PARAM: &[ParamDef] = &[
+    COLUMN_OPTIONAL[0],
+    ParamDef {
+        name: "method",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["average", "min", "max", "first", "dense"],
+        default_json: "\"average\"",
+    },
+];
+const Q_PARAM: &[ParamDef] = &[ParamDef {
+    name: "q",
+    kind: ParamKind::Float,
+    wireable: false,
+    wire_types: &[],
+    options: &[],
+    default_json: "0.5",
+}];
+const REINDEX_PARAM: &[ParamDef] = &[
+    text_param("index"),
+    text_param("columns"),
+    text_param("fill"),
+];
+const SORT_INDEX_PARAM: &[ParamDef] = &[
+    ParamDef {
+        name: "order",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["ascending", "descending"],
+        default_json: "\"ascending\"",
+    },
+    ParamDef {
+        name: "axis",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["0", "1"],
+        default_json: "\"0\"",
+    },
+];
+const WIDE_PARAM: &[ParamDef] = &[
+    text_param("stubnames"),
+    text_param("i"),
+    text_param("j"),
+    text_param("sep"),
+];
+const READ_TABLE_PARAM: &[ParamDef] = &[
+    PATH_PARAM[0],
+    ParamDef {
+        name: "sep",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"\\t\"",
+    },
+    READ_CSV_PARAMS[1],
+    READ_CSV_PARAMS[2],
+    READ_CSV_PARAMS[3],
+];
+const READ_FWF_PARAM: &[ParamDef] = &[
+    PATH_PARAM[0],
+    text_param("colspecs"),
+    READ_CSV_PARAMS[1],
+    READ_CSV_PARAMS[2],
+    READ_CSV_PARAMS[3],
+];
+const READ_HTML_PARAM: &[ParamDef] = &[
+    PATH_PARAM[0],
+    int_param("which", "0"),
+    READ_CSV_PARAMS[1],
+    READ_CSV_PARAMS[2],
+    READ_CSV_PARAMS[3],
+];
+const READ_XML_PARAM: &[ParamDef] = &[PATH_PARAM[0], text_param("xpath"), READ_CSV_PARAMS[1]];
+const JSON_NORM_PARAM: &[ParamDef] = &[
+    PATH_PARAM[0],
+    text_param("record_path"),
+    text_param("meta"),
+    text_param("sep"),
+];
+const APPLY_PARAM: &[ParamDef] = &[
+    ParamDef {
+        name: "fn",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &[
+            "sum", "mean", "min", "max", "count", "median", "std", "quantile", "code",
+        ],
+        default_json: "\"sum\"",
+    },
+    ParamDef {
+        name: "axis",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["0", "1"],
+        default_json: "\"0\"",
+    },
+    ParamDef {
+        name: "q",
+        kind: ParamKind::Float,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "0.5",
+    },
+    ParamDef {
+        name: "code",
+        kind: ParamKind::Code,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"def run(values):\\n    return values\\n\"",
+    },
+];
+const MAP_PARAM: &[ParamDef] = &[
+    ParamDef {
+        name: "fn",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &[
+            "sum", "mean", "min", "max", "count", "median", "std", "quantile", "code",
+        ],
+        default_json: "\"code\"",
+    },
+    ParamDef {
+        name: "code",
+        kind: ParamKind::Code,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"def run(value):\\n    return value\\n\"",
+    },
+];
+const ARITH_PARAM: &[ParamDef] = &[
+    ParamDef {
+        name: "op",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &[
+            "add", "sub", "mul", "div", "floordiv", "mod", "pow", "eq", "ne", "lt", "gt", "le",
+            "ge",
+        ],
+        default_json: "\"add\"",
+    },
+    text_param("value"),
+];
+
 const fn feature_row(
     id: &'static str,
     title: &'static str,
@@ -1598,6 +2167,6 @@ pub fn features_in(group: &str) -> impl Iterator<Item = &'static FeatureDef> {
 
 pub fn groups() -> &'static [&'static str] {
     &[
-        "IO", "Labels", "Select", "Shape", "Clean", "Text", "Reduce", "Code", "Output",
+        "IO", "Labels", "Select", "Shape", "Clean", "Text", "Time", "Reduce", "Code", "Output",
     ]
 }

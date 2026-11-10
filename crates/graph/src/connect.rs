@@ -94,6 +94,19 @@ fn preserves_input(feature: &str) -> bool {
             | "dt"
             | "to_datetime"
             | "to_numeric"
+            | "expanding"
+            | "ewm"
+            | "tz_localize"
+            | "tz_convert"
+            | "to_timedelta"
+            | "cut"
+            | "qcut"
+            | "factorize"
+            | "arith"
+            | "rank"
+            | "reindex"
+            | "sort_index"
+            | "map"
     )
 }
 
