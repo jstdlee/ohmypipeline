@@ -130,6 +130,28 @@ def resolve_variables(graph: dict[str, Any], overrides: dict[str, str]) -> dict[
     return variables
 
 
+def referenced_names(value: Any) -> set[str]:
+    """Every variable name a param tree mentions, scanned deep.
+
+    `$${` escapes to literal text and mentions nothing.
+    """
+    if isinstance(value, str):
+        if not value or "${" not in value:
+            return set()
+        return {name for kind, name in _walk(value) if kind == "var"}
+    if isinstance(value, dict):
+        found: set[str] = set()
+        for item in value.values():
+            found |= referenced_names(item)
+        return found
+    if isinstance(value, list):
+        found = set()
+        for item in value:
+            found |= referenced_names(item)
+        return found
+    return set()
+
+
 def substitute_params(
     params: Any, variables: dict[str, Any], origin: str | None = None
 ) -> tuple[Any, dict[str, str]]:

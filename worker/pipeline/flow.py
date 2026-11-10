@@ -268,11 +268,16 @@ def evaluate(text: str, variables: dict[str, Any], frame: pd.DataFrame | None) -
 
 
 def loop_members(graph: dict[str, Any], start_id: str, end_id: str) -> list[str]:
-    """Nodes on any path from loop_start to loop_end, exclusive of both.
+    """Nodes the loop recomputes once per iteration, exclusive of the pair.
 
-    Ancestors of the end that are also descendants of the start, in a
-    parents-before-children order.
+    Members are ancestors of the end that either descend from the start or
+    mention the loop variable or ${loop_index} in any string param, plus
+    every node on a path from such a node to the end. Everything else
+    upstream is loop-invariant and computed once. Parents come first.
     """
+    from pipeline.vars import referenced_names
+
+    nodes = {node.get("id"): node for node in graph.get("nodes") or []}
     ancestors: list[str] = []
     seen: set[str] = set()
     stack: set[str] = set()
@@ -291,6 +296,10 @@ def loop_members(graph: dict[str, Any], start_id: str, end_id: str) -> list[str]
         ancestors.append(current)
 
     walk(end_id)
+    # The loop variables a body may use: `${name}` and `${loop_index}`.
+    start = nodes.get(start_id)
+    name = str(((start or {}).get("params") or {}).get("name") or "loop_value")
+    loop_names = {name, "loop_index"}
     below: set[str] = set()
     queue = [start_id]
     while queue:
@@ -299,9 +308,22 @@ def loop_members(graph: dict[str, Any], start_id: str, end_id: str) -> list[str]
             if edge.get("from") == current and edge.get("to") not in below:
                 below.add(edge.get("to"))
                 queue.append(edge.get("to"))
-    below.discard(start_id)
-    below.discard(end_id)
-    return [node_id for node_id in ancestors if node_id in below]
+    inside = [node_id for node_id in ancestors if node_id not in (start_id, end_id)]
+    seeds: set[str] = set()
+    for node_id in inside:
+        mentions = referenced_names((nodes.get(node_id) or {}).get("params") or {})
+        if node_id in below or mentions & loop_names:
+            seeds.add(node_id)
+    parents: dict[str, list[str]] = {}
+    for edge in graph.get("edges") or []:
+        parents.setdefault(edge.get("to"), []).append(edge.get("from"))
+    members: set[str] = set()
+    ordered: list[str] = []
+    for node_id in inside:
+        if node_id in seeds or any(parent in members for parent in parents.get(node_id, ())):
+            members.add(node_id)
+            ordered.append(node_id)
+    return ordered
 
 
 def paired_loop_starts(graph: dict[str, Any]) -> dict[str, str]:

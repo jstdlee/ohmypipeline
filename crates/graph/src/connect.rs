@@ -583,4 +583,18 @@ mod tests {
         assert!(try_connect(&graph, "s", "true", "h", "in").is_ok());
         assert!(try_connect(&graph, "h", "out", "e", "in").is_ok());
     }
+
+    #[test]
+    fn a_loop_start_cannot_wire_into_a_port_that_does_not_exist() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("l", "loop_start"));
+        graph.nodes.push(node("r", "read_csv"));
+        // read_csv has no `in` port, so the canvas must never draw this
+        // wire. A reader joins the loop body through its ${loop_value}
+        // param instead.
+        assert_eq!(
+            try_connect(&graph, "l", "out", "r", "in").unwrap_err(),
+            Reject::Type
+        );
+    }
 }

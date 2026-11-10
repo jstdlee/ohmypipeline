@@ -1349,18 +1349,71 @@ class FlowTests(unittest.TestCase):
         )
 
     def files_loop(self, name, pattern, body_nodes, body_edges, add_column=None):
-        """loop_start -> body -> loop_end. The body reads ${loop_value}."""
+        """A loop whose body reads ${loop_value} and feeds loop_end.
+
+        No wire from loop_start: the body membership comes from the
+        ${loop_value} reference, the way an unwired canvas loop builds.
+        """
         end_params = {"pair": name}
         if add_column is not None:
             end_params["add_column"] = add_column
         nodes = [node(name, "loop_start", {"mode": "files", "pattern": pattern})]
         nodes += body_nodes
         nodes.append(node("lend", "loop_end", end_params))
-        edges = [edge(name, body_nodes[0]["id"])] + body_edges
+        edges = list(body_edges)
         edges.append(edge(body_nodes[-1]["id"], "lend"))
         return nodes, edges
 
-    def test_files_loop_concatenates_and_names_the_loop_column(self):
+    def test_loop_members_pick_loop_var_references_and_downstream(self):
+        from pipeline.flow import loop_members
+
+        nodes = [
+            node("s", "loop_start", {"mode": "files", "pattern": "mem_*.csv", "name": "loop_value"}),
+            node("static", "read_csv", {"path": "constant.csv"}),
+            node("body", "read_csv", {"path": "${loop_value}"}),
+            node("m", "concat", {}),
+            node("e", "loop_end", {"pair": "s"}),
+        ]
+        edges = [
+            edge("static", "m", dst_port="in"),
+            edge("body", "m", dst_port="in"),
+            edge("m", "e"),
+        ]
+        graph = graph_of(nodes, edges)
+        graph["version"] = 2
+        # The reader joins through ${loop_value}; concat follows it. The
+        # unwired reader stays loop-invariant and is computed once.
+        self.assertEqual(loop_members(graph, "s", "e"), ["body", "m"])
+
+    def test_an_invariant_upstream_reader_is_computed_once(self):
+        from pipeline.flow import loop_members
+        from pipeline.run import stats
+
+        for stem, region in (("invar_a", "N"), ("invar_b", "S"), ("invar_c", "E")):
+            path = self.tmp / f"{stem}.csv"
+            path.write_text(f"region,amount\n{region},1\n", encoding="utf-8")
+        fixed = self.tmp / "invar_fixed.csv"
+        fixed.write_text("region,amount\nW,9\n", encoding="utf-8")
+        start = node("n1", "loop_start", {"mode": "files", "pattern": "invar_?.csv"})
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        constant = node("n4", "read_csv", {"path": str(fixed)})
+        end = node("lend", "loop_end", {"pair": "n1"})
+        nodes = [start, reader, constant, end]
+        edges = [edge("n2", "lend"), edge("n4", "lend")]
+        graph = graph_of(nodes, edges)
+        self.assertEqual(loop_members(graph, "n1", "lend"), ["n2"])
+        before = stats["computed"]
+        reply = self.job(nodes, edges, "lend")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        after = stats["computed"]
+        # loop_start and the body reader run once per iteration (three
+        # files); the constant reader runs once across the whole loop.
+        self.assertEqual(after - before, 7)
+        self.assertEqual(reply["n"], 3)
+        regions = {row[reply["columns"].index("region")] for row in reply["rows"]}
+        self.assertEqual(regions, {"N", "S", "E"})
+
+    def test_a_files_loop_concatenates_all_files_without_a_start_wire(self):
         for stem, region, rows in (("bulk_a", "N", 2), ("bulk_b", "S", 1), ("bulk_c", "E", 3)):
             path = self.tmp / f"{stem}.csv"
             text = "region,amount\n" + "".join(f"{region},{10 + i}\n" for i in range(rows))
@@ -1595,7 +1648,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(reply["rows"][0][reply["columns"].index("region")], "N")
         start = node("n1", "loop_start", {"mode": "files", "pattern": "first_*.csv"})
         end = node("lend", "loop_end", {"pair": "n1"})
-        reply = self.job([start, reader, end], [edge("n1", "n2"), edge("n2", "lend")], "n1")
+        reply = self.job([start, reader, end], [edge("n2", "lend")], "n1")
         self.assertIsNone(reply.get("error"), reply.get("error"))
         self.assertEqual(reply["claim"], "first iteration")
         self.assertEqual(reply["columns"], ["path", "name"])

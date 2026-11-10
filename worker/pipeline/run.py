@@ -110,11 +110,11 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         member_of: dict[str, str] = {}
         loop_end_of: dict[str, str] = {}
         for end_id, start_id in pairs.items():
-            if end_id not in order_set and start_id not in order_set:
-                continue
             try:
                 members = loop_members(graph, start_id, end_id)
             except NodeError:
+                continue
+            if end_id not in order_set and start_id not in order_set and node_id not in members:
                 continue
             member_of[start_id] = start_id
             for member in members:

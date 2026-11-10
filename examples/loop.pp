@@ -25,7 +25,6 @@
     }
   ],
   "edges": [
-    { "from": "n1", "from_port": "out", "to": "n2", "to_port": "in" },
     { "from": "n2", "from_port": "out", "to": "n3", "to_port": "in" }
   ],
   "camera": { "x": 0, "y": 0, "zoom": 1 }
