@@ -481,6 +481,20 @@ impl Node {
         ports
     }
 
+    /// All output ports. Most features have one; `if_switch` has `true` and
+    /// `false`. Falls back to the single output for every existing feature.
+    pub fn output_ports(&self) -> Vec<PortRecord> {
+        if self.feature == "chart" || self.unknown {
+            return Vec::new();
+        }
+        if let Some(def) = self.def()
+            && !def.outputs.is_empty()
+        {
+            return def.outputs.iter().map(PortRecord::from_def).collect();
+        }
+        self.output_port().into_iter().collect()
+    }
+
     pub fn output_port(&self) -> Option<PortRecord> {
         if self.feature == "chart" || self.unknown {
             return None;
@@ -639,6 +653,29 @@ impl Node {
             "merge" => format!("how={}", self.param_str("how")),
             "concat" => "concat".to_string(),
             "to_frame" => "series to frame".to_string(),
+            "loop_start" => {
+                let mode = self.param_str("mode");
+                let detail = match mode.as_str() {
+                    "groups" => self.param_str("column"),
+                    "values" => self.param_str("values"),
+                    _ => self.param_str("pattern"),
+                };
+                if detail.is_empty() {
+                    mode
+                } else {
+                    format!("{mode} {detail}")
+                }
+            }
+            "loop_end" => "collect".to_string(),
+            "if_switch" => {
+                let condition = self.param_str("condition");
+                if condition.is_empty() {
+                    "no condition".to_string()
+                } else {
+                    condition
+                }
+            }
+            "end_if" => "merge branches".to_string(),
             _ => self.feature.clone(),
         }
     }
@@ -714,11 +751,25 @@ pub fn duplicate_headers(pairs: &[(String, String)]) -> Option<String> {
 }
 
 /// Nodes with no outgoing edge. Chart nodes count: they are sinks.
+/// A loop_start whose paired loop_end exists does not: the flow ends at the
+/// loop_end, and the start with no wires is still a legal body loop.
 pub fn sinks(graph: &Graph) -> Vec<String> {
+    let paired: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.feature == "loop_end")
+        .filter_map(|node| {
+            node.params
+                .get("pair")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
     graph
         .nodes
         .iter()
         .filter(|node| !graph.edges.iter().any(|edge| edge.from == node.id))
+        .filter(|node| !(node.feature == "loop_start" && paired.contains(&node.id)))
         .map(|node| node.id.clone())
         .collect()
 }
@@ -976,4 +1027,32 @@ pub fn python_arg_names(code: &str) -> Vec<String> {
         }
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Point;
+
+    fn node(id: &str, feature: &str) -> Node {
+        Node::new(id, feature, Point::new(0.0, 0.0))
+    }
+
+    #[test]
+    fn a_wired_loop_start_is_not_a_sink_alone() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "loop_start"));
+        let mut end = node("n2", "loop_end");
+        end.params.insert("pair".to_string(), json!("n1"));
+
+        graph.nodes.push(end);
+        graph.edges.push(Edge::between("n1", "out", "n2", "in"));
+        assert_eq!(sinks(&graph), vec!["n2".to_string()]);
+
+        // With no wires at all the start still announces itself, so a
+        // headless run never guesses its way into a broken body.
+        let mut bare = Graph::default();
+        bare.nodes.push(node("n1", "loop_start"));
+        assert_eq!(sinks(&bare), vec!["n1".to_string()]);
+    }
 }

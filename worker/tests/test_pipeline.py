@@ -1326,5 +1326,357 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(reply["computed"], ["n1"])
 
 
+class FlowTests(unittest.TestCase):
+    """Loops, branches, and the condition language."""
+
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp"
+        self.tmp.mkdir(exist_ok=True)
+
+    def job(self, nodes, edges, node_id, variables=None, **extra):
+        document = graph_of(nodes, edges)
+        if variables is not None:
+            document["variables"] = variables
+        return run_job(
+            {
+                "generation": 1,
+                "mode": extra.pop("mode", "preview"),
+                "graph": document,
+                "node": node_id,
+                "base_dir": str(self.tmp),
+                **extra,
+            }
+        )
+
+    def files_loop(self, name, pattern, body_nodes, body_edges, add_column=None):
+        """A loop whose body reads ${loop_value} and feeds loop_end.
+
+        No wire from loop_start: the body membership comes from the
+        ${loop_value} reference, the way an unwired canvas loop builds.
+        """
+        end_params = {"pair": name}
+        if add_column is not None:
+            end_params["add_column"] = add_column
+        nodes = [node(name, "loop_start", {"mode": "files", "pattern": pattern})]
+        nodes += body_nodes
+        nodes.append(node("lend", "loop_end", end_params))
+        edges = list(body_edges)
+        edges.append(edge(body_nodes[-1]["id"], "lend"))
+        return nodes, edges
+
+    def test_loop_members_pick_loop_var_references_and_downstream(self):
+        from pipeline.flow import loop_members
+
+        nodes = [
+            node("s", "loop_start", {"mode": "files", "pattern": "mem_*.csv", "name": "loop_value"}),
+            node("static", "read_csv", {"path": "constant.csv"}),
+            node("body", "read_csv", {"path": "${loop_value}"}),
+            node("m", "concat", {}),
+            node("e", "loop_end", {"pair": "s"}),
+        ]
+        edges = [
+            edge("static", "m", dst_port="in"),
+            edge("body", "m", dst_port="in"),
+            edge("m", "e"),
+        ]
+        graph = graph_of(nodes, edges)
+        graph["version"] = 2
+        # The reader joins through ${loop_value}; concat follows it. The
+        # unwired reader stays loop-invariant and is computed once.
+        self.assertEqual(loop_members(graph, "s", "e"), ["body", "m"])
+
+    def test_an_invariant_upstream_reader_is_computed_once(self):
+        from pipeline.flow import loop_members
+        from pipeline.run import stats
+
+        for stem, region in (("invar_a", "N"), ("invar_b", "S"), ("invar_c", "E")):
+            path = self.tmp / f"{stem}.csv"
+            path.write_text(f"region,amount\n{region},1\n", encoding="utf-8")
+        fixed = self.tmp / "invar_fixed.csv"
+        fixed.write_text("region,amount\nW,9\n", encoding="utf-8")
+        start = node("n1", "loop_start", {"mode": "files", "pattern": "invar_?.csv"})
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        constant = node("n4", "read_csv", {"path": str(fixed)})
+        end = node("lend", "loop_end", {"pair": "n1"})
+        nodes = [start, reader, constant, end]
+        edges = [edge("n2", "lend"), edge("n4", "lend")]
+        graph = graph_of(nodes, edges)
+        self.assertEqual(loop_members(graph, "n1", "lend"), ["n2"])
+        before = stats["computed"]
+        reply = self.job(nodes, edges, "lend")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        after = stats["computed"]
+        # loop_start and the body reader run once per iteration (three
+        # files); the constant reader runs once across the whole loop.
+        self.assertEqual(after - before, 7)
+        self.assertEqual(reply["n"], 3)
+        regions = {row[reply["columns"].index("region")] for row in reply["rows"]}
+        self.assertEqual(regions, {"N", "S", "E"})
+
+    def test_a_files_loop_concatenates_all_files_without_a_start_wire(self):
+        for stem, region, rows in (("bulk_a", "N", 2), ("bulk_b", "S", 1), ("bulk_c", "E", 3)):
+            path = self.tmp / f"{stem}.csv"
+            text = "region,amount\n" + "".join(f"{region},{10 + i}\n" for i in range(rows))
+            path.write_text(text, encoding="utf-8")
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        nodes, edges = self.files_loop("n1", "bulk_*.csv", [reader], [])
+        reply = self.job(nodes, edges, "lend")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"][0], "loop_value")
+        self.assertEqual(reply["n"], 6)
+        loop_values = [row[0] for row in reply["rows"]]
+        self.assertEqual(len(loop_values), 6)
+        self.assertTrue(all(Path(str(v)).is_absolute() for v in loop_values))
+        regions = {row[reply["columns"].index("region")] for row in reply["rows"]}
+        self.assertEqual(regions, {"N", "S", "E"})
+        self.assertEqual(reply["inactive"], [])
+
+    def test_groups_loop_iterates_sorted_unique_values(self):
+        csv_path = self.tmp / "grouped.csv"
+        csv_path.write_text("region,amount\nN,12\nS,8\nN,15\n", encoding="utf-8")
+        start = node("n1", "loop_start", {"mode": "groups", "column": "region", "name": "g"})
+        head = node("n2", "head", {"n": 1})
+        end = node("n3", "loop_end", {"pair": "n1"})
+        reply = self.job(
+            [
+                node("n0", "read_csv", {"path": str(csv_path)}),
+                start,
+                head,
+                end,
+            ],
+            [edge("n0", "n1"), edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"][0], "g")
+        self.assertEqual([row[0] for row in reply["rows"]], ["N", "S"])
+        amounts = [row[reply["columns"].index("amount")] for row in reply["rows"]]
+        self.assertEqual(amounts, [12, 8])
+
+    def test_values_loop_splits_a_variable(self):
+        csv_path = self.tmp / "values_in.csv"
+        csv_path.write_text("region,amount\nN,12\n", encoding="utf-8")
+        start = node("n1", "loop_start", {"mode": "values", "values": "${regions}", "name": "region_v"})
+        head = node("n2", "head", {"n": 1})
+        end = node("n3", "loop_end", {"pair": "n1"})
+        reply = self.job(
+            [
+                node("n0", "read_csv", {"path": str(csv_path)}),
+                start,
+                head,
+                end,
+            ],
+            [edge("n0", "n1"), edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+            variables=[{"name": "regions", "kind": "string", "value": "N,S,E"}],
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"][0], "region_v")
+        self.assertEqual([row[0] for row in reply["rows"]], ["N", "S", "E"])
+        self.assertEqual(reply["n"], 3)
+
+    def test_preview_caps_the_loop_at_three_of_five_iterations(self):
+        csv_path = self.tmp / "cap_in.csv"
+        csv_path.write_text("region,amount\nN,12\n", encoding="utf-8")
+        start = node("n1", "loop_start", {"mode": "values", "values": "1,2,3,4,5", "name": "i"})
+        head = node("n2", "head", {"n": 1})
+        end = node("n3", "loop_end", {"pair": "n1"})
+        reply = self.job(
+            [
+                node("n0", "read_csv", {"path": str(csv_path)}),
+                start,
+                head,
+                end,
+            ],
+            [edge("n0", "n1"), edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["claim"], "preview · first 3 of 5 iterations")
+        self.assertEqual(reply["n"], 3)
+        self.assertEqual([row[0] for row in reply["rows"]], ["1", "2", "3"])
+        full = self.job(
+            [
+                node("n0", "read_csv", {"path": str(csv_path)}),
+                start,
+                head,
+                end,
+            ],
+            [edge("n0", "n1"), edge("n1", "n2"), edge("n2", "n3")],
+            "n3",
+            mode="full",
+        )
+        self.assertEqual(full["n"], 5)
+        self.assertEqual(full["claim"], "full")
+
+    def test_an_iteration_error_names_the_file(self):
+        good = self.tmp / "err_a.csv"
+        good.write_text("region,amount\nN,12\n", encoding="utf-8")
+        bad = self.tmp / "err_b.csv"
+        bad.write_text("region\nS,8\n", encoding="utf-8")
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        column = node("n3", "column", {"name": "amount"})
+        nodes, edges = self.files_loop("n1", "err_*.csv", [reader, column], [edge("n2", "n3")])
+        reply = self.job(nodes, edges, "lend")
+        self.assertIsNotNone(reply["error"])
+        self.assertEqual(reply["error"]["node"], "n3")
+        self.assertEqual(
+            reply["error"]["message"],
+            "iteration 2 (err_b.csv): missing column amount",
+        )
+
+    def test_if_switch_branches_and_reports_inactive(self):
+        csv_path = self.tmp / "branch.csv"
+        csv_path.write_text("amount,region\n12,N\n8,S\n15,N\n3,E\n", encoding="utf-8")
+        document_nodes = [
+            node("n1", "read_csv", {"path": str(csv_path)}),
+            node("n2", "if_switch", {"condition": '${mode} == "full"'}),
+            node("n3", "head", {"n": 2}),
+            node("n4", "head", {"n": 1}),
+            node("n5", "end_if", {}),
+        ]
+        document_edges = [
+            edge("n1", "n2"),
+            edge("n2", "n3", src_port="true"),
+            edge("n2", "n4", src_port="false"),
+            edge("n3", "n5", dst_port="true"),
+            edge("n4", "n5", dst_port="false"),
+        ]
+        variables = [{"name": "mode", "kind": "string", "value": "preview"}]
+        reply = self.job(document_nodes, document_edges, "n5", variables=variables)
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 1)
+        self.assertEqual(reply["inactive"], ["n3"])
+        self.assertEqual(reply["claim"], "preview")
+        full = self.job(
+            document_nodes,
+            document_edges,
+            "n5",
+            variables=variables,
+            overrides={"mode": "full"},
+        )
+        self.assertIsNone(full.get("error"), full.get("error"))
+        self.assertEqual(full["n"], 2)
+        self.assertEqual(full["inactive"], ["n4"])
+
+    def test_rows_condition_on_an_empty_frame(self):
+        csv_path = self.tmp / "empty.csv"
+        csv_path.write_text("amount,region\n", encoding="utf-8")
+        nodes = [
+            node("n1", "read_csv", {"path": str(csv_path)}),
+            node("n2", "if_switch", {"condition": "rows > 0"}),
+            node("n3", "head", {"n": 1}),
+            node("n4", "head", {"n": 1}),
+            node("n5", "end_if", {}),
+        ]
+        edges = [
+            edge("n1", "n2"),
+            edge("n2", "n3", src_port="true"),
+            edge("n2", "n4", src_port="false"),
+            edge("n3", "n5", dst_port="true"),
+            edge("n4", "n5", dst_port="false"),
+        ]
+        reply = self.job(nodes, edges, "n5")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["inactive"], ["n3"])
+        self.assertEqual(reply["n"], 0)
+
+    def test_skip_propagates_through_two_nodes(self):
+        csv_path = self.tmp / "skip.csv"
+        csv_path.write_text("amount,region\n12,N\n8,S\n", encoding="utf-8")
+        nodes = [
+            node("n1", "read_csv", {"path": str(csv_path)}),
+            node("n2", "if_switch", {"condition": "${off}"}),
+            node("n3", "head", {"n": 1}),
+            node("n4", "head", {"n": 1}),
+            node("n5", "head", {"n": 1}),
+            node("n6", "end_if", {}),
+        ]
+        edges = [
+            edge("n1", "n2"),
+            edge("n2", "n3", src_port="true"),
+            edge("n3", "n4"),
+            edge("n4", "n6", dst_port="true"),
+            edge("n2", "n5", src_port="false"),
+            edge("n5", "n6", dst_port="false"),
+        ]
+        reply = self.job(
+            nodes,
+            edges,
+            "n6",
+            variables=[{"name": "off", "kind": "bool", "value": False}],
+        )
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["inactive"], ["n3", "n4"])
+        self.assertEqual(reply["n"], 1)
+
+    def test_an_if_switch_inside_a_loop_body(self):
+        two = self.tmp / "body_a.csv"
+        two.write_text("region,amount\nN,12\nN,15\n", encoding="utf-8")
+        one = self.tmp / "body_b.csv"
+        one.write_text("region,amount\nS,8\n", encoding="utf-8")
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        switch = node("n3", "if_switch", {"condition": "rows > 1"})
+        head = node("n4", "head", {"n": 1})
+        nodes, edges = self.files_loop(
+            "n1",
+            "body_*.csv",
+            [reader, switch, head],
+            [
+                edge("n2", "n3"),
+                edge("n3", "n4", src_port="true"),
+            ],
+        )
+        reply = self.job(nodes, edges, "lend")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["n"], 1)
+        self.assertEqual(reply["inactive"], ["n4"])
+        loop_values = [row[0] for row in reply["rows"]]
+        self.assertTrue(loop_values[0].endswith("body_a.csv"))
+
+    def test_requesting_a_body_node_runs_the_first_iteration(self):
+        first = self.tmp / "first_a.csv"
+        first.write_text("region,amount\nN,12\n", encoding="utf-8")
+        second = self.tmp / "first_b.csv"
+        second.write_text("region,amount\nS,8\nS,9\n", encoding="utf-8")
+        reader = node("n2", "read_csv", {"path": "${loop_value}"})
+        nodes, edges = self.files_loop("n1", "first_*.csv", [reader], [])
+        reply = self.job(nodes, edges, "n2")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["claim"], "first iteration")
+        self.assertEqual(reply["n"], 1)
+        self.assertEqual(reply["rows"][0][reply["columns"].index("region")], "N")
+        start = node("n1", "loop_start", {"mode": "files", "pattern": "first_*.csv"})
+        end = node("lend", "loop_end", {"pair": "n1"})
+        reply = self.job([start, reader, end], [edge("n2", "lend")], "n1")
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["claim"], "first iteration")
+        self.assertEqual(reply["columns"], ["path", "name"])
+        self.assertEqual(reply["rows"][0][1], "first_a")
+
+    def test_a_loop_end_without_a_pair_is_an_error(self):
+        end = node("n1", "loop_end", {"pair": "missing"})
+        reply = self.job([end], [], "n1")
+        self.assertIsNotNone(reply["error"])
+        self.assertIn("not paired", reply["error"]["message"])
+
+    def test_the_condition_parser_rejects_calls_and_broken_text(self):
+        import pandas as pd
+
+        from pipeline.flow import FlowError, evaluate
+
+        with self.assertRaises(FlowError) as caught:
+            evaluate("__import__('os')", {}, None)
+        self.assertIn("unknown name", str(caught.exception))
+        with self.assertRaises(FlowError) as caught:
+            evaluate("((rows > 0)", {}, None)
+        self.assertIn("unbalanced parenthesis at 0", str(caught.exception))
+        with self.assertRaises(FlowError):
+            evaluate("rows >", {}, None)
+        self.assertTrue(evaluate('${m} == "full"', {"m": "full"}, None))
+        self.assertFalse(evaluate("rows > 0", {}, pd.DataFrame()))
+        self.assertTrue(evaluate("not false and (1 < 2)", {}, None))
+
+
 if __name__ == "__main__":
     unittest.main()

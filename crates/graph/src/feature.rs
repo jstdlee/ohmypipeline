@@ -51,6 +51,11 @@ pub struct FeatureDef {
     pub can_add_input: bool,
     /// The node stores its own input list (a code block).
     pub inputs_are_user: bool,
+    /// Named outputs when the feature has more than one. Empty means the
+    /// single output above.
+    pub outputs: &'static [PortDef],
+    /// Inputs a node may leave unwired.
+    pub optional_inputs: &'static [&'static str],
 }
 
 const READ_CSV_PARAMS: &[ParamDef] = &[
@@ -306,6 +311,62 @@ const IN_MULTI: PortDef = PortDef {
     accepts: DF_OR_SERIES,
     multi: true,
 };
+const IN_TRUE: PortDef = PortDef {
+    name: "true",
+    accepts: DF,
+    multi: false,
+};
+const IN_FALSE: PortDef = PortDef {
+    name: "false",
+    accepts: DF,
+    multi: false,
+};
+const OUT_TRUE: PortDef = PortDef {
+    name: "true",
+    accepts: DF,
+    multi: false,
+};
+const OUT_FALSE: PortDef = PortDef {
+    name: "false",
+    accepts: DF,
+    multi: false,
+};
+
+const LOOP_START_PARAMS: &[ParamDef] = &[
+    ParamDef {
+        name: "mode",
+        kind: ParamKind::Enum,
+        wireable: false,
+        wire_types: &[],
+        options: &["files", "groups", "values"],
+        default_json: "\"files\"",
+    },
+    text_param("pattern"),
+    text_param("column"),
+    text_param("values"),
+    ParamDef {
+        name: "name",
+        kind: ParamKind::String,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "\"loop_value\"",
+    },
+];
+
+const LOOP_END_PARAMS: &[ParamDef] = &[
+    text_param("pair"),
+    ParamDef {
+        name: "add_column",
+        kind: ParamKind::Bool,
+        wireable: false,
+        wire_types: &[],
+        options: &[],
+        default_json: "true",
+    },
+];
+
+const IF_PARAMS: &[ParamDef] = &[text_param("condition")];
 
 /// The milestone catalog, plus the fan-in and preview actions the wire and
 /// table rules name directly. A pandas call that is not here is absent.
@@ -321,6 +382,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: READ_CSV_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "read_excel",
@@ -333,6 +396,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: EXCEL_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "read_sql",
@@ -370,6 +435,8 @@ pub static CATALOG: &[FeatureDef] = &[
         ],
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "head",
@@ -382,6 +449,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: HEAD_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "change_headers",
@@ -394,6 +463,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: CHANGE_HEADERS_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "query",
@@ -406,6 +477,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: QUERY_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "column",
@@ -418,6 +491,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: COLUMN_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "to_frame",
@@ -434,6 +509,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: &[],
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "sort_values",
@@ -446,6 +523,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: SORT_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "merge",
@@ -469,6 +548,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: MERGE_PARAMS,
         can_add_input: true,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "concat",
@@ -481,6 +562,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: &[],
         can_add_input: true,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "literal",
@@ -498,6 +581,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: LITERAL_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "python",
@@ -510,6 +595,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: PYTHON_PARAMS,
         can_add_input: false,
         inputs_are_user: true,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "chart",
@@ -522,6 +609,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: CHART_PARAMS,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     feature_row(
         "read_json",
@@ -1344,6 +1433,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: ARITH_PARAM,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "corr",
@@ -1356,6 +1447,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: &[],
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "cov",
@@ -1368,6 +1461,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: &[],
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "combine_first",
@@ -1391,6 +1486,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: &[],
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "join",
@@ -1414,6 +1511,8 @@ pub static CATALOG: &[FeatureDef] = &[
         params: JOIN_PARAM,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     },
     FeatureDef {
         id: "merge_asof",
@@ -1437,6 +1536,64 @@ pub static CATALOG: &[FeatureDef] = &[
         params: ASOF_PARAM,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
+    },
+    FeatureDef {
+        id: "loop_start",
+        title: "Loop start",
+        group: "Flow",
+        inputs: &[IN_DF],
+        output: Some(TypeName::Dataframe),
+        possible_outputs: DF,
+        output_name: "out",
+        params: LOOP_START_PARAMS,
+        can_add_input: false,
+        inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &["in"],
+    },
+    FeatureDef {
+        id: "loop_end",
+        title: "Loop end",
+        group: "Flow",
+        inputs: &[IN_DF],
+        output: Some(TypeName::Dataframe),
+        possible_outputs: DF,
+        output_name: "out",
+        params: LOOP_END_PARAMS,
+        can_add_input: false,
+        inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
+    },
+    FeatureDef {
+        id: "if_switch",
+        title: "If switch",
+        group: "Flow",
+        inputs: &[IN_DF],
+        output: None,
+        possible_outputs: &[],
+        output_name: "out",
+        params: IF_PARAMS,
+        can_add_input: false,
+        inputs_are_user: false,
+        outputs: &[OUT_TRUE, OUT_FALSE],
+        optional_inputs: &["in"],
+    },
+    FeatureDef {
+        id: "end_if",
+        title: "End if",
+        group: "Flow",
+        inputs: &[IN_TRUE, IN_FALSE],
+        output: Some(TypeName::Dataframe),
+        possible_outputs: DF,
+        output_name: "out",
+        params: &[],
+        can_add_input: false,
+        inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &["true", "false"],
     },
 ];
 
@@ -2315,6 +2472,8 @@ const fn feature_row(
         params,
         can_add_input: false,
         inputs_are_user: false,
+        outputs: &[],
+        optional_inputs: &[],
     }
 }
 
@@ -2329,5 +2488,6 @@ pub fn features_in(group: &str) -> impl Iterator<Item = &'static FeatureDef> {
 pub fn groups() -> &'static [&'static str] {
     &[
         "IO", "Labels", "Select", "Shape", "Clean", "Text", "Time", "Reduce", "Code", "Output",
+        "Flow",
     ]
 }

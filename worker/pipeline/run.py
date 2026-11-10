@@ -14,8 +14,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from pipeline.flow import (
+    SKIP,
+    Branch,
+    FlowError,
+    evaluate,
+    loop_iterations,
+    loop_members,
+    paired_loop_starts,
+)
+
 PREVIEW_ROW_CAP = 10_000
 TABLE_WINDOW = 500
+# Preview mode runs at most this many loop iterations.
+LOOP_PREVIEW_CAP = 3
 
 # How many times a node was actually computed. Tests use this to see the cache.
 stats = {"computed": 0}
@@ -88,28 +100,100 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         order = ancestors(graph, node_id)
         values: dict[str, Any] = {}
         keys: dict[str, str] = {}
+        claim = mode
+        order_set = set(order)
+        pairs = paired_loop_starts(graph)
+        # Loops this job touches: every body node and the loop_start map to
+        # the loop_start id. Computed eagerly only when the loop_end is not
+        # part of this run, because then the body runs once with the first
+        # iteration's bindings.
+        member_of: dict[str, str] = {}
+        loop_end_of: dict[str, str] = {}
+        for end_id, start_id in pairs.items():
+            try:
+                members = loop_members(graph, start_id, end_id)
+            except NodeError:
+                continue
+            if end_id not in order_set and start_id not in order_set and node_id not in members:
+                continue
+            member_of[start_id] = start_id
+            for member in members:
+                member_of[member] = start_id
+            loop_end_of[start_id] = end_id
+        if member_of.get(node_id) is not None and loop_end_of.get(node_id) not in order_set:
+            claim = "first iteration"
+        # First-iteration bindings per loop. Groups bindings need the
+        # loop_start input frame, so they are computed when the loop_start
+        # is reached in the topological order.
+        bindings: dict[str, dict[str, Any]] = {}
+
+        def first_bindings(start_id: str) -> dict[str, Any] | None:
+            if start_id not in bindings:
+                bindings[start_id] = _first_bindings(
+                    graph, start_id, values, base_dir, variables
+                )
+            return bindings[start_id]
+
         for current in order:
-            value, key = compute_node(
-                graph,
-                current,
-                values,
-                keys,
-                mode=mode,
-                base_dir=base_dir,
-                overrides=overrides,
-                variables=variables,
-            )
+            if current in pairs:
+                value, key, loop_claim = compute_loop_end(
+                    graph,
+                    current,
+                    values,
+                    keys,
+                    mode=mode,
+                    base_dir=base_dir,
+                    overrides=overrides,
+                    variables=variables,
+                )
+                if current == node_id and loop_claim:
+                    claim = loop_claim
+            else:
+                start_id = member_of.get(current)
+                if start_id is not None and loop_end_of.get(start_id) in order_set:
+                    # The loop_end computes this node once per iteration.
+                    # The placeholder is replaced when the loop runs.
+                    values[current] = SKIP
+                    continue
+                extra: dict[str, Any] | None = None
+                local_vars = variables
+                if start_id is not None:
+                    extra = first_bindings(start_id)
+                    if extra:
+                        local_vars = {**variables, **extra}
+                value, key = compute_node(
+                    graph,
+                    current,
+                    values,
+                    keys,
+                    mode=mode,
+                    base_dir=base_dir,
+                    overrides=overrides,
+                    variables=local_vars,
+                    key_extra=extra,
+                )
             values[current] = value
             keys[current] = key
-        computed = list(order)
+        computed = []
+        inactive = []
+        for current in order:
+            if values[current] is SKIP:
+                inactive.append(current)
+            else:
+                computed.append(current)
         result = values[node_id]
+        if isinstance(result, Branch):
+            result = result.pick()
+        if result is SKIP:
+            result = pd.DataFrame()
+            claim = "inactive branch"
         node = find_node(graph, node_id)
         if node and node.get("type") == "chart":
             # The chart has no table output. The preview is its input.
             incoming = edges_into(graph, node_id)
             if not incoming:
                 raise NodeError(node_id, "chart has no input")
-            result = values[incoming[0]["from"]]
+            result = input_value(values, incoming[0])
         if op == "export":
             path = job.get("output")
             if not path:
@@ -130,10 +214,10 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "generation": generation,
                 "mode": mode,
                 "node": node_id,
-                "claim": mode,
+                "claim": claim,
                 "error": None,
                 "computed": computed,
-                "inactive": [],
+                "inactive": inactive,
             }
         )
         if fit := take_fit(node_id):
@@ -209,6 +293,194 @@ def find_node(graph: dict[str, Any], node_id: str) -> dict[str, Any] | None:
     return None
 
 
+def value_of(values: dict[str, Any], node_id: str | None, from_port: str | None = None) -> Any:
+    """The value a node hands to a consumer. Multi-output nodes go per port."""
+    value = values.get(node_id)
+    if isinstance(value, Branch):
+        return value.outputs.get(from_port)
+    return value
+
+
+def input_value(values: dict[str, Any], edge: dict[str, Any]) -> Any:
+    """The value an edge carries. Edges name the output port they come from."""
+    return value_of(values, edge.get("from"), edge.get("from_port"))
+
+
+def wired_frame(graph: dict[str, Any], values: dict[str, Any], node_id: str, port: str) -> Any:
+    """The value on an input port, or None when nothing is wired."""
+    for edge in edges_into(graph, node_id, port):
+        return input_value(values, edge)
+    return None
+
+
+def _first_bindings(
+    graph: dict[str, Any],
+    start_id: str,
+    values: dict[str, Any],
+    base_dir: Path,
+    variables: dict[str, Any],
+) -> dict[str, Any] | None:
+    """The iteration bindings of the first iteration of a loop."""
+    from pipeline.vars import VarError, substitute_node
+
+    raw = find_node(graph, start_id)
+    if raw is None:
+        return None
+    try:
+        node, _ = substitute_node(raw, variables)
+    except VarError as exc:
+        raise NodeError(start_id, str(exc)) from exc
+    frame = wired_frame(graph, values, start_id, "in")
+    try:
+        iterations = loop_iterations(
+            node,
+            base_dir=base_dir,
+            input_frame=frame if isinstance(frame, pd.DataFrame) else None,
+        )
+    except FlowError as exc:
+        raise NodeError(start_id, str(exc)) from exc
+    if not iterations:
+        return None
+    return dict(iterations[0][1])
+
+
+def compute_loop_end(
+    graph: dict[str, Any],
+    loop_end_id: str,
+    values: dict[str, Any],
+    keys: dict[str, str],
+    *,
+    mode: str,
+    base_dir: Path,
+    overrides: dict[str, str],
+    variables: dict[str, Any],
+) -> tuple[Any, str, str | None]:
+    """Runs the body once per iteration and concatenates the results.
+
+    Returns (value, key, claim). Preview mode runs at most
+    LOOP_PREVIEW_CAP iterations and says so in the claim.
+    """
+    from pipeline.vars import VarError, substitute_node
+
+    node = find_node(graph, loop_end_id)
+    if node is None:
+        raise NodeError(loop_end_id, f"unknown node {loop_end_id}")
+    params = node.get("params") or {}
+    start_id = str(params.get("pair") or "")
+    raw_start = find_node(graph, start_id)
+    if raw_start is None or raw_start.get("type") != "loop_start":
+        raise NodeError(loop_end_id, "loop end is not paired with a loop start")
+    try:
+        start_node, _ = substitute_node(raw_start, variables)
+    except VarError as exc:
+        raise NodeError(start_id, str(exc)) from exc
+    name_param = str(start_node.get("params", {}).get("name") or "loop_value")
+    end_edges = edges_into(graph, loop_end_id, "in")
+    if not end_edges:
+        raise NodeError(loop_end_id, "loop end needs an input")
+    body_source = end_edges[0]["from"]
+    body_port = end_edges[0].get("from_port")
+    frame_in = wired_frame(graph, values, start_id, "in")
+    try:
+        iterations = loop_iterations(
+            start_node,
+            base_dir=base_dir,
+            input_frame=frame_in if isinstance(frame_in, pd.DataFrame) else None,
+        )
+    except FlowError as exc:
+        raise NodeError(start_id, str(exc)) from exc
+    try:
+        members = loop_members(graph, start_id, loop_end_id)
+    except NodeError as exc:
+        raise NodeError(loop_end_id, str(exc)) from exc
+    total = len(iterations)
+    preview = mode != "full"
+    run_count = min(total, LOOP_PREVIEW_CAP) if preview else total
+    results: list[tuple[Any, Any]] = []
+    for index in range(run_count):
+        label, extra, _frame = iterations[index]
+        local_vars = {**variables, **extra}
+        try:
+            value, key = compute_node(
+                graph,
+                start_id,
+                values,
+                keys,
+                mode=mode,
+                base_dir=base_dir,
+                overrides=overrides,
+                variables=local_vars,
+                key_extra=extra,
+            )
+            values[start_id] = value
+            keys[start_id] = key
+            for member in members:
+                value, key = compute_node(
+                    graph,
+                    member,
+                    values,
+                    keys,
+                    mode=mode,
+                    base_dir=base_dir,
+                    overrides=overrides,
+                    variables=local_vars,
+                    key_extra=extra,
+                )
+                values[member] = value
+                keys[member] = key
+        except NodeError as exc:
+            prefix = f"iteration {index + 1} ({label}): "
+            raise NodeError(exc.node, prefix + exc.message, exc.declared, exc.actual) from exc
+        value = value_of(values, body_source, body_port)
+        if value is SKIP:
+            continue
+        results.append((extra.get(name_param), value))
+    frames = [frame for _, frame in results]
+    if frames:
+        try:
+            out = pd.concat(frames, ignore_index=True)
+        except Exception as exc:  # noqa: BLE001
+            raise NodeError(loop_end_id, f"concat failed: {exc}") from exc
+    else:
+        out = pd.DataFrame()
+    add_column = params.get("add_column", True)
+    if add_column in (True, "true"):
+        # The loop column repeats the iteration value on every row the
+        # iteration contributed.
+        column_values: list[Any] = []
+        for item, frame in results:
+            column_values.extend([item] * len(frame))
+        if len(column_values) == len(out):
+            out.insert(0, name_param, column_values)
+        elif out.empty:
+            out = pd.DataFrame({name_param: column_values})
+    claim = None
+    if preview and total > LOOP_PREVIEW_CAP:
+        claim = f"preview · first {LOOP_PREVIEW_CAP} of {total} iterations"
+    # The key names the whole loop, so a body edit or a new iteration set
+    # invalidates everything downstream of the loop_end.
+    parent_keys = [
+        {
+            "from": edge["from"],
+            "out": edge.get("from_port"),
+            "port": edge.get("to_port"),
+            "key": keys.get(edge["from"]),
+        }
+        for edge in edges_into(graph, loop_end_id)
+    ]
+    record = {
+        "type": "loop_end",
+        "params": params,
+        "parents": parent_keys,
+        "mode": mode,
+        "override": overrides.get(loop_end_id),
+    }
+    key = hashlib.sha256(json.dumps(record, sort_keys=True, default=str).encode()).hexdigest()
+    _node_keys.setdefault(loop_end_id, set()).add(key)
+    _cache[key] = out
+    return out, key, claim
+
+
 def compute_node(
     graph: dict[str, Any],
     node_id: str,
@@ -219,6 +491,7 @@ def compute_node(
     base_dir: Path,
     overrides: dict[str, str],
     variables: dict[str, Any] | None = None,
+    key_extra: dict[str, Any] | None = None,
 ) -> tuple[Any, str]:
     from pipeline.vars import VarError, substitute_node
 
@@ -237,7 +510,12 @@ def compute_node(
         raise NodeError(node_id, str(exc)) from exc
     parent_edges = edges_into(graph, node_id)
     parent_keys = [
-        {"from": edge["from"], "port": edge.get("to_port"), "key": keys.get(edge["from"])}
+        {
+            "from": edge["from"],
+            "out": edge.get("from_port"),
+            "port": edge.get("to_port"),
+            "key": keys.get(edge["from"]),
+        }
         for edge in parent_edges
     ]
     record = {
@@ -251,11 +529,21 @@ def compute_node(
         "parents": parent_keys,
         "mode": mode,
         "override": overrides.get(node_id),
+        # Loop iteration bindings. Two iterations of the same body must not
+        # share a cache entry even when the substituted params agree.
+        "extra": key_extra or None,
     }
     key = hashlib.sha256(json.dumps(record, sort_keys=True, default=str).encode()).hexdigest()
     _node_keys.setdefault(node_id, set()).add(key)
     if key in _cache:
         return _cache[key], key
+    # A node fed by an inactive branch is skipped without executing. end_if
+    # is the merge point and looks at both inputs itself.
+    if node.get("type") != "end_if":
+        for edge in parent_edges:
+            if input_value(values, edge) is SKIP:
+                _cache[key] = SKIP
+                return SKIP, key
     stats["computed"] += 1
     value = execute(
         graph,
@@ -268,7 +556,7 @@ def compute_node(
         var_origins=var_origins,
     )
     declared = declared_type(node, graph, values)
-    if declared is not None:
+    if declared is not None and value is not SKIP and not isinstance(value, Branch):
         actual = actual_type(value, declared)
         if actual != declared:
             raise NodeError(
@@ -327,6 +615,10 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         "crosstab",
         "join",
         "merge_asof",
+        "loop_start",
+        "loop_end",
+        "if_switch",
+        "end_if",
     ):
         return "dataframe"
     if kind == "str" and str((node.get("params") or {}).get("method") or "") == "extract":
@@ -408,7 +700,8 @@ def input_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str, An
     parent = find_node(graph, incoming[0]["from"])
     if parent is None:
         return None
-    return declared_type(parent, graph, values) or actual_type(values.get(incoming[0]["from"]), None)
+    value = input_value(values, incoming[0])
+    return declared_type(parent, graph, values) or actual_type(value, None)
 
 
 def actual_type(value: Any, declared: str | None) -> str:
@@ -448,20 +741,28 @@ def execute(
     var_origins = var_origins or {}
 
     def wired(port: str) -> Any | None:
-        edges = edges_into(graph, node_id, port)
-        if not edges:
-            return None
-        return values.get(edges[0]["from"])
+        return wired_frame(graph, values, node_id, port)
 
     def require_frame_or_series(port: str = "in") -> Any:
         edges = edges_into(graph, node_id, port)
         if not edges:
             raise NodeError(node_id, f"{kind} needs an input")
-        value = values.get(edges[0]["from"])
+        value = input_value(values, edges[0])
         if not isinstance(value, (pd.DataFrame, pd.Series)):
             raise NodeError(node_id, f"{kind} expected a dataframe or a series")
         return value
 
+    if kind == "loop_start":
+        return loop_start_output(
+            node_id, node, params, graph, values, base_dir, variables
+        )
+    if kind == "if_switch":
+        return if_switch_output(node_id, graph, values, variables)
+    if kind == "end_if":
+        return end_if_output(graph, values, node_id)
+    if kind == "loop_end":
+        # Reaching execute means the pair never resolved.
+        raise NodeError(node_id, "loop end is not paired with a loop start")
     if kind == "read_csv":
         path = resolve_path(node_id, params, wired("path"), overrides, base_dir)
         return read_csv(node_id, path, preview, params)
@@ -599,6 +900,78 @@ def execute(
     if extra is not _MISSING:
         return extra
     raise NodeError(node_id, f"unknown feature {kind}")
+
+
+def loop_start_output(
+    node_id: str,
+    node: dict[str, Any],
+    params: dict[str, Any],
+    graph: dict[str, Any],
+    values: dict[str, Any],
+    base_dir: Path,
+    variables: dict[str, Any],
+) -> Any:
+    """The loop_start output for one iteration.
+
+    When the iteration bindings are in `variables` it produces that
+    iteration's frame; otherwise the first iteration's.
+    """
+    frame_in = wired_frame(graph, values, node_id, "in")
+    try:
+        iterations = loop_iterations(
+            node,
+            base_dir=base_dir,
+            input_frame=frame_in if isinstance(frame_in, pd.DataFrame) else None,
+        )
+    except FlowError as exc:
+        raise NodeError(node_id, str(exc)) from exc
+    if not iterations:
+        return pd.DataFrame()
+    name = str(params.get("name") or "loop_value")
+    chosen = None
+    if "loop_index" in variables and name in variables:
+        index = variables.get("loop_index")
+        for _label, bindings, frame in iterations:
+            if bindings.get("loop_index") == index:
+                chosen = frame
+                break
+    if chosen is None:
+        chosen = iterations[0][2]
+    return chosen
+
+
+def if_switch_output(
+    node_id: str,
+    graph: dict[str, Any],
+    values: dict[str, Any],
+    variables: dict[str, Any],
+) -> Any:
+    """Picks a branch. The selected port carries the input, the other SKIP.
+
+    The condition is read raw on purpose: `${name}` inside it is resolved by
+    the evaluator against `variables`, so substitution must not touch it.
+    """
+    raw = find_node(graph, node_id) or {}
+    text = str((raw.get("params") or {}).get("condition") or "")
+    frame = wired_frame(graph, values, node_id, "in")
+    if frame is not None and not isinstance(frame, pd.DataFrame):
+        raise NodeError(node_id, "if switch takes a dataframe")
+    try:
+        chosen = evaluate(text, variables, frame)
+    except FlowError as exc:
+        raise NodeError(node_id, str(exc)) from exc
+    source = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    return Branch({"true": source if chosen else SKIP, "false": SKIP if chosen else source})
+
+
+def end_if_output(graph: dict[str, Any], values: dict[str, Any], node_id: str) -> Any:
+    """The active branch input, or SKIP when both sides are inactive."""
+    for port in ("true", "false"):
+        for edge in edges_into(graph, node_id, port):
+            value = input_value(values, edge)
+            if value is not SKIP:
+                return value
+    return SKIP
 
 
 _MISSING = object()
@@ -990,13 +1363,11 @@ def merge_frames(node_id: str, graph: dict[str, Any], values: dict[str, Any], pa
         ports.append(extra.get("name"))
     frames = []
     for port in ports:
-        edges = edges_into(graph, node_id, port)
-        if not edges:
-            continue
-        value = values.get(edges[0]["from"])
-        if not isinstance(value, pd.DataFrame):
-            raise NodeError(node_id, f"{port} must be a dataframe")
-        frames.append(value)
+        for edge in edges_into(graph, node_id, port):
+            value = input_value(values, edge)
+            if not isinstance(value, pd.DataFrame):
+                raise NodeError(node_id, f"{port} must be a dataframe")
+            frames.append(value)
     if len(frames) < 2:
         raise NodeError(node_id, "merge needs two dataframes")
     how = str(params.get("how") or "inner")
@@ -1022,7 +1393,7 @@ def concat_frames(node_id: str, graph: dict[str, Any], node: dict[str, Any], val
             ports.append(name)
     for port in ports:
         for edge in edges_into(graph, node_id, port):
-            value = values.get(edge["from"])
+            value = input_value(values, edge)
             if not isinstance(value, (pd.DataFrame, pd.Series)):
                 raise NodeError(node_id, "concat takes dataframes or series")
             frames.append(value)
@@ -1093,7 +1464,7 @@ def run_python(
         edges = edges_into(graph, node_id, name)
         if not edges:
             raise NodeError(node_id, f"python input {name} is not connected")
-        kwargs[name] = values.get(edges[0]["from"])
+        kwargs[name] = input_value(values, edges[0])
     try:
         return fn(**kwargs)
     except Exception as exc:  # noqa: BLE001
