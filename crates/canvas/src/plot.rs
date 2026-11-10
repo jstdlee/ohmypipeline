@@ -322,6 +322,23 @@ fn series_names(points: &[PlotPoint]) -> Vec<String> {
     names
 }
 
+/// Legend entries (text, color) for a chart's series, or pie slices.
+/// The chart panel uses these to draw the freely placed legend.
+pub fn legend_entries(mark: &str, points: &[PlotPoint], colors: &[Hsla; 5]) -> Vec<(String, Hsla)> {
+    if mark == "pie" {
+        return points
+            .iter()
+            .take(8)
+            .map(|point| (point.x.clone(), colors[point.index % colors.len()]))
+            .collect();
+    }
+    series_names(points)
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), colors[index % colors.len()]))
+        .collect()
+}
+
 fn y_span(points: &[PlotPoint]) -> (f32, f32) {
     let mut min_y = f32::MAX;
     let mut max_y = f32::MIN;

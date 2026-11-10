@@ -22,7 +22,7 @@ use graph::{
     card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
 };
 
-use crate::layout::{self, Side, card_height, port_slots};
+use crate::layout::{self, Detail, Side, card_height, port_slots};
 use crate::motion;
 use crate::plot::{feature_chart, points_from};
 
@@ -1499,6 +1499,24 @@ impl Render for CanvasModel {
                     this.align("hcenter", cx);
                 } else if platform && event.keystroke.modifiers.shift && key == "h" {
                     this.align("distribute-h", cx);
+                } else if !platform
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                {
+                    // Tool shortcuts. Plain letters, so a paste chord never reaches them.
+                    let next = match key {
+                        "v" => Some(Tool::Select),
+                        "h" => Some(Tool::Hand),
+                        "r" => Some(Tool::Rectangle),
+                        "o" => Some(Tool::Circle),
+                        "t" => Some(Tool::Label),
+                        "n" => Some(Tool::Note),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.tool = next;
+                        cx.notify();
+                    }
                 }
             }))
             .track_focus(&self.focus)
@@ -2085,6 +2103,7 @@ fn card_element(
     let origin = node.position_point();
     let window = camera.to_window(Point::new(origin.x + offset.x, origin.y + offset.y));
     let width = px(card_width(&node.feature) * zoom);
+    let detail = layout::detail_for(zoom);
     let id = node.id.clone();
     let title = node.label.clone();
     let summary = node.summary();
@@ -2124,7 +2143,7 @@ fn card_element(
         paint.card
     };
 
-    div()
+    let mut card = div()
         .id(SharedString::from(format!("card-{id}")))
         .absolute()
         .left(px(window.x))
@@ -2159,49 +2178,18 @@ fn card_element(
                 cx.stop_propagation();
                 entity.update(cx, |this, cx| this.card_down(&id, event, window, cx));
             }
-        })
-        .child(
-            div()
-                .h(px(layout::HEADER * zoom))
-                .mt(px(layout::PAD_Y * zoom))
-                .px(px(10.0 * zoom))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0 * zoom))
-                .child(
-                    div()
-                        .w(px(3.0 * zoom))
-                        .h(px(14.0 * zoom))
-                        .rounded(px(2.0))
-                        .bg(accent),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .text_sm()
-                        .text_color(paint.fg)
-                        .child(title),
-                )
-                .child(div().size(px(7.0 * zoom)).rounded_full().bg(dot)),
-        )
-        .child(
-            div()
-                .h(px(layout::SUMMARY * zoom))
-                .px(px(10.0 * zoom))
-                .overflow_hidden()
-                .text_xs()
-                .text_color(paint.muted)
-                .font_family(paint.mono.clone())
-                .child(summary),
-        )
-        .child({
+        });
+    card = match detail {
+        Detail::Title => {
+            // One bold title, always 13 screen px so a distant card keeps its name.
+            // Port dots stay at the layout offsets, so wires still end on ports.
             let block = layout::PORT_ROW * rows as f32;
+            let port_top = (layout::PAD_Y + layout::HEADER + layout::SUMMARY) * zoom;
             let mut column = div()
-                .relative()
-                .mb(px(layout::PAD_Y * zoom))
+                .absolute()
+                .left(px(0.0))
+                .right(px(0.0))
+                .top(px(port_top))
                 .h(px(block * zoom));
             if inputs.len() <= 1 {
                 column = column.child(port_pair(
@@ -2211,6 +2199,7 @@ fn card_element(
                     output.as_ref(),
                     0.0,
                     zoom,
+                    detail,
                     graph,
                     link_from.clone(),
                     snap_target.clone(),
@@ -2225,6 +2214,7 @@ fn card_element(
                         None,
                         layout::PORT_ROW * index as f32,
                         zoom,
+                        detail,
                         graph,
                         link_from.clone(),
                         snap_target.clone(),
@@ -2240,6 +2230,7 @@ fn card_element(
                         Some(port),
                         top,
                         zoom,
+                        detail,
                         graph,
                         None,
                         None,
@@ -2247,16 +2238,138 @@ fn card_element(
                     ));
                 }
             }
-            column
-        })
-        .children(output_body(
-            node,
-            paint.frame.as_ref(),
-            selected,
-            reduced_motion,
-            &paint,
-        ))
-        .into_any_element()
+            let (size, line) = layout::text_with_zoom(13.0 / zoom, 1.0);
+            card.child(
+                div()
+                    .mt(px(layout::PAD_Y * zoom))
+                    .h(px((layout::HEADER * zoom).max(size.as_f32())))
+                    .px(px(10.0 * zoom))
+                    .flex()
+                    .items_center()
+                    .truncate()
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_size(size)
+                    .line_height(line)
+                    .text_color(paint.fg)
+                    .child(title),
+            )
+            .child(column)
+        }
+        Detail::Compact | Detail::Full => {
+            let (title_size, title_line) = layout::text_with_zoom(layout::TITLE_TEXT, zoom);
+            card
+                // The summary row keeps its height in every detail so the port
+                // block and the wires stay where the layout puts them.
+                .child(
+                    div()
+                        .h(px(layout::HEADER * zoom))
+                        .mt(px(layout::PAD_Y * zoom))
+                        .px(px(10.0 * zoom))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0 * zoom))
+                        .child(
+                            div()
+                                .w(px(3.0 * zoom))
+                                .h(px(14.0 * zoom))
+                                .rounded(px(2.0))
+                                .bg(accent),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(title_size)
+                                .line_height(title_line)
+                                .text_color(paint.fg)
+                                .child(title),
+                        )
+                        .child(div().size(px(7.0 * zoom)).rounded_full().bg(dot)),
+                )
+                .child(
+                    div()
+                        .h(px(layout::SUMMARY * zoom))
+                        .px(px(10.0 * zoom))
+                        .overflow_hidden()
+                        .when(detail == Detail::Full, |row| {
+                            let (size, line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
+                            row.text_size(size)
+                                .line_height(line)
+                                .text_color(paint.muted)
+                                .font_family(paint.mono.clone())
+                                .child(summary)
+                        }),
+                )
+                .child({
+                    let block = layout::PORT_ROW * rows as f32;
+                    let mut column = div()
+                        .relative()
+                        .mb(px(layout::PAD_Y * zoom))
+                        .h(px(block * zoom));
+                    if inputs.len() <= 1 {
+                        column = column.child(port_pair(
+                            entity.clone(),
+                            &id,
+                            inputs.first(),
+                            output.as_ref(),
+                            0.0,
+                            zoom,
+                            detail,
+                            graph,
+                            link_from.clone(),
+                            snap_target.clone(),
+                            &paint,
+                        ));
+                    } else {
+                        for (index, port) in inputs.iter().enumerate() {
+                            column = column.child(port_pair(
+                                entity.clone(),
+                                &id,
+                                Some(port),
+                                None,
+                                layout::PORT_ROW * index as f32,
+                                zoom,
+                                detail,
+                                graph,
+                                link_from.clone(),
+                                snap_target.clone(),
+                                &paint,
+                            ));
+                        }
+                        if let Some(port) = output.as_ref() {
+                            let top = (block - layout::PORT_ROW) * 0.5;
+                            column = column.child(port_pair(
+                                entity.clone(),
+                                &id,
+                                None,
+                                Some(port),
+                                top,
+                                zoom,
+                                detail,
+                                graph,
+                                None,
+                                None,
+                                &paint,
+                            ));
+                        }
+                    }
+                    column
+                })
+                .when(detail == Detail::Full, |card| {
+                    card.children(output_body(
+                        node,
+                        paint.frame.as_ref(),
+                        selected,
+                        reduced_motion,
+                        &paint,
+                        zoom,
+                    ))
+                })
+        }
+    };
+    card.into_any_element()
 }
 
 fn output_body(
@@ -2265,7 +2378,9 @@ fn output_body(
     selected: bool,
     reduced_motion: bool,
     paint: &CardPaint,
+    zoom: f32,
 ) -> Option<gpui_kit::AnyElement> {
+    let (size, line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
     if matches!(
         node.feature.as_str(),
         "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql"
@@ -2277,8 +2392,9 @@ fn output_body(
         };
         return Some(
             div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(color)
                 .child(text)
                 .into_any_element(),
@@ -2286,10 +2402,11 @@ fn output_body(
     }
     if node.feature == "preview_table" {
         return Some(match frame {
-            Some(frame) => mini_table(frame, paint),
+            Some(frame) => mini_table(frame, paint, zoom),
             None => div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.muted)
                 .child("Run preview")
                 .into_any_element(),
@@ -2301,8 +2418,9 @@ fn output_body(
     let Some(frame) = frame else {
         return Some(
             div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.muted)
                 .child("Run preview")
                 .into_any_element(),
@@ -2325,9 +2443,9 @@ fn output_body(
             &node.param_str("series"),
         ) {
             Ok(points) => div()
-                .h(px(168.0))
-                .px(px(6.0))
-                .pb(px(6.0))
+                .h(px(168.0 * zoom))
+                .px(px(6.0 * zoom))
+                .pb(px(6.0 * zoom))
                 .child(feature_chart(
                     &mark,
                     points,
@@ -2340,8 +2458,9 @@ fn output_body(
                 ))
                 .into_any_element(),
             Err(message) => div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.danger)
                 .child(message)
                 .into_any_element(),
@@ -2349,7 +2468,7 @@ fn output_body(
     )
 }
 
-fn mini_table(frame: &FrameView, paint: &CardPaint) -> gpui_kit::AnyElement {
+fn mini_table(frame: &FrameView, paint: &CardPaint, zoom: f32) -> gpui_kit::AnyElement {
     let count = frame.columns.len().min(4);
     let mut grid = div().px(px(8.0)).pb(px(6.0)).flex().flex_col().gap(px(2.0));
     grid = grid.child(mini_row(
@@ -2361,26 +2480,29 @@ fn mini_table(frame: &FrameView, paint: &CardPaint) -> gpui_kit::AnyElement {
             .collect::<Vec<_>>(),
         true,
         paint,
+        zoom,
     ));
     for row in frame.rows.iter().take(4) {
         let cells = (0..count)
             .map(|index| row.get(index).map(graph::cell_text).unwrap_or_default())
             .collect::<Vec<_>>();
-        grid = grid.child(mini_row(&cells, false, paint));
+        grid = grid.child(mini_row(&cells, false, paint, zoom));
     }
     grid.into_any_element()
 }
 
-fn mini_row(cells: &[String], header: bool, paint: &CardPaint) -> gpui_kit::Div {
-    let mut row = div().flex().flex_row().gap(px(6.0));
+fn mini_row(cells: &[String], header: bool, paint: &CardPaint, zoom: f32) -> gpui_kit::Div {
+    let (size, line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom);
+    let mut row = div().flex().flex_row().gap(px(6.0 * zoom));
     for cell in cells {
         let numeric = !header && cell.parse::<f64>().is_ok();
         row = row.child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .overflow_hidden()
-                .text_xs()
+                .truncate()
+                .text_size(size)
+                .line_height(line)
                 .when(numeric, |cell| cell.text_right())
                 .font_family(paint.mono.clone())
                 .text_color(if header { paint.fg } else { paint.muted })
@@ -2398,6 +2520,7 @@ fn port_pair(
     output: Option<&graph::PortRecord>,
     top: f32,
     zoom: f32,
+    detail: layout::Detail,
     graph: &graph::Graph,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
@@ -2426,6 +2549,7 @@ fn port_pair(
             port,
             Side::In,
             zoom,
+            detail,
             graph,
             link_from.clone(),
             snap_target.clone(),
@@ -2441,6 +2565,7 @@ fn port_pair(
             port,
             Side::Out,
             zoom,
+            detail,
             graph,
             None,
             None,
@@ -2457,13 +2582,13 @@ fn port_hit(
     port: &graph::PortRecord,
     side: Side,
     zoom: f32,
+    detail: layout::Detail,
     graph: &graph::Graph,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
     paint: &CardPaint,
 ) -> gpui_kit::AnyElement {
     let name = port.name.clone();
-    let caption = port_caption(&port.name, &port.accepts);
     let ty = port.accepts.first().copied().unwrap_or(TypeName::Dataframe);
     let color = type_color(ty, &paint.chart);
     let compatible = match (&link_from, side) {
@@ -2491,16 +2616,62 @@ fn port_hit(
         } else {
             color.opacity(0.45)
         });
+    // Port labels and type labels only when the camera is near enough
+    // for them to be read.
+    if detail != layout::Detail::Full {
+        let node_id = node_id.to_string();
+        return div()
+            .id(SharedString::from(format!(
+                "{}-{node_id}-{name}",
+                if side == Side::In { "in" } else { "out" }
+            )))
+            .flex()
+            .items_center()
+            .h(px(layout::PORT_ROW * zoom))
+            .child(dot)
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                cx.stop_propagation();
+                entity.update(cx, |this, cx| {
+                    this.port_down(&node_id, &name, side, event, window, cx);
+                });
+            })
+            .into_any_element();
+    }
+    let generic = name == "in" || name == "out" || name.is_empty();
+    let (label_size, label_line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
+    let (type_size, type_line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom);
     let label = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0 * zoom))
         .max_w(px(78.0 * zoom))
-        .overflow_hidden()
-        .text_xs()
-        .text_color(if dim {
-            paint.muted.opacity(0.4)
-        } else {
-            paint.muted
-        })
-        .child(caption);
+        .min_w(px(0.0))
+        .child(
+            div()
+                .truncate()
+                .text_size(label_size)
+                .line_height(label_line)
+                .text_color(if dim {
+                    paint.muted.opacity(0.4)
+                } else {
+                    paint.muted
+                })
+                .when(!generic, |label| label.child(name.clone())),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(type_size)
+                .line_height(type_line)
+                .font_family(paint.mono.clone())
+                .text_color(if dim {
+                    paint.muted.opacity(0.4)
+                } else {
+                    paint.muted.opacity(0.75)
+                })
+                .child(shorten_types(&port_caption("", &port.accepts))),
+        );
     let node_id = node_id.to_string();
     let row = div()
         .id(SharedString::from(format!(
@@ -2557,6 +2728,7 @@ fn mark_element(
         mark.text.clone()
     };
     let shape = matches!(mark.kind, MarkKind::Rectangle | MarkKind::Circle);
+    let (text_size, text_line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
     let mut body = div()
         .id(SharedString::from(format!("mark-{id}")))
         .absolute()
@@ -2567,7 +2739,8 @@ fn mark_element(
         .px(px(8.0 * zoom))
         .flex()
         .items_center()
-        .text_sm()
+        .text_size(text_size)
+        .line_height(text_line)
         .text_color(if placeholder { muted } else { fg })
         .when(mark.kind == MarkKind::Circle, |el| el.rounded_full())
         .when(mark.kind == MarkKind::Rectangle, |el| el.rounded(px(8.0)))

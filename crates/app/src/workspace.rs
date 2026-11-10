@@ -1,11 +1,14 @@
 //! Document window. Dock holds the palette, the canvas, the chart, the inspector, and the preview.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use canvas::{
-    CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, points_for_encodings, port_slots,
+    CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, legend_entries, points_for_encodings,
+    port_slots,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -24,13 +27,14 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, S
 use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window, actions, div, px,
+    App, AppContext as _, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div, px,
 };
 use graph::{
-    CHART_POINT_CAP, Job, JobOp, PREVIEW_ROW_CAP, RunMode, TABLE_WINDOW, ancestors, cell_text,
-    duplicate_headers, header_pairs, run_fingerprint, sinks, status_line,
+    CHART_POINT_CAP, Job, JobOp, PREVIEW_ROW_CAP, Presentation, RunMode, TABLE_WINDOW, ancestors,
+    cell_text, duplicate_headers, header_pairs, run_fingerprint, sinks, status_line,
 };
 use serde_json::{Value, json};
 
@@ -246,13 +250,20 @@ impl Workspace {
         let preview =
             cx.new(|cx| PreviewPanel::new(session.clone(), search_input.clone(), window, cx));
         let (dock, _) = DockSkin::dock_area("ohmypipeline", Some(1), window, cx);
+        // Restored sizes: the saved document wins per slot, then the user's
+        // last layout from the settings file, then the defaults.
+        let saved_dock = canvas.read(cx).editor().graph().view.dock;
+        let stored_dock = stored_dock_sizes();
+        let left_size = px(dock_size(saved_dock.left, stored_dock.left, 220.0));
+        let right_size = px(dock_size(saved_dock.right, stored_dock.right, 300.0));
+        let bottom_size = px(dock_size(saved_dock.bottom, stored_dock.bottom, 240.0));
         dock.update(cx, |area, cx| {
             let layout = DockLayout::v_split()
                 .child(
                     DockLayout::h_split()
                         .child(
                             DockLayout::tabs().panel_view(panel_handle(palette), cx),
-                            Some(px(220.)),
+                            Some(left_size),
                         )
                         .child(
                             DockLayout::tabs()
@@ -262,13 +273,13 @@ impl Workspace {
                         )
                         .child(
                             DockLayout::tabs().panel_view(panel_handle(inspector), cx),
-                            Some(px(300.)),
+                            Some(right_size),
                         ),
                     None,
                 )
                 .child(
                     DockLayout::tabs().panel_view(panel_handle(preview), cx),
-                    Some(px(240.)),
+                    Some(bottom_size),
                 );
             area.set_center(layout, window, cx);
         });
@@ -321,6 +332,26 @@ impl Workspace {
                     });
                 }
                 CanvasEvent::FocusInspector | CanvasEvent::OpenCatalog { .. } => {}
+            },
+        ));
+        // A finished split drag (or any structural dock edit) lands here. The
+        // current sizes go into the document view with no undo step and into
+        // the settings file, so a new untitled document opens the same way.
+        subs.push(cx.subscribe(
+            &dock,
+            move |this, area, event: &gpui_kit::component::dock::DockEvent, cx| {
+                if !matches!(event, gpui_kit::component::dock::DockEvent::LayoutChanged) {
+                    return;
+                }
+                let sizes = read_dock_sizes(area.read(cx));
+                save_dock_sizes(&sizes);
+                this.session.update(cx, |session, cx| {
+                    session.canvas.update(cx, |canvas, _| {
+                        let mut view = canvas.editor().graph().view;
+                        view.dock = sizes;
+                        canvas.editor_mut().set_view(view);
+                    });
+                });
             },
         ));
         // Replies are applied on the next frames while a run is in progress.
@@ -388,9 +419,18 @@ impl Workspace {
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
+        // The zoom and toolbar demos pin the camera themselves; the auto fit
+        // would overwrite it.
+        let keep_camera = matches!(
+            options.demo.as_deref(),
+            Some("zoom") | Some("zoom-in") | Some("toolbar")
+        );
         let session = workspace.session.clone();
         window.on_next_frame(move |window, _cx| {
             window.on_next_frame(move |_window, cx| {
+                if keep_camera {
+                    return;
+                }
                 session.update(cx, |session, cx| {
                     let empty = session.canvas.read(cx).editor().graph().nodes.is_empty();
                     if !empty {
@@ -616,12 +656,18 @@ impl Workspace {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
+        // Snapshot the live dock sizes into the view so the saved file
+        // restores the layout exactly as it is on screen.
+        let sizes = read_dock_sizes(self.dock.read(cx));
         let result: Result<(), String> = self.session.update(cx, |session, cx| {
             session.canvas.update(cx, |canvas, cx| {
                 let editor = canvas.editor_mut();
                 if editor.path().is_none() {
                     return Err("save-as".into());
                 }
+                let mut view = editor.graph().view;
+                view.dock = sizes;
+                editor.set_view(view);
                 editor.save().map_err(|err| err.to_string())?;
                 cx.emit(CanvasEvent::Edited);
                 Ok(())
@@ -635,9 +681,10 @@ impl Workspace {
         }
     }
 
-    fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match graph::Document::load(&path) {
             Ok(doc) => {
+                let saved = doc.graph().view.dock;
                 self.session.update(cx, |session, cx| {
                     session
                         .canvas
@@ -647,6 +694,7 @@ impl Workspace {
                     session.full_enabled = false;
                     cx.notify();
                 });
+                self.apply_dock_sizes(&saved, window, cx);
             }
             Err(err) => {
                 self.session.update(cx, |session, cx| {
@@ -655,6 +703,54 @@ impl Workspace {
                 });
             }
         }
+    }
+
+    /// Push saved split sizes for the palette, inspector, and preview docks
+    /// back into the layout. The middle slots absorb what the fixed slots
+    /// leave, computed from the measured area bounds.
+    fn apply_dock_sizes(
+        &mut self,
+        saved: &graph::DockSizes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if saved.left.is_none() && saved.right.is_none() && saved.bottom.is_none() {
+            return;
+        }
+        let stored = stored_dock_sizes();
+        let left = px(dock_size(saved.left, stored.left, 220.0));
+        let right = px(dock_size(saved.right, stored.right, 300.0));
+        let bottom = px(dock_size(saved.bottom, stored.bottom, 240.0));
+        if saved.left.is_none() && saved.right.is_none() {
+            return;
+        }
+        self.dock.update(cx, |area, cx| {
+            let bounds = area.bounds();
+            let width = (bounds.size.width.as_f32() - left.as_f32() - right.as_f32())
+                .max((gpui_kit::base::PANEL_MIN_SIZE * 2.0).as_f32());
+            let height = (bounds.size.height.as_f32() - bottom.as_f32())
+                .max((gpui_kit::base::PANEL_MIN_SIZE * 2.0).as_f32());
+            let Some(tree) = area.layout(gpui_kit::component::dock::DockPlacement::Center) else {
+                return;
+            };
+            let root = tree.root().clone();
+            let (root_node, main) = match root.kind() {
+                gpui_kit::component::dock::PaneRef::Split { children, .. } => {
+                    (root.id(), children.first().cloned())
+                }
+                _ => return,
+            };
+            let Some(main) = main.filter(|main| {
+                matches!(
+                    main.kind(),
+                    gpui_kit::component::dock::PaneRef::Split { .. }
+                )
+            }) else {
+                return;
+            };
+            area.set_split_sizes(root_node, vec![px(height), bottom], window, cx);
+            area.set_split_sizes(main.id(), vec![left, px(width), right], window, cx);
+        });
     }
 
     fn confirm_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -680,12 +776,14 @@ impl Workspace {
         }
         let save = matches!(kind, Some(PathKind::SaveAs));
         if save {
+            let sizes = read_dock_sizes(self.dock.read(cx));
             let result = self.session.update(cx, |session, cx| {
                 session.canvas.update(cx, |canvas, _| {
-                    canvas
-                        .editor_mut()
-                        .save_as(&path)
-                        .map_err(|err| err.to_string())
+                    let editor = canvas.editor_mut();
+                    let mut view = editor.graph().view;
+                    view.dock = sizes;
+                    editor.set_view(view);
+                    editor.save_as(&path).map_err(|err| err.to_string())
                 })
             });
             if let Err(err) = result {
@@ -700,7 +798,7 @@ impl Workspace {
                 });
             }
         } else {
-            self.open_path(path, cx);
+            self.open_path(path, window, cx);
         }
         let _ = window;
     }
@@ -1810,6 +1908,20 @@ fn load_demo(
             if demo != "reel-link" {
                 canvas.seed_link_drag(&column, "out", (592.0, 140.0), cx);
             }
+        } else if demo == "zoom" || demo == "zoom-in" || demo == "toolbar" {
+            canvas.load_document(doc, cx);
+            canvas.select_only(&headers, cx);
+            let camera = canvas.editor().graph().camera;
+            let zoom = match demo.as_str() {
+                "zoom" => 0.42,
+                "zoom-in" => 1.8,
+                _ => 1.0,
+            };
+            canvas.editor_mut().set_camera(graph::Camera {
+                x: camera.x,
+                y: camera.y,
+                zoom,
+            });
         } else {
             canvas.load_document(doc, cx);
             canvas.select_only(&headers, cx);
@@ -1852,6 +1964,74 @@ fn write_settings(mut body: impl FnMut(&mut serde_json::Map<String, Value>)) {
         body(map);
     }
     let _ = std::fs::write(dir.join("settings.json"), value.to_string());
+}
+
+/// Split sizes the user last used, from the settings file. A new untitled
+/// document opens with these.
+fn stored_dock_sizes() -> graph::DockSizes {
+    let value = read_settings();
+    let Some(dock) = value.get("dock") else {
+        return graph::DockSizes::default();
+    };
+    let pick = |name: &str| dock.get(name).and_then(Value::as_f64).map(|v| v as f32);
+    graph::DockSizes {
+        left: pick("left"),
+        right: pick("right"),
+        bottom: pick("bottom"),
+    }
+}
+
+fn save_dock_sizes(sizes: &graph::DockSizes) {
+    write_settings(|map| {
+        map.insert(
+            "dock".into(),
+            json!({
+                "left": sizes.left,
+                "right": sizes.right,
+                "bottom": sizes.bottom,
+            }),
+        );
+    });
+}
+
+fn dock_size(saved: Option<f32>, stored: Option<f32>, fallback: f32) -> f32 {
+    saved.or(stored).unwrap_or(fallback)
+}
+
+/// The current left, right, and bottom split sizes of the dock layout.
+/// The app builds the center as a vertical split of one horizontal split
+/// and the preview tabs, so the sizes read positionally.
+fn read_dock_sizes(area: &gpui_kit::component::dock::DockArea) -> graph::DockSizes {
+    let mut sizes = graph::DockSizes::default();
+    let Some(tree) = area.layout(gpui_kit::component::dock::DockPlacement::Center) else {
+        return sizes;
+    };
+    let root = tree.root().clone();
+    let (column, slot_sizes) = match root.kind() {
+        gpui_kit::component::dock::PaneRef::Split {
+            children, sizes, ..
+        } => (children.to_vec(), sizes.to_vec()),
+        _ => return sizes,
+    };
+    // The bottom slot is the second slot of the vertical split.
+    if column.len() == 2
+        && let Some(bottom) = slot_sizes.get(1).copied().flatten()
+    {
+        sizes.bottom = Some(bottom.as_f32());
+    }
+    // The top row is a horizontal split of palette, canvas, inspector.
+    let Some(main) = column.first() else {
+        return sizes;
+    };
+    if let gpui_kit::component::dock::PaneRef::Split {
+        sizes: row_sizes, ..
+    } = main.kind()
+        && row_sizes.len() == 3
+    {
+        sizes.left = row_sizes[0].map(|size| size.as_f32());
+        sizes.right = row_sizes[2].map(|size| size.as_f32());
+    }
+    sizes
 }
 
 fn save_reduced_motion(reduced: bool) {
@@ -2160,15 +2340,18 @@ impl Render for GraphPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tool = self.canvas.read(cx).tool();
         let canvas = self.canvas.clone();
+        let theme = cx.theme();
         div()
             .size_full()
             .relative()
             .child(self.canvas.clone())
+            // Floating toolbar at the top-center of the canvas.
             .child(
                 div()
                     .absolute()
-                    .bottom(px(12.0))
-                    .w_full()
+                    .top(px(12.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
                     .flex()
                     .justify_center()
                     .child(
@@ -2176,93 +2359,188 @@ impl Render for GraphPanel {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_1()
-                            .px_1()
-                            .py(px(2.0))
+                            .h(px(36.0))
+                            .px(px(2.0))
+                            .gap(px(1.0))
                             .rounded(px(8.0))
-                            .bg(cx.theme().background)
+                            .bg(theme.background)
                             .border_1()
-                            .border_color(cx.theme().border)
-                            .child(canvas_tool(
+                            .border_color(theme.border)
+                            .shadow_sm()
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-select",
                                 IconName::MousePointer2,
-                                "Select",
+                                "Select (V)",
+                                "Select · V",
                                 tool == Tool::Select,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Select,
                             ))
-                            .child(canvas_tool(
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-hand",
                                 IconName::Hand,
-                                "Hand",
+                                "Hand (H)",
+                                "Hand · H",
                                 tool == Tool::Hand,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Hand,
                             ))
-                            .child(canvas_tool(
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-rect",
                                 IconName::Square,
-                                "Rectangle",
+                                "Rectangle (R)",
+                                "Rectangle · R",
                                 tool == Tool::Rectangle,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Rectangle,
                             ))
-                            .child(canvas_tool(
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-circle",
                                 IconName::Circle,
-                                "Circle",
+                                "Circle (O)",
+                                "Circle · O",
                                 tool == Tool::Circle,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Circle,
                             ))
-                            .child(canvas_tool(
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-label",
                                 IconName::Type,
-                                "Label",
+                                "Label (T)",
+                                "Label · T",
                                 tool == Tool::Label,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Label,
                             ))
-                            .child(canvas_tool(
+                            .child(toolbar_button(
                                 &canvas,
                                 "tool-note",
                                 IconName::StickyNote,
-                                "Note",
+                                "Note (N)",
+                                "Note · N",
                                 tool == Tool::Note,
+                                theme.accent,
+                                theme.accent_foreground,
                                 Tool::Note,
+                            ))
+                            .child(div().w(px(1.0)).h(px(18.0)).mx_1().bg(theme.border))
+                            .child(history_toolbar_button(
+                                &canvas,
+                                "tool-undo",
+                                IconName::Undo2,
+                                "Undo",
+                                |canvas, cx| canvas.undo(cx),
+                            ))
+                            .child(history_toolbar_button(
+                                &canvas,
+                                "tool-redo",
+                                IconName::Redo2,
+                                "Redo",
+                                |canvas, cx| canvas.redo(cx),
+                            ))
+                            .child(history_toolbar_button(
+                                &canvas,
+                                "tool-fit",
+                                IconName::Maximize,
+                                "Zoom to fit",
+                                |canvas, cx| canvas.fit_all(cx),
                             )),
                     ),
             )
     }
 }
 
-fn canvas_tool(
+#[allow(clippy::too_many_arguments)]
+fn toolbar_button(
     canvas: &Entity<CanvasModel>,
     id: &str,
     icon: IconName,
     label: &str,
+    tooltip: &str,
     selected: bool,
+    accent: gpui_kit::Hsla,
+    accent_foreground: gpui_kit::Hsla,
     tool: Tool,
 ) -> gpui_kit::component::button::Button {
     let canvas = canvas.clone();
     Button::new(SharedString::from(id.to_string()))
         .ghost()
-        .compact()
+        .with_size(px(28.0))
         .icon(icon)
-        .selected(selected)
+        .tooltip(tooltip.to_string())
+        .accessibility_label(label.to_string())
+        .when(selected, |button| {
+            button.bg(accent).text_color(accent_foreground)
+        })
+        .on_click(move |_, _, cx| {
+            canvas.update(cx, |canvas, cx| canvas.set_tool(tool, cx));
+        })
+}
+
+fn history_toolbar_button<F>(
+    canvas: &Entity<CanvasModel>,
+    id: &str,
+    icon: IconName,
+    label: &str,
+    run: F,
+) -> gpui_kit::component::button::Button
+where
+    F: Fn(&mut CanvasModel, &mut gpui_kit::Context<CanvasModel>) + 'static,
+{
+    let canvas = canvas.clone();
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .with_size(px(28.0))
+        .icon(icon)
         .tooltip(label.to_string())
         .accessibility_label(label.to_string())
         .on_click(move |_, _, cx| {
-            canvas.update(cx, |canvas, cx| canvas.set_tool(tool, cx));
+            canvas.update(cx, |canvas, cx| run(canvas, cx));
         })
 }
 
 struct ChartPanel {
     focus: FocusHandle,
     session: Entity<Session>,
-    drag: Option<(f32, f32)>,
+    /// Live drag of the title or the legend across the plot box.
+    drag: Option<ChartDrag>,
+    /// Which placed element the pointer is over.
+    hover: Option<ChartTrack>,
+    /// Bounds recorded during the last paint, for fraction math.
+    plot_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    title_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    legend_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     _sub: Subscription,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChartTrack {
+    Title,
+    Legend,
+}
+
+#[derive(Clone, Debug)]
+struct ChartDrag {
+    track: ChartTrack,
+    node_id: String,
+    /// Fractions the element held when the drag began.
+    origin: (f32, f32),
+    /// Live fractions while the drag runs.
+    live: (f32, f32),
+    start: Point<Pixels>,
+    box_bounds: Bounds<Pixels>,
+}
+
 impl ChartPanel {
     fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
         let sub = cx.observe(&session, |_, _, cx| cx.notify());
@@ -2270,7 +2548,19 @@ impl ChartPanel {
             focus: cx.focus_handle(),
             session,
             drag: None,
+            hover: None,
+            plot_bounds: Rc::new(RefCell::new(None)),
+            title_bounds: Rc::new(RefCell::new(None)),
+            legend_bounds: Rc::new(RefCell::new(None)),
             _sub: sub,
+        }
+    }
+
+    /// Fractions to draw for a track, honoring an active drag.
+    fn placed(&self, track: ChartTrack, base: (f32, f32)) -> (f32, f32) {
+        match self.drag.as_ref().filter(|drag| drag.track == track) {
+            Some(drag) => drag.live,
+            None => base,
         }
     }
 }
@@ -2295,7 +2585,7 @@ impl Panel for ChartPanel {
 }
 impl Render for ChartPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (node, rows, columns, n, reduced, error) = {
+        let (node, rows, columns, n, reduced, error, readonly) = {
             let session = self.session.read(cx);
             let canvas = session.canvas.read(cx);
             (
@@ -2308,6 +2598,7 @@ impl Render for ChartPanel {
                 session.n,
                 session.reduced_motion,
                 session.error.clone(),
+                canvas.editor().is_readonly(),
             )
         };
         let Some(node) = node else {
@@ -2358,10 +2649,11 @@ impl Render for ChartPanel {
                         .into_any_element();
                 }
             };
-        let title = node
-            .presentation
-            .as_ref()
-            .and_then(|item| item.title.text.clone())
+        let presentation = node.presentation.clone().unwrap_or_default();
+        let title = presentation
+            .title
+            .text
+            .clone()
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| node.label.clone());
         let colors = [
@@ -2371,6 +2663,7 @@ impl Render for ChartPanel {
             cx.theme().chart_4,
             cx.theme().chart_5,
         ];
+        let legend_items = legend_entries(&mark, &points, &colors);
         let log_note = chart_limitation(&node);
         let note = if error.is_some() {
             error.unwrap_or_default()
@@ -2379,7 +2672,6 @@ impl Render for ChartPanel {
         } else {
             "preview · the chart draws this window".into()
         };
-        let _ = self.drag;
         let plot = if matches!(mark.as_str(), "area" | "scatter") {
             FeaturePlot {
                 mark: mark.clone(),
@@ -2400,14 +2692,216 @@ impl Render for ChartPanel {
                 &log_note,
             )
         };
+        let theme_fg = cx.theme().foreground;
+        let box_bounds = (*self.plot_bounds.borrow()).unwrap_or_default();
+        let title_size = (*self.title_bounds.borrow())
+            .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()))
+            .unwrap_or((0.0, 0.0));
+        let legend_size = (*self.legend_bounds.borrow())
+            .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()))
+            .unwrap_or((0.0, 0.0));
+        let (title_fx, title_fy) = self.placed(
+            ChartTrack::Title,
+            (presentation.title.x, presentation.title.y),
+        );
+        let (legend_fx, legend_fy) = self.placed(
+            ChartTrack::Legend,
+            (presentation.legend.x, presentation.legend.y),
+        );
+        let (title_left, title_top) = anchor_point(
+            presentation.title.anchor,
+            (title_fx, title_fy),
+            &box_bounds,
+            title_size,
+        );
+        let (legend_left, legend_top) = anchor_point(
+            presentation.legend.anchor,
+            (legend_fx, legend_fy),
+            &box_bounds,
+            legend_size,
+        );
+        let title_node_id = node.id.clone();
+        let legend_node_id = node.id.clone();
+        let reset_title_id = node.id.clone();
+        let reset_legend_id = node.id.clone();
+        let title_base = (presentation.title.x, presentation.title.y);
+        let legend_base = (presentation.legend.x, presentation.legend.y);
+        let plot_bounds_cell = self.plot_bounds.clone();
+        let title_bounds_cell = self.title_bounds.clone();
+        let legend_bounds_cell = self.legend_bounds.clone();
+        let title_hover = self.hover == Some(ChartTrack::Title);
+        let legend_hover = self.hover == Some(ChartTrack::Legend);
+        let title_drag = self.drag.as_ref().map(|drag| drag.track) == Some(ChartTrack::Title);
+        let legend_drag = self.drag.as_ref().map(|drag| drag.track) == Some(ChartTrack::Legend);
+        let mut legend_row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap_2()
+            .px(px(2.0));
+        for (name, color) in &legend_items {
+            legend_row = legend_row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(div().size(px(8.0)).rounded_full().bg(*color))
+                    .child(div().text_xs().text_color(theme_fg).child(name.clone())),
+            );
+        }
         div()
             .size_full()
             .flex()
             .flex_col()
             .p_4()
             .gap_2()
-            .child(div().text_sm().child(title))
-            .child(div().flex_1().min_h(px(160.)).child(plot))
+            .child(
+                div()
+                    .id("chart-box")
+                    .relative()
+                    .flex_1()
+                    .min_h(px(160.))
+                    .child(plot)
+                    // Records the plot box bounds for fraction math.
+                    .child(
+                        gpui_kit::canvas(
+                            move |bounds, _, _| *plot_bounds_cell.borrow_mut() = Some(bounds),
+                            move |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .when(!readonly, |box_element| {
+                        box_element
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                if this.drag.is_none() {
+                                    return;
+                                }
+                                this.drag_move(event.position);
+                                cx.notify();
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                                    if this.drag.take().is_none() {
+                                        return;
+                                    }
+                                    this.drag_commit(event.position, cx);
+                                    cx.notify();
+                                }),
+                            )
+                    })
+                    .when(!title.is_empty(), |box_element| {
+                        box_element.child(
+                            div()
+                                .id("chart-title")
+                                .absolute()
+                                .left(px(title_left))
+                                .top(px(title_top))
+                                .max_w(px(box_bounds.size.width.as_f32() * 0.8))
+                                .px_1()
+                                .text_sm()
+                                .text_color(theme_fg)
+                                .truncate()
+                                .when(title_hover || title_drag, |element| {
+                                    element
+                                        .border_1()
+                                        .border_dashed()
+                                        .rounded(px(4.0))
+                                        .border_color(theme_fg.opacity(0.5))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .child(title)
+                                .child(
+                                    gpui_kit::canvas(
+                                        move |bounds, _, _| {
+                                            *title_bounds_cell.borrow_mut() = Some(bounds)
+                                        },
+                                        move |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                )
+                                .on_mouse_down(MouseButton::Left, {
+                                    let node_id = title_node_id;
+                                    let reset_id = reset_title_id;
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        if event.click_count >= 2 {
+                                            this.drag = None;
+                                            this.reset_track(ChartTrack::Title, &reset_id, cx);
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.drag_start(
+                                            ChartTrack::Title,
+                                            &node_id,
+                                            title_base,
+                                            event.position,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    })
+                                })
+                                .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                                    this.set_hover(ChartTrack::Title, *over, cx);
+                                })),
+                        )
+                    })
+                    .when(!legend_items.is_empty(), |box_element| {
+                        box_element.child(
+                            div()
+                                .id("chart-legend")
+                                .absolute()
+                                .left(px(legend_left))
+                                .top(px(legend_top))
+                                .max_w(px(box_bounds.size.width.as_f32() * 0.6))
+                                .when(legend_hover || legend_drag, |element| {
+                                    element
+                                        .border_1()
+                                        .border_dashed()
+                                        .rounded(px(4.0))
+                                        .border_color(theme_fg.opacity(0.5))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .child(legend_row)
+                                .child(
+                                    gpui_kit::canvas(
+                                        move |bounds, _, _| {
+                                            *legend_bounds_cell.borrow_mut() = Some(bounds)
+                                        },
+                                        move |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                )
+                                .on_mouse_down(MouseButton::Left, {
+                                    let node_id = legend_node_id;
+                                    let reset_id = reset_legend_id;
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        if event.click_count >= 2 {
+                                            this.drag = None;
+                                            this.reset_track(ChartTrack::Legend, &reset_id, cx);
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.drag_start(
+                                            ChartTrack::Legend,
+                                            &node_id,
+                                            legend_base,
+                                            event.position,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    })
+                                })
+                                .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                                    this.set_hover(ChartTrack::Legend, *over, cx);
+                                })),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .text_xs()
@@ -2416,6 +2910,152 @@ impl Render for ChartPanel {
             )
             .into_any_element()
     }
+}
+
+impl ChartPanel {
+    fn set_hover(&mut self, track: ChartTrack, over: bool, cx: &mut Context<Self>) {
+        if over {
+            if self.hover != Some(track) {
+                self.hover = Some(track);
+                cx.notify();
+            }
+        } else if self.hover == Some(track) {
+            self.hover = None;
+            cx.notify();
+        }
+    }
+
+    fn drag_start(
+        &mut self,
+        track: ChartTrack,
+        node_id: &str,
+        origin: (f32, f32),
+        start: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(box_bounds) = *self.plot_bounds.borrow() else {
+            return;
+        };
+        if self.session.read(cx).canvas.read(cx).editor().is_readonly() {
+            return;
+        }
+        self.drag = Some(ChartDrag {
+            track,
+            node_id: node_id.to_string(),
+            origin,
+            live: origin,
+            start,
+            box_bounds,
+        });
+    }
+
+    fn drag_move(&mut self, at: Point<Pixels>) {
+        let Some(mut drag) = self.drag.clone() else {
+            return;
+        };
+        let width = drag.box_bounds.size.width.as_f32().max(1.0);
+        let height = drag.box_bounds.size.height.as_f32().max(1.0);
+        let dx = (at.x - drag.start.x).as_f32();
+        let dy = (at.y - drag.start.y).as_f32();
+        let live = (
+            (drag.origin.0 + dx / width).clamp(0.0, 1.0),
+            (drag.origin.1 + dy / height).clamp(0.0, 1.0),
+        );
+        drag.live = live;
+        self.drag = Some(drag);
+    }
+
+    fn drag_commit(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag_move(at);
+        let Some(drag) = self.drag.clone() else {
+            return;
+        };
+        self.drag = None;
+        let node_id = drag.node_id.clone();
+        let (x, y) = drag.live;
+        self.session.update(cx, |session, cx| {
+            let mut next = session
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .node(&node_id)
+                .and_then(|node| node.presentation.clone())
+                .unwrap_or_default();
+            match drag.track {
+                ChartTrack::Title => {
+                    next.title.x = x;
+                    next.title.y = y;
+                }
+                ChartTrack::Legend => {
+                    next.legend.x = x;
+                    next.legend.y = y;
+                }
+            }
+            session.canvas.update(cx, |canvas, cx| {
+                canvas.editor_mut().set_presentation(&node_id, next);
+                cx.notify();
+            });
+        });
+    }
+
+    /// Double-click on a placed element puts it back at the default spot.
+    fn reset_track(&mut self, track: ChartTrack, node_id: &str, cx: &mut Context<Self>) {
+        self.session.update(cx, |session, cx| {
+            let mut next = session
+                .canvas
+                .read(cx)
+                .editor()
+                .graph()
+                .node(node_id)
+                .and_then(|node| node.presentation.clone())
+                .unwrap_or_default();
+            match track {
+                ChartTrack::Title => {
+                    next.title.x = Presentation::default().title.x;
+                    next.title.y = Presentation::default().title.y;
+                    next.title.anchor = Presentation::default().title.anchor;
+                }
+                ChartTrack::Legend => {
+                    next.legend.x = Presentation::default().legend.x;
+                    next.legend.y = Presentation::default().legend.y;
+                    next.legend.anchor = Presentation::default().legend.anchor;
+                }
+            }
+            session.canvas.update(cx, |canvas, cx| {
+                canvas.editor_mut().set_presentation(node_id, next);
+                cx.notify();
+            });
+        });
+    }
+}
+
+/// Window pixels for a placed element, from its anchor and fractions of the
+/// plot box.
+fn anchor_point(
+    anchor: graph::Anchor,
+    (x, y): (f32, f32),
+    box_bounds: &Bounds<Pixels>,
+    element: (f32, f32),
+) -> (f32, f32) {
+    let width = box_bounds.size.width.as_f32();
+    let height = box_bounds.size.height.as_f32();
+    let (element_width, element_height) = element;
+    let point = match anchor {
+        graph::Anchor::TopStart => (x * width, y * height),
+        graph::Anchor::Top => (x * width - element_width * 0.5, y * height),
+        graph::Anchor::TopEnd => (x * width - element_width, y * height),
+        graph::Anchor::Start => (x * width, y * height - element_height * 0.5),
+        graph::Anchor::Center => (
+            x * width - element_width * 0.5,
+            y * height - element_height * 0.5,
+        ),
+        graph::Anchor::End => (x * width - element_width, y * height - element_height * 0.5),
+        graph::Anchor::BottomStart => (x * width, y * height - element_height),
+        graph::Anchor::Bottom => (x * width - element_width * 0.5, y * height - element_height),
+        graph::Anchor::BottomEnd => (x * width - element_width, y * height - element_height),
+    };
+    (point.0, point.1)
 }
 
 struct InspectorPanel {
@@ -3167,12 +3807,21 @@ impl Render for InspectorPanel {
             .p_3()
             .gap_2()
             .overflow_y_scrollbar();
-        body = body.child(div().text_sm().child(node.label.clone()));
         body = body.child(
             div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(node.feature.clone()),
+                .id("inspector-title")
+                .truncate()
+                .text_sm()
+                .child(node.label.clone())
+                .tooltip({
+                    let feature = node.feature.clone();
+                    move |_window, cx| {
+                        // The internal feature id lives in the tooltip so the
+                        // inspector keeps one line under the title.
+                        gpui_kit::component::tooltip::Tooltip::new(feature.clone())
+                            .build(_window, cx)
+                    }
+                }),
         );
         if let Some(fitted) = node.fitted.clone() {
             body = body.child(fit_summary(&fitted));
@@ -4318,7 +4967,10 @@ impl TableDelegate for PreviewTable {
 
 pub fn run_gui(options: GuiOptions) {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        // AllAssets embeds every bundled icon. Assets (the whitelist bundle)
+        // leaves tool icons such as MousePointer2 and Hand out, so they draw
+        // as empty boxes.
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.bind_keys(vec![

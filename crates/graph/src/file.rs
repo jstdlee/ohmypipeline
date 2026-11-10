@@ -248,6 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn presentation_round_trips_through_save_and_load() {
+        let mut graph = round_trip_fixture();
+        let presentation = crate::model::Presentation {
+            title: crate::model::Placed {
+                text: Some("Revenue by month".into()),
+                x: 0.25,
+                y: 0.75,
+                anchor: crate::model::Anchor::BottomStart,
+            },
+            legend: crate::model::Placed {
+                text: None,
+                x: 0.1,
+                y: 0.9,
+                anchor: crate::model::Anchor::End,
+            },
+            hidden_series: vec!["qty".into()],
+        };
+        graph.nodes[0].presentation = Some(presentation.clone());
+        let text = to_json(&graph).unwrap();
+        let loaded = load_str(&text).unwrap();
+        assert_eq!(loaded.nodes[0].presentation, Some(presentation));
+        assert_eq!(loaded.nodes[0].presentation, graph.nodes[0].presentation);
+    }
+
+    #[test]
     fn frames_variables_view_and_reroutes_round_trip() {
         let loaded = load_str(&to_json(&round_trip_fixture()).unwrap()).unwrap();
         assert_eq!(loaded.frames, round_trip_fixture().frames);

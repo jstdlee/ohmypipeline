@@ -10,6 +10,38 @@ pub const HEADER: f32 = 28.0;
 pub const SUMMARY: f32 = 16.0;
 pub const PAD_Y: f32 = 8.0;
 
+/// Text bases. A card draws every glyph at `BASE * zoom` so the letters
+/// shrink and grow with the same camera as the card box.
+pub const TITLE_TEXT: f32 = 12.0;
+pub const BODY_TEXT: f32 = 11.0;
+pub const TYPE_TEXT: f32 = 10.0;
+
+/// How much of a card the camera can still ask a card to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Detail {
+    /// Everything: title, summary, port labels, inline body.
+    Full,
+    /// Title and port dots only, so distant cards stay quiet.
+    Compact,
+    /// A single bold title. For very distant cards.
+    Title,
+}
+
+pub fn detail_for(zoom: f32) -> Detail {
+    if zoom >= 0.55 {
+        Detail::Full
+    } else if zoom >= 0.3 {
+        Detail::Compact
+    } else {
+        Detail::Title
+    }
+}
+
+/// Line height that tracks a text base the way the card box tracks the zoom.
+pub fn text_with_zoom(base: f32, zoom: f32) -> (gpui_kit::Pixels, gpui_kit::Pixels) {
+    (gpui_kit::px(base * zoom), gpui_kit::px(base * zoom * 1.25))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     In,
@@ -175,6 +207,16 @@ mod tests {
         assert!(cubic.c1.x - cubic.from.x < 48.0);
         assert!(cubic.c1.x < 320.0);
         assert!(cubic.c2.x < cubic.from.x);
+    }
+
+    #[test]
+    fn detail_levels_follow_the_zoom_thresholds() {
+        assert_eq!(detail_for(0.9), Detail::Full);
+        assert_eq!(detail_for(0.55), Detail::Full);
+        assert_eq!(detail_for(0.549), Detail::Compact);
+        assert_eq!(detail_for(0.3), Detail::Compact);
+        assert_eq!(detail_for(0.299), Detail::Title);
+        assert_eq!(detail_for(0.05), Detail::Title);
     }
 
     #[test]
