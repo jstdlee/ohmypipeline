@@ -174,7 +174,7 @@ impl Session {
 }
 
 pub struct Workspace {
-    session: Entity<Session>,
+    pub(crate) session: Entity<Session>,
     dock: Entity<DockArea>,
     focus: FocusHandle,
     polling: bool,
@@ -183,6 +183,9 @@ pub struct Workspace {
     model_name: Entity<InputState>,
     model_key: Entity<InputState>,
     model_open: bool,
+    /// The node search popover, when open.
+    pub(crate) node_search: Option<crate::node_search::NodeSearch>,
+    pub(crate) node_search_input: Entity<InputState>,
     #[allow(dead_code)]
     search_input: Entity<InputState>,
     _subs: Vec<Subscription>,
@@ -243,6 +246,7 @@ impl Workspace {
             state.set_value(stored_model.key, window, cx);
         });
         let search_input = cx.new(|cx| InputState::new(window, cx));
+        let node_search_input = cx.new(|cx| InputState::new(window, cx));
         let palette = cx.new(|cx| PalettePanel::new(session.clone(), window, cx));
         let graph_panel = cx.new(|cx| GraphPanel::new(canvas.clone(), cx));
         let chart = cx.new(|cx| ChartPanel::new(session.clone(), cx));
@@ -331,9 +335,36 @@ impl Workspace {
                         cx.notify();
                     });
                 }
-                CanvasEvent::FocusInspector | CanvasEvent::OpenCatalog { .. } => {}
+                CanvasEvent::FocusInspector => {}
+                CanvasEvent::OpenCatalog {
+                    from,
+                    to,
+                    ty,
+                    at,
+                    screen,
+                } => {
+                    this.open_node_search(
+                        crate::node_search::NodeSearch {
+                            from: from.clone(),
+                            to: to.clone(),
+                            ty: *ty,
+                            at: *at,
+                            screen: *screen,
+                            query: String::new(),
+                            highlight: 0,
+                            opened: std::time::Instant::now(),
+                        },
+                        window,
+                        cx,
+                    );
+                }
             },
         ));
+        subs.push(
+            cx.subscribe(&node_search_input, |this, input, event: &InputEvent, cx| {
+                crate::node_search::watch_node_search_input(this, &input, event, cx);
+            }),
+        );
         // A finished split drag (or any structural dock edit) lands here. The
         // current sizes go into the document view with no undo step and into
         // the settings file, so a new untitled document opens the same way.
@@ -377,6 +408,8 @@ impl Workspace {
             model_name,
             model_key,
             model_open: options.demo.as_deref() == Some("assist"),
+            node_search: None,
+            node_search_input,
             search_input,
             _subs: subs,
         };
@@ -457,6 +490,37 @@ impl Workspace {
             let started = std::time::Instant::now();
             window.on_next_frame(move |window, cx| {
                 play_reel(demo, session, started, window, cx);
+            });
+        }
+        // The search demo opens the popover as if a wire from the last node's
+        // output was dropped on empty canvas, two frames in so the camera
+        // fit has already happened.
+        if options.demo.as_deref() == Some("search") {
+            let session = workspace.session.clone();
+            window.on_next_frame(move |window, _cx| {
+                window.on_next_frame(move |_window, cx| {
+                    session.update(cx, |session, cx| {
+                        let Some(id) = session
+                            .canvas
+                            .read(cx)
+                            .editor()
+                            .graph()
+                            .nodes
+                            .last()
+                            .map(|node| node.id.clone())
+                        else {
+                            return;
+                        };
+                        session.canvas.update(cx, |canvas, cx| {
+                            canvas.seed_search_drop(
+                                &id,
+                                "out",
+                                graph::Point::new(880.0, 140.0),
+                                cx,
+                            );
+                        });
+                    });
+                });
             });
         }
         workspace
@@ -979,6 +1043,10 @@ impl Render for Workspace {
                 cx,
             )))
             .child(div().flex_1().min_h(px(0.)).child(self.dock.clone()))
+            .when(self.node_search.is_some(), |root| {
+                let popover = self.render_node_search(window, cx);
+                root.child(popover)
+            })
             .when(prompt, |this| {
                 this.child(
                     div()
@@ -1822,6 +1890,36 @@ fn load_demo(
             json!([{"from": "amount", "to": "revenue"}, {"from": "region", "to": ""}]),
         );
         let _ = doc.connect(&head, "out", &headers, "in");
+        if demo == "reroute" {
+            let mut doc = graph::Document::new();
+            let read = doc
+                .add_node("read_csv", graph::Point::new(48.0, 80.0))
+                .unwrap();
+            doc.set_param(&read, "path", json!(csv.display().to_string()));
+            doc.set_label(&read, "orders.csv".into());
+            let head = doc
+                .add_node("head", graph::Point::new(520.0, 80.0))
+                .unwrap();
+            doc.set_param(&head, "n", json!(5));
+            let headers = doc
+                .add_node("change_headers", graph::Point::new(992.0, 80.0))
+                .unwrap();
+            doc.set_param(
+                &headers,
+                "mapping",
+                json!([{"from": "amount", "to": "revenue"}]),
+            );
+            let _ = doc.connect(&read, "out", &head, "in");
+            let _ = doc.connect(&head, "out", &headers, "in");
+            // Two bend points on the first wire so it dips down and back up.
+            if let Some(edge) = doc.graph().edges.first().map(|edge| edge.id.clone()) {
+                doc.add_reroute(&edge, 0, graph::Point::new(360.0, 240.0));
+                doc.add_reroute(&edge, 1, graph::Point::new(460.0, 240.0));
+            }
+            canvas.load_document(doc, cx);
+            canvas.select_only(head, cx);
+            return;
+        }
         if demo == "marks" {
             let mut doc = graph::Document::new();
             let _ = doc.add_mark(

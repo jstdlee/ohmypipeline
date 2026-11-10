@@ -50,7 +50,16 @@ pub enum CanvasEvent {
     Edited,
     SelectionChanged,
     FocusInspector,
-    OpenCatalog { filter: Option<TypeName> },
+    /// Open the node search popover. `from` is set when a drag left an output
+    /// port, `to` when it ended on an input side; `at` is the canvas point of
+    /// the drop and `screen` its window position.
+    OpenCatalog {
+        from: Option<(String, String)>,
+        to: Option<(String, String)>,
+        ty: Option<TypeName>,
+        at: Point,
+        screen: GPoint<Pixels>,
+    },
 }
 
 struct Settle {
@@ -67,6 +76,7 @@ struct CameraAnim {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum Drag {
     Move {
         origin_local: GPoint<Pixels>,
@@ -76,11 +86,20 @@ enum Drag {
         duplicated: bool,
     },
     Link {
-        from: String,
-        from_port: String,
-        detached: Option<Edge>,
+        /// The output-side anchor that stays attached, when the drag keeps one.
+        from: Option<(String, String)>,
+        /// The input-side anchor the drag started from, when any.
+        to: Option<(String, String)>,
+        /// Wires picked up by a modifier drag on an output port. They are
+        /// detached for the drag; a cancel restores them.
+        rewired: Vec<Edge>,
         /// Canvas point under the pointer.
         pointer: Point,
+    },
+    /// Drag of one reroute point on a wire.
+    Reroute {
+        edge: String,
+        index: usize,
     },
     Marquee {
         start: GPoint<Pixels>,
@@ -129,6 +148,16 @@ pub struct CanvasModel {
     camera_anim: Option<CameraAnim>,
     frame_armed: bool,
     hovered: Option<String>,
+    /// Wire the pointer is over, with the nearest segment.
+    hover_wire: Option<(String, usize)>,
+    /// Reroute point the pointer is over.
+    hover_reroute: Option<(String, usize)>,
+    /// Reroute point the user selected, for Delete.
+    picked_reroute: Option<(String, usize)>,
+    /// Edge the context menu was opened on, with the pointer point.
+    wire_pick: Option<(String, Point, usize)>,
+    /// Wire a dragged node could be inserted into.
+    insert_hint: Option<String>,
     flow: f32,
     clip: Option<Clip>,
     label_input: Entity<gpui_kit::component::input::InputState>,
@@ -171,6 +200,11 @@ impl CanvasModel {
             camera_anim: None,
             frame_armed: false,
             hovered: None,
+            hover_wire: None,
+            hover_reroute: None,
+            picked_reroute: None,
+            wire_pick: None,
+            insert_hint: None,
             flow: 0.0,
             clip: None,
             label_input,
@@ -321,6 +355,11 @@ impl CanvasModel {
         self.drag = None;
         self.settle = None;
         self.camera_anim = None;
+        self.hover_wire = None;
+        self.hover_reroute = None;
+        self.picked_reroute = None;
+        self.wire_pick = None;
+        self.insert_hint = None;
         cx.emit(CanvasEvent::Edited);
         cx.emit(CanvasEvent::SelectionChanged);
         cx.notify();
@@ -363,11 +402,27 @@ impl CanvasModel {
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        let (nodes, marks) = self.split_selection();
-        if nodes.is_empty() && marks.is_empty() {
+        if let Some((edge, index)) = self.picked_reroute.take() {
+            self.editor.remove_reroute(&edge, index);
+            self.changed(cx);
             return;
         }
+        let (nodes, marks) = self.split_selection();
+        let edges: Vec<String> = self
+            .selection
+            .iter()
+            .filter(|id| self.editor.graph().edges.iter().any(|edge| &edge.id == *id))
+            .cloned()
+            .collect();
+        if nodes.is_empty() && marks.is_empty() && edges.is_empty() {
+            return;
+        }
+        self.editor.begin_gesture();
+        for edge in &edges {
+            self.editor.detach(edge);
+        }
         self.editor.delete(&nodes, &marks);
+        self.editor.commit_gesture();
         self.selection.clear();
         self.changed(cx);
         cx.emit(CanvasEvent::SelectionChanged);
@@ -658,9 +713,9 @@ impl CanvasModel {
     /// Move an in-progress link drag. Used by the screenshot reel.
     pub fn show_link(&mut self, from: &str, from_port: &str, at: Point, cx: &mut Context<Self>) {
         self.drag = Some(Drag::Link {
-            from: from.to_string(),
-            from_port: from_port.to_string(),
-            detached: None,
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            rewired: Vec::new(),
             pointer: at,
         });
         self.refresh_link_status();
@@ -676,12 +731,36 @@ impl CanvasModel {
         cx: &mut Context<Self>,
     ) {
         self.drag = Some(Drag::Link {
-            from: from.to_string(),
-            from_port: from_port.to_string(),
-            detached: None,
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            rewired: Vec::new(),
             pointer: self.canvas_of(point(px(local.0), px(local.1))),
         });
         self.refresh_link_status();
+        cx.notify();
+    }
+
+    /// Open the node search as if a wire from an output was dropped at `at`.
+    /// Used by the screenshot reel.
+    pub fn seed_search_drop(
+        &mut self,
+        from: &str,
+        from_port: &str,
+        at: Point,
+        cx: &mut Context<Self>,
+    ) {
+        let ty = graph::output_types(self.editor.graph(), from)
+            .into_iter()
+            .next();
+        let local = self.editor.graph().camera.to_window(at);
+        let screen = self.screen_of(point(px(local.x), px(local.y)));
+        cx.emit(CanvasEvent::OpenCatalog {
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            ty,
+            at,
+            screen,
+        });
         cx.notify();
     }
 
@@ -768,6 +847,15 @@ impl CanvasModel {
         window.focus(&self.focus, cx);
         if event.button == MouseButton::Right {
             self.select_hit(local);
+            let canvas = self.canvas_of(local);
+            self.wire_pick = if self.selection.is_empty() {
+                self.wire_hit_at(canvas).map(|(edge, segment)| {
+                    self.selection = vec![edge.clone()];
+                    (edge, canvas, segment)
+                })
+            } else {
+                None
+            };
             cx.emit(CanvasEvent::SelectionChanged);
             cx.notify();
             return;
@@ -794,6 +882,56 @@ impl CanvasModel {
             cx.notify();
             return;
         }
+        let canvas = self.canvas_of(local);
+        // A double click adds a bend to a wire, removes a bend point, or
+        // opens the node search on empty canvas.
+        if event.click_count >= 2 {
+            if let Some((edge, index)) = self.reroute_at(canvas) {
+                self.picked_reroute = None;
+                self.editor.remove_reroute(&edge, index);
+                self.changed(cx);
+                return;
+            }
+            if let Some((edge, segment)) = self.wire_hit_at(canvas) {
+                if self.editor.is_readonly() {
+                    return;
+                }
+                self.editor.begin_gesture();
+                self.editor.add_reroute(&edge, segment, canvas);
+                self.editor.commit_gesture();
+                self.changed(cx);
+                return;
+            }
+            if self.editor.is_readonly() {
+                return;
+            }
+            let screen = self.screen_of(local);
+            cx.emit(CanvasEvent::OpenCatalog {
+                from: None,
+                to: None,
+                ty: None,
+                at: canvas,
+                screen,
+            });
+            cx.notify();
+            return;
+        }
+        if let Some((edge, index)) = self.reroute_at(canvas) {
+            self.picked_reroute = Some((edge.clone(), index));
+            self.selection.clear();
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::Reroute { edge, index });
+            cx.emit(CanvasEvent::SelectionChanged);
+            cx.notify();
+            return;
+        }
+        if let Some((edge, _)) = self.wire_hit_at(canvas) {
+            self.picked_reroute = None;
+            self.selection = vec![edge];
+            cx.emit(CanvasEvent::SelectionChanged);
+            cx.notify();
+            return;
+        }
         self.drag = Some(Drag::Marquee {
             start: local,
             current: local,
@@ -816,13 +954,33 @@ impl CanvasModel {
         }
         let local = self.local_of(event.position);
         window.focus(&self.focus, cx);
+        let pointer = self.canvas_of(local);
         if side == Side::Out {
             self.editor.begin_gesture();
+            let wires: Vec<Edge> = self
+                .editor
+                .graph()
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node && edge.from_port == port)
+                .cloned()
+                .collect();
+            // Ctrl or Alt picks up every wire of the output instead of
+            // starting one new wire.
+            let pickup = event.modifiers.control || event.modifiers.alt;
+            let mut rewired = Vec::new();
+            if pickup {
+                for edge in wires {
+                    if let Some(detached) = self.editor.detach(&edge.id) {
+                        rewired.push(detached);
+                    }
+                }
+            }
             self.drag = Some(Drag::Link {
-                from: node.to_string(),
-                from_port: port.to_string(),
-                detached: None,
-                pointer: self.canvas_of(local),
+                from: Some((node.to_string(), port.to_string())),
+                to: None,
+                rewired,
+                pointer,
             });
         } else if let Some(edge) = self
             .editor
@@ -834,14 +992,24 @@ impl CanvasModel {
         {
             self.editor.begin_gesture();
             let detached = self.editor.detach(&edge.id);
-            if let Some(detached) = detached.as_ref() {
+            if let Some(detached) = detached {
                 self.drag = Some(Drag::Link {
-                    from: detached.from.clone(),
-                    from_port: detached.from_port.clone(),
-                    detached: Some(detached.clone()),
-                    pointer: self.canvas_of(local),
+                    from: Some((detached.from.clone(), detached.from_port.clone())),
+                    to: Some((node.to_string(), port.to_string())),
+                    rewired: Vec::new(),
+                    pointer,
                 });
             }
+        } else {
+            // A drag from an unconnected input port: the new wire keeps the
+            // input as its anchor and reaches for an output.
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::Link {
+                from: None,
+                to: Some((node.to_string(), port.to_string())),
+                rewired: Vec::new(),
+                pointer,
+            });
         }
         self.refresh_link_status();
         cx.notify();
@@ -910,6 +1078,7 @@ impl CanvasModel {
         }
         self.editor.begin_gesture();
         self.settle = None;
+        self.insert_hint = None;
         self.drag = Some(Drag::Move {
             origin_local: local,
             nodes,
@@ -922,6 +1091,7 @@ impl CanvasModel {
     fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let local = self.local_of(event.position);
         let Some(mut drag) = self.drag.clone() else {
+            self.track_hover(local, cx);
             return;
         };
         let mut refresh_link = false;
@@ -957,10 +1127,26 @@ impl CanvasModel {
                     .map(|(id, origin)| (id.clone(), Point::new(origin.x + dx, origin.y + dy)))
                     .collect();
                 self.editor.place(&placed_nodes, &placed_marks, false);
+                // A single unconnected node near a wire can be inserted into it.
+                self.insert_hint = None;
+                if marks.is_empty() && nodes.len() == 1 {
+                    let id = nodes.keys().next().cloned().unwrap_or_default();
+                    self.update_insert_hint(&id, self.canvas_of(local));
+                }
             }
             Drag::Link { pointer, .. } => {
                 *pointer = self.canvas_of(local);
                 refresh_link = true;
+            }
+            Drag::Reroute { edge, index } => {
+                let at = self.canvas_of(local);
+                // The snap-disable modifier is the one card drags use.
+                let at = if event.modifiers.alt {
+                    at
+                } else {
+                    graph::snap_grid(at)
+                };
+                self.editor.move_reroute(edge, *index, at);
             }
             Drag::Marquee { current, .. } => {
                 *current = local;
@@ -991,6 +1177,22 @@ impl CanvasModel {
             self.refresh_link_status();
         }
         cx.notify();
+    }
+
+    /// Remember which wire and bend point sit under the pointer.
+    fn track_hover(&mut self, local: GPoint<Pixels>, cx: &mut Context<Self>) {
+        let canvas = self.canvas_of(local);
+        let reroute = self.reroute_at(canvas);
+        let wire = if reroute.is_none() {
+            self.wire_hit_at(canvas)
+        } else {
+            None
+        };
+        if self.hover_reroute != reroute || self.hover_wire != wire {
+            self.hover_reroute = reroute;
+            self.hover_wire = wire;
+            cx.notify();
+        }
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
@@ -1036,6 +1238,30 @@ impl CanvasModel {
                     self.selection = vec![focus];
                     cx.emit(CanvasEvent::SelectionChanged);
                 }
+                // Dropping one unconnected node on a highlighted wire threads
+                // it in; the move and the insert share the open gesture.
+                if let Some(edge) = self.insert_hint.take()
+                    && marks.is_empty()
+                    && nodes.len() == 1
+                    && let Some(id) = nodes.keys().next()
+                    && self
+                        .editor
+                        .graph()
+                        .edges
+                        .iter()
+                        .all(|wire| wire.from != *id && wire.to != *id)
+                {
+                    match self.editor.insert_node_on_edge(&edge, id) {
+                        Ok(()) => {
+                            self.selection = vec![id.clone()];
+                            self.status = "node inserted into wire".to_string();
+                            cx.emit(CanvasEvent::SelectionChanged);
+                        }
+                        Err(reason) => {
+                            self.status = reject_message(reason, "node", "wire");
+                        }
+                    }
+                }
                 self.editor.commit_gesture();
                 if !self.reduced_motion
                     && offsets
@@ -1052,29 +1278,90 @@ impl CanvasModel {
             }
             Some(Drag::Link {
                 from,
-                from_port,
-                detached,
+                to,
+                rewired,
                 pointer,
+                ..
             }) => {
-                let snap = self.snap_at(pointer, &from, &from_port);
-                if let Some((to, to_port)) = snap {
-                    let _ = self.editor.connect(&from, &from_port, &to, &to_port);
-                    self.status.clear();
-                } else if detached.is_some() {
-                    self.status = "wire removed".to_string();
-                } else {
-                    self.status.clear();
-                    let filter = self.editor.graph().node(&from).and_then(|_| {
-                        graph::output_types(self.editor.graph(), &from)
-                            .into_iter()
-                            .next()
-                    });
-                    if snap.is_none() && detached.is_none() {
-                        cx.emit(CanvasEvent::OpenCatalog { filter });
+                if !rewired.is_empty() {
+                    let ids: Vec<String> = rewired.iter().map(|edge| edge.id.clone()).collect();
+                    let origin = from.clone().unwrap_or_default().0;
+                    if let Some((node, port)) = self.output_drop_at(pointer, &origin) {
+                        let (moved, rejected) = self.editor.rewire_sources(&ids, &node, &port);
+                        self.editor.commit_gesture();
+                        self.status = if rejected > 0 {
+                            format!("moved {moved}, rejected {rejected}")
+                        } else if moved == 1 {
+                            "moved 1 wire".to_string()
+                        } else {
+                            format!("moved {moved} wires")
+                        };
+                    } else {
+                        // Empty space cancels: the gesture restores the wires.
+                        self.editor.cancel_gesture();
+                        self.status.clear();
                     }
+                    self.changed(cx);
+                } else if let Some((from_node, from_port)) = from.clone()
+                    && let Some((to_node, to_port)) = self.snap_at(pointer, &from_node, &from_port)
+                {
+                    let _ = self
+                        .editor
+                        .connect(&from_node, &from_port, &to_node, &to_port);
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if from.is_none()
+                    && let Some((to_node, to_port)) = to.clone()
+                    && let Some((node, port)) = self.output_drop_at(pointer, "")
+                {
+                    let _ = self.editor.connect(&node, &port, &to_node, &to_port);
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if let Some((to_node, to_port)) = to.clone() {
+                    // An input end was dropped on empty space: offer nodes
+                    // that can feed the input again.
+                    self.status.clear();
+                    let ty = self
+                        .editor
+                        .graph()
+                        .node(&to_node)
+                        .and_then(|node| {
+                            node.input_ports()
+                                .into_iter()
+                                .find(|slot| slot.name == to_port)
+                        })
+                        .and_then(|slot| slot.accepts.first().copied());
+                    let screen = self.screen_of(local);
+                    cx.emit(CanvasEvent::OpenCatalog {
+                        from: None,
+                        to: Some((to_node, to_port)),
+                        ty,
+                        at: pointer,
+                        screen,
+                    });
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if let Some((from_node, from_port)) = from.clone() {
+                    self.status.clear();
+                    let ty = graph::output_types(self.editor.graph(), &from_node)
+                        .into_iter()
+                        .next();
+                    let screen = self.screen_of(local);
+                    cx.emit(CanvasEvent::OpenCatalog {
+                        from: Some((from_node, from_port)),
+                        to: None,
+                        ty,
+                        at: pointer,
+                        screen,
+                    });
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else {
+                    self.editor.commit_gesture();
+                    self.changed(cx);
                 }
-                self.editor.commit_gesture();
-                self.changed(cx);
             }
             Some(Drag::Marquee {
                 start,
@@ -1115,6 +1402,10 @@ impl CanvasModel {
                     cx.emit(CanvasEvent::SelectionChanged);
                 }
                 cx.notify();
+            }
+            Some(Drag::Reroute { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
             }
             Some(Drag::Resize { .. }) => {
                 self.editor.commit_gesture();
@@ -1179,28 +1470,47 @@ impl CanvasModel {
     fn refresh_link_status(&mut self) {
         let Some(Drag::Link {
             from,
-            from_port,
+            to,
             pointer,
+            rewired,
             ..
         }) = &self.drag
         else {
             return;
         };
         let from = from.clone();
-        let from_port = from_port.clone();
+        let to = to.clone();
         let pointer = *pointer;
-        let snap = self.snap_at(pointer, &from, &from_port);
-        if let Some((to, to_port)) = snap {
-            let (left, right) = type_pair_label(self.editor.graph(), &from, &to, &to_port);
+        let rewired = rewired.len();
+        if rewired > 0 {
+            self.status = format!("moving {rewired} wires");
+            return;
+        }
+        if let Some((from_node, from_port)) = from {
+            let snap = self.snap_at(pointer, &from_node, &from_port);
+            if let Some((to_node, to_port)) = snap {
+                let (left, right) =
+                    type_pair_label(self.editor.graph(), &from_node, &to_node, &to_port);
+                self.status = format!("{} → {}", shorten_types(&left), shorten_types(&right));
+                return;
+            }
+            if let Some((node, port, reason)) = self.nearest_reject(pointer, &from_node, &from_port)
+            {
+                let (left, right) = type_pair_label(self.editor.graph(), &from_node, &node, &port);
+                self.status = reject_message(reason, &shorten_types(&left), &shorten_types(&right));
+            } else {
+                self.status.clear();
+            }
+            return;
+        }
+        if let Some((to_node, to_port)) = to
+            && let Some((node, _)) = self.output_drop_at(pointer, "")
+        {
+            let (left, right) = type_pair_label(self.editor.graph(), &node, &to_node, &to_port);
             self.status = format!("{} → {}", shorten_types(&left), shorten_types(&right));
             return;
         }
-        if let Some((node, port, reason)) = self.nearest_reject(pointer, &from, &from_port) {
-            let (left, right) = type_pair_label(self.editor.graph(), &from, &node, &port);
-            self.status = reject_message(reason, &shorten_types(&left), &shorten_types(&right));
-        } else {
-            self.status.clear();
-        }
+        self.status.clear();
     }
 
     fn nearest_reject(
@@ -1318,31 +1628,84 @@ impl CanvasModel {
     fn link_visual(&self) -> Option<LinkVisual> {
         let Drag::Link {
             from,
-            from_port,
+            to,
             pointer,
+            rewired,
             ..
         } = self.drag.as_ref()?
         else {
             return None;
         };
-        let source = self.editor.graph().node(from)?;
-        let slot = port_slots(source)
+        if !rewired.is_empty() {
+            // Every picked wire draws from its own source port to the pointer.
+            let mut starts = Vec::new();
+            for edge in rewired {
+                let source = self.editor.graph().node(&edge.from)?;
+                let slot = port_slots(source)
+                    .into_iter()
+                    .find(|slot| slot.name == edge.from_port && slot.side == Side::Out)?;
+                starts.push(slot.center);
+            }
+            let first = *starts.first()?;
+            return Some(LinkVisual {
+                from: first,
+                to: *pointer,
+                extra_from: starts[1..].to_vec(),
+                snapped: None,
+                reject: None,
+                message: self.status.clone(),
+            });
+        }
+        if let Some((from_node, from_port)) = from {
+            let source = self.editor.graph().node(from_node.as_str())?;
+            let slot = port_slots(source)
+                .into_iter()
+                .find(|slot| slot.name == from_port.as_str() && slot.side == Side::Out)?;
+            let snap = self.snap_at(*pointer, from_node, from_port);
+            let reject = if snap.is_none() {
+                self.nearest_reject(*pointer, from_node, from_port)
+            } else {
+                None
+            };
+            let end = if let Some((to, to_port)) = &snap {
+                self.editor
+                    .graph()
+                    .node(to)
+                    .and_then(|node| {
+                        port_slots(node)
+                            .into_iter()
+                            .find(|slot| slot.name == *to_port && slot.side == Side::In)
+                            .map(|slot| slot.center)
+                    })
+                    .unwrap_or(*pointer)
+            } else {
+                *pointer
+            };
+            return Some(LinkVisual {
+                from: slot.center,
+                to: end,
+                extra_from: Vec::new(),
+                snapped: snap,
+                reject: reject.map(|(_, _, reason)| reason),
+                message: self.status.clone(),
+            });
+        }
+        // A drag from an input side: the wire hangs from the pointer and
+        // reaches for an output.
+        let (to_node, to_port) = to.as_ref()?;
+        let target = self.editor.graph().node(to_node)?;
+        let slot = port_slots(target)
             .into_iter()
-            .find(|slot| slot.name == *from_port && slot.side == Side::Out)?;
-        let snap = self.snap_at(*pointer, from, from_port);
-        let reject = if snap.is_none() {
-            self.nearest_reject(*pointer, from, from_port)
-        } else {
-            None
-        };
-        let end = if let Some((to, to_port)) = &snap {
+            .find(|slot| slot.name == *to_port && slot.side == Side::In)?;
+        let snap = self.output_drop_at(*pointer, "");
+        let end = if let Some((node, port)) = &snap {
             self.editor
                 .graph()
-                .node(to)
+                .node(node)
                 .and_then(|node| {
                     port_slots(node)
                         .into_iter()
-                        .find(|slot| slot.name == *to_port && slot.side == Side::In)
+                        .find(|slot| slot.name == *port && slot.side == Side::Out)
                         .map(|slot| slot.center)
                 })
                 .unwrap_or(*pointer)
@@ -1350,12 +1713,148 @@ impl CanvasModel {
             *pointer
         };
         Some(LinkVisual {
-            from: slot.center,
-            to: end,
+            from: end,
+            to: slot.center,
+            extra_from: Vec::new(),
             snapped: snap,
-            reject: reject.map(|(_, _, reason)| reason),
+            reject: None,
             message: self.status.clone(),
         })
+    }
+
+    /// Window position of a canvas-local point, for popovers that anchor to
+    /// the pointer.
+    fn screen_of(&self, local: GPoint<Pixels>) -> GPoint<Pixels> {
+        let origin = self
+            .viewport
+            .borrow()
+            .map(|bounds| bounds.origin)
+            .unwrap_or_else(|| point(px(0.0), px(0.0)));
+        origin + local
+    }
+
+    fn zoom(&self) -> f32 {
+        self.editor.graph().camera.zoom.max(0.05)
+    }
+
+    /// Nearest wire segment within 8 screen px, as edge id and segment index.
+    fn wire_hit_at(&self, canvas: Point) -> Option<(String, usize)> {
+        let graph = self.editor.graph();
+        let radius = 8.0 / self.zoom();
+        for edge in graph.edges.iter().rev() {
+            if let Some(path) = layout::edge_wire_path(&graph.nodes, edge)
+                && let Some(segment) = layout::wire_hit(&path, canvas, radius)
+            {
+                return Some((edge.id.clone(), segment));
+            }
+        }
+        None
+    }
+
+    /// Nearest reroute point within 7 screen px, as edge id and point index.
+    fn reroute_at(&self, canvas: Point) -> Option<(String, usize)> {
+        let graph = self.editor.graph();
+        let radius = 7.0 / self.zoom();
+        let mut best: Option<(f32, String, usize)> = None;
+        for edge in graph.edges.iter().rev() {
+            for (index, point) in edge.reroutes.iter().enumerate() {
+                let dx = point[0] - canvas.x;
+                let dy = point[1] - canvas.y;
+                let distance = dx * dx + dy * dy;
+                if distance <= radius * radius
+                    && best.as_ref().is_none_or(|(top, _, _)| distance < *top)
+                {
+                    best = Some((distance, edge.id.clone(), index));
+                }
+            }
+        }
+        best.map(|(_, edge, index)| (edge, index))
+    }
+
+    /// Nearest output port within the snap radius. `origin` excludes the port
+    /// the drag started from; an empty origin means every output counts.
+    fn output_drop_at(&self, pointer: Point, origin: &str) -> Option<(String, String)> {
+        let graph = self.editor.graph();
+        let zoom = self.zoom();
+        let origin_types = if origin.is_empty() {
+            Vec::new()
+        } else {
+            graph::output_types(graph, origin)
+        };
+        let mut candidates = Vec::new();
+        for node in &graph.nodes {
+            if node.id == origin {
+                continue;
+            }
+            for slot in port_slots(node) {
+                if slot.side != Side::Out {
+                    continue;
+                }
+                let dx = (slot.center.x - pointer.x) * zoom;
+                let dy = (slot.center.y - pointer.y) * zoom;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let types = graph::output_types(graph, &node.id);
+                let compatible = if origin_types.is_empty() {
+                    !types.is_empty()
+                } else {
+                    types.iter().any(|ty| origin_types.contains(ty))
+                };
+                candidates.push(SnapCandidate {
+                    node: node.id.clone(),
+                    port: slot.name.clone(),
+                    distance_px: distance,
+                    compatible,
+                });
+            }
+        }
+        let index = pick_snap(&candidates)?;
+        Some((
+            candidates[index].node.clone(),
+            candidates[index].port.clone(),
+        ))
+    }
+
+    /// The wire a dragged unconnected node could be inserted into, when the
+    /// pointer is within 8 screen px and both connect rules would accept it.
+    fn update_insert_hint(&mut self, node_id: &str, pointer: Point) {
+        self.insert_hint = None;
+        let graph = self.editor.graph();
+        let Some(node) = graph.node(node_id) else {
+            return;
+        };
+        if graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == node_id || edge.to == node_id)
+        {
+            return;
+        }
+        let Some(input) = node.input_ports().into_iter().next() else {
+            return;
+        };
+        let Some(output) = node.output_port() else {
+            return;
+        };
+        let radius = 8.0 / self.zoom();
+        for edge in &graph.edges {
+            if edge.from == node_id || edge.to == node_id {
+                continue;
+            }
+            let Some(path) = layout::edge_wire_path(&graph.nodes, edge) else {
+                continue;
+            };
+            if layout::wire_hit(&path, pointer, radius).is_none() {
+                continue;
+            }
+            let mut trial = graph.clone();
+            trial.edges.retain(|item| item.id != edge.id);
+            if try_connect(&trial, &edge.from, &edge.from_port, node_id, &input.name).is_ok()
+                && try_connect(&trial, node_id, &output.name, &edge.to, &edge.to_port).is_ok()
+            {
+                self.insert_hint = Some(edge.id.clone());
+                return;
+            }
+        }
     }
 }
 
@@ -1370,9 +1869,21 @@ struct Clip {
 struct LinkVisual {
     from: Point,
     to: Point,
+    /// More source ports when several wires are picked up at once.
+    extra_from: Vec<Point>,
     snapped: Option<(String, String)>,
     reject: Option<Reject>,
     message: String,
+}
+
+/// What the wire layer needs to know about hover, selection, and the drop
+/// hint, beyond the selection itself.
+#[derive(Clone, Default)]
+struct WireOverlay {
+    hover: Option<String>,
+    hover_point: Option<(String, usize)>,
+    picked: Option<(String, usize)>,
+    hint: Option<String>,
 }
 
 impl EventEmitter<CanvasEvent> for CanvasModel {}
@@ -1445,9 +1956,16 @@ impl Render for CanvasModel {
             .collect();
         let link_from = match &self.drag {
             Some(Drag::Link {
-                from, from_port, ..
-            }) => Some((from.clone(), from_port.clone())),
+                from: Some((node, port)),
+                ..
+            }) => Some((node.clone(), port.clone())),
             _ => None,
+        };
+        let overlay = WireOverlay {
+            hover: self.hover_wire.as_ref().map(|(id, _)| id.clone()),
+            hover_point: self.hover_reroute.clone(),
+            picked: self.picked_reroute.clone(),
+            hint: self.insert_hint.clone(),
         };
         let snap_target = link.as_ref().and_then(|item| item.snapped.clone());
         let flow = if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
@@ -1599,6 +2117,7 @@ impl Render for CanvasModel {
                 let painted_chart = chart;
                 let painted_settle = settle_ids.clone();
                 let painted_link = link.clone();
+                let painted_overlay = overlay.clone();
                 canvas(
                     move |bounds, _, _| {
                         *viewport.borrow_mut() = Some(bounds);
@@ -1617,6 +2136,8 @@ impl Render for CanvasModel {
                             theme_muted,
                             theme_primary,
                             theme_danger,
+                            theme_border,
+                            &painted_overlay,
                             &painted_chart,
                             window,
                             cx,
@@ -1763,7 +2284,7 @@ impl Render for CanvasModel {
             )
             .context_menu({
                 let entity = cx.entity();
-                move |menu, _, _| canvas_menu(menu, entity.clone())
+                move |menu, _, cx| canvas_menu(menu, entity.clone(), cx)
             })
     }
 }
@@ -1771,6 +2292,7 @@ impl Render for CanvasModel {
 fn canvas_menu(
     menu: gpui_kit::component::menu::PopupMenu,
     entity: Entity<CanvasModel>,
+    cx: &App,
 ) -> gpui_kit::component::menu::PopupMenu {
     let paste = entity.clone();
     let duplicate = entity.clone();
@@ -1779,38 +2301,66 @@ fn canvas_menu(
     let front = entity.clone();
     let back = entity.clone();
     let edit = entity.clone();
-    menu.item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
-        paste.update(cx, |this, cx| this.paste(cx));
-    }))
-    .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
-        duplicate.update(cx, |this, cx| this.duplicate_selection(cx));
-    }))
-    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
-        delete.update(cx, |this, cx| this.delete_selection(cx));
-    }))
-    .separator()
-    .item(PopupMenuItem::new("Align left").on_click(move |_, _, cx| {
-        align.update(cx, |this, cx| this.align("left", cx));
-    }))
-    .item(
-        PopupMenuItem::new("Bring to front").on_click(move |_, _, cx| {
-            front.update(cx, |this, cx| this.reorder_selection(true, cx));
-        }),
-    )
-    .item(
-        PopupMenuItem::new("Send to back").on_click(move |_, _, cx| {
-            back.update(cx, |this, cx| this.reorder_selection(false, cx));
-        }),
-    )
-    .item(
-        PopupMenuItem::new("Edit label").on_click(move |_, window, cx| {
-            edit.update(cx, |this, cx| {
-                if let Some(id) = this.selection.first().cloned() {
-                    this.start_label_edit(&id, window, cx);
-                }
-            });
-        }),
-    )
+    let mut menu = menu
+        .item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
+            paste.update(cx, |this, cx| this.paste(cx));
+        }))
+        .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
+            duplicate.update(cx, |this, cx| this.duplicate_selection(cx));
+        }))
+        .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+            delete.update(cx, |this, cx| this.delete_selection(cx));
+        }))
+        .separator()
+        .item(PopupMenuItem::new("Align left").on_click(move |_, _, cx| {
+            align.update(cx, |this, cx| this.align("left", cx));
+        }))
+        .item(
+            PopupMenuItem::new("Bring to front").on_click(move |_, _, cx| {
+                front.update(cx, |this, cx| this.reorder_selection(true, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Send to back").on_click(move |_, _, cx| {
+                back.update(cx, |this, cx| this.reorder_selection(false, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Edit label").on_click(move |_, window, cx| {
+                edit.update(cx, |this, cx| {
+                    if let Some(id) = this.selection.first().cloned() {
+                        this.start_label_edit(&id, window, cx);
+                    }
+                });
+            }),
+        );
+    // A right click on a wire adds bend commands to the same menu.
+    if let Some((edge, at, segment)) = entity.read(cx).wire_pick.clone() {
+        let add = entity.clone();
+        let clear = entity.clone();
+        let clear_edge = edge.clone();
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("Add reroute point").on_click(move |_, _, cx| {
+                    add.update(cx, |this, cx| {
+                        this.editor.begin_gesture();
+                        this.editor.add_reroute(&edge, segment, at);
+                        this.editor.commit_gesture();
+                        this.changed(cx);
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Remove reroute points").on_click(move |_, _, cx| {
+                    clear.update(cx, |this, cx| {
+                        this.editor.clear_reroutes(&clear_edge);
+                        this.changed(cx);
+                    });
+                }),
+            );
+    }
+    menu
 }
 
 fn mark_kind(tool: Tool) -> MarkKind {
@@ -1928,6 +2478,8 @@ fn paint_scene(
     muted: gpui_kit::Hsla,
     primary: gpui_kit::Hsla,
     danger: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    overlay: &WireOverlay,
     chart: &[gpui_kit::Hsla; 6],
     window: &mut Window,
     _cx: &mut App,
@@ -1963,38 +2515,78 @@ fn paint_scene(
 
     let placed = shifted(nodes, settle);
     for edge in edges {
-        let Some(cubic) = layout::edge_cubic(&placed, edge) else {
+        let Some(path) = layout::edge_wire_path(&placed, edge) else {
             continue;
         };
         let selected = selection.iter().any(|id| id == &edge.id);
+        let hovered = overlay.hover.as_deref() == Some(edge.id.as_str());
+        let hinted = overlay.hint.as_deref() == Some(edge.id.as_str());
         let ty = output_types_first(nodes, &edge.from);
-        let color = ty
+        let base = ty
             .map(|ty| type_color(ty, chart))
             .unwrap_or(muted)
             .opacity(if selected { 1.0 } else { 0.85 });
-        paint_cubic(
-            origin,
-            camera,
-            cubic,
-            color,
-            px(if selected { 1.75 } else { 1.25 }),
-            window,
-        );
+        let (color, width) = if hinted {
+            (primary, 2.5)
+        } else if selected {
+            (base, 1.75)
+        } else {
+            (base, 1.25)
+        };
+        for cubic in &path {
+            paint_cubic(origin, camera, *cubic, color, px(width), window);
+        }
         if let Some(phase) = flow {
-            let at = layout::cubic_point(cubic, phase);
+            let at = layout::cubic_point(path[0], phase);
             paint_dot(origin, camera, at, 3.0, color, window);
+        }
+        // Bend points show when they matter: near the camera, or when the
+        // wire or one of the points is being looked at.
+        if edge.reroutes.is_empty() {
+            continue;
+        }
+        let is_picked = |index: usize| {
+            overlay
+                .picked
+                .as_ref()
+                .is_some_and(|(id, i)| id == &edge.id && *i == index)
+        };
+        let is_hover_point = |index: usize| {
+            overlay
+                .hover_point
+                .as_ref()
+                .is_some_and(|(id, i)| id == &edge.id && *i == index)
+        };
+        for (index, point) in edge.reroutes.iter().enumerate() {
+            let active = selected || hovered || is_picked(index) || is_hover_point(index);
+            if zoom < 0.55 && !active {
+                continue;
+            }
+            let accent = is_picked(index) || is_hover_point(index);
+            paint_dot(
+                origin,
+                camera,
+                Point::new(point[0], point[1]),
+                3.5,
+                if accent { primary } else { border },
+                window,
+            );
         }
     }
     if let Some(link) = link {
-        let cubic = layout::wire_cubic(link.from, link.to);
+        let mut starts = vec![link.from];
+        starts.extend(link.extra_from.iter().copied());
         let color = if link.reject.is_some() {
             danger
-        } else if link.snapped.is_some() {
+        } else if link.snapped.is_some() || !link.extra_from.is_empty() {
             link_source_color(nodes, link, chart, primary)
         } else {
             muted
         };
-        paint_cubic(origin, camera, cubic, color, px(1.5), window);
+        for start in starts {
+            let cubic = layout::wire_cubic(start, link.to);
+            paint_cubic(origin, camera, cubic, color, px(1.5), window);
+        }
     }
 }
 

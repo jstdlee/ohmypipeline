@@ -4,6 +4,7 @@
 mod assist;
 mod chart_plot;
 mod headless;
+mod node_search;
 mod worker;
 mod workspace;
 

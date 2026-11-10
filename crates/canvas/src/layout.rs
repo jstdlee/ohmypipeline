@@ -158,25 +158,55 @@ pub fn cubic_point(cubic: Cubic, t: f32) -> Point {
     )
 }
 
-pub fn wire_hit(cubic: Cubic, point: Point, radius: f32) -> bool {
-    let mut closest = f32::MAX;
-    for step in 0..=24 {
-        let at = cubic_point(cubic, step as f32 / 24.0);
-        let dx = at.x - point.x;
-        let dy = at.y - point.y;
-        closest = closest.min(dx * dx + dy * dy);
+/// The full wire as a chain of cubics through each reroute point.
+/// Segment `i` joins `points[i]` and `points[i + 1]`, where `points` is
+/// `from`, the reroutes in order, then `to`. Each segment follows the same
+/// tangent rule as [`wire_cubic`].
+pub fn wire_path(from: Point, reroutes: &[Point], to: Point) -> Vec<Cubic> {
+    let mut points = Vec::with_capacity(reroutes.len() + 2);
+    points.push(from);
+    points.extend_from_slice(reroutes);
+    points.push(to);
+    let mut path = Vec::with_capacity(points.len().saturating_sub(1));
+    for pair in points.windows(2) {
+        path.push(wire_cubic(pair[0], pair[1]));
     }
-    closest <= radius * radius
+    path
 }
 
-pub fn edge_cubic(nodes: &[Node], edge: &Edge) -> Option<Cubic> {
+/// Nearest segment of the chain within `radius`, as the segment index.
+/// `None` when the point misses every segment.
+pub fn wire_hit(path: &[Cubic], point: Point, radius: f32) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (index, cubic) in path.iter().enumerate() {
+        for step in 0..=24 {
+            let at = cubic_point(*cubic, step as f32 / 24.0);
+            let dx = at.x - point.x;
+            let dy = at.y - point.y;
+            let distance = dx * dx + dy * dy;
+            if distance <= radius * radius && best.is_none_or(|(closest, _)| distance < closest) {
+                best = Some((distance, index));
+            }
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
+/// The wire of `edge` as a chain, including its stored reroute points.
+/// The first segment of the chain is the plain `edge_cubic` of before.
+pub fn edge_wire_path(nodes: &[Node], edge: &Edge) -> Option<Vec<Cubic>> {
     let source = nodes.iter().find(|node| node.id == edge.from)?;
     let target = nodes.iter().find(|node| node.id == edge.to)?;
     let source_slots = port_slots(source);
     let target_slots = port_slots(target);
     let from = slot(&source_slots, &edge.from_port, Side::Out)?;
     let to = slot(&target_slots, &edge.to_port, Side::In)?;
-    Some(wire_cubic(from.center, to.center))
+    let reroutes: Vec<Point> = edge
+        .reroutes
+        .iter()
+        .map(|point| Point::new(point[0], point[1]))
+        .collect();
+    Some(wire_path(from.center, &reroutes, to.center))
 }
 
 pub fn to_local(camera: Camera, canvas: Point) -> Point {
@@ -193,9 +223,9 @@ mod tests {
         let mut source = Node::new("n1", "read_csv", Point::new(16.0, 32.0));
         let target = Node::new("n2", "head", Point::new(320.0, 32.0));
         let edge = Edge::between("n1", "out", "n2", "in");
-        let first = edge_cubic(&[source.clone(), target.clone()], &edge).unwrap();
+        let first = edge_wire_path(&[source.clone(), target.clone()], &edge).unwrap()[0];
         source.position = [48.0, 64.0];
-        let second = edge_cubic(&[source, target], &edge).unwrap();
+        let second = edge_wire_path(&[source, target], &edge).unwrap()[0];
         assert!((second.from.x - first.from.x - 32.0).abs() < 0.1);
         assert!((second.from.y - first.from.y - 32.0).abs() < 0.1);
         assert_eq!(second.to, first.to);
@@ -221,9 +251,41 @@ mod tests {
 
     #[test]
     fn a_point_on_the_cubic_hits_and_a_far_point_does_not() {
-        let cubic = wire_cubic(Point::new(0.0, 0.0), Point::new(200.0, 0.0));
-        let mid = cubic_point(cubic, 0.5);
-        assert!(wire_hit(cubic, mid, 6.0));
-        assert!(!wire_hit(cubic, Point::new(mid.x, mid.y + 40.0), 6.0));
+        let path = wire_path(Point::new(0.0, 0.0), &[], Point::new(200.0, 0.0));
+        let mid = cubic_point(path[0], 0.5);
+        assert_eq!(wire_hit(&path, mid, 6.0), Some(0));
+        assert_eq!(wire_hit(&path, Point::new(mid.x, mid.y + 40.0), 6.0), None);
+    }
+
+    #[test]
+    fn a_chain_with_reroutes_is_continuous_and_ends_where_it_should() {
+        let from = Point::new(0.0, 0.0);
+        let to = Point::new(400.0, 0.0);
+        let bends = [Point::new(120.0, 120.0), Point::new(260.0, -80.0)];
+        for reroutes in [Vec::new(), vec![bends[0]], vec![bends[0], bends[1]]] {
+            let path = wire_path(from, &reroutes, to);
+            assert_eq!(path.len(), reroutes.len() + 1);
+            assert_eq!(path[0].from, from);
+            assert_eq!(path[path.len() - 1].to, to);
+            for pair in path.windows(2) {
+                assert_eq!(pair[0].to, pair[1].from, "segments must share endpoints");
+            }
+        }
+        // Each segment leaves horizontally, so a reroute is a real corner.
+        let path = wire_path(from, &bends, to);
+        assert!((path[0].c1.y - path[0].from.y).abs() < 0.001);
+        assert!((path[2].c2.y - path[2].to.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_hit_on_a_chain_names_its_segment() {
+        let bends = [Point::new(120.0, 160.0)];
+        let path = wire_path(Point::new(0.0, 0.0), &bends, Point::new(400.0, 0.0));
+        // Near the bend point itself, inside the second segment.
+        let at = cubic_point(path[1], 0.5);
+        assert_eq!(wire_hit(&path, at, 8.0), Some(1));
+        let straight = wire_path(Point::new(0.0, 0.0), &[], Point::new(400.0, 0.0));
+        let mid = cubic_point(straight[0], 0.5);
+        assert_eq!(wire_hit(&straight, mid, 8.0), Some(0));
     }
 }

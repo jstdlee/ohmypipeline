@@ -927,6 +927,18 @@ impl Document {
         });
     }
 
+    /// Drop every bend point of a wire. The wire stays.
+    pub fn clear_reroutes(&mut self, edge_id: &str) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            if let Some(edge) = graph.edges.iter_mut().find(|edge| edge.id == edge_id) {
+                edge.reroutes.clear();
+            }
+        });
+    }
+
     /// Insert by name or replace the existing entry with the same name.
     pub fn set_variable(&mut self, variable: Variable) {
         if self.readonly {
@@ -1191,6 +1203,102 @@ impl Document {
         Ok(id)
     }
 
+    /// Thread an existing, unconnected node into a wire. The node keeps its id
+    /// and parameters; the wire is replaced by the two edges through it.
+    pub fn insert_node_on_edge(&mut self, edge_id: &str, node_id: &str) -> Result<(), Reject> {
+        if self.readonly {
+            return Err(Reject::Type);
+        }
+        let edge = self
+            .graph
+            .edges
+            .iter()
+            .find(|edge| edge.id == edge_id)
+            .cloned()
+            .ok_or(Reject::Type)?;
+        let node = self.graph.node(node_id).ok_or(Reject::Type)?.clone();
+        if self
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == node.id || edge.to == node.id)
+        {
+            return Err(Reject::Type);
+        }
+        let input = node.input_ports().into_iter().next().ok_or(Reject::Type)?;
+        let output = node.output_port().ok_or(Reject::Type)?;
+        let mut trial = self.graph.clone();
+        trial.edges.retain(|item| item.id != edge.id);
+        try_connect(&trial, &edge.from, &edge.from_port, node_id, &input.name)?;
+        try_connect(&trial, node_id, &output.name, &edge.to, &edge.to_port)?;
+        let upstream = Edge::between(&edge.from, &edge.from_port, node_id, &input.name);
+        let downstream = Edge::between(node_id, &output.name, &edge.to, &edge.to_port);
+        self.mutate(|graph| {
+            graph.edges.retain(|item| item.id != edge.id);
+            graph.edges.push(upstream);
+            graph.edges.push(downstream);
+        });
+        Ok(())
+    }
+
+    /// Point every picked wire at a new output port. Each wire moves only when
+    /// the normal connect rules accept it; the rest stay where they were.
+    /// Returns how many moved and how many were rejected.
+    pub fn rewire_sources(
+        &mut self,
+        edge_ids: &[String],
+        new_from: &str,
+        new_port: &str,
+    ) -> (usize, usize) {
+        if self.readonly || edge_ids.is_empty() {
+            return (0, edge_ids.len());
+        }
+        let picked: BTreeSet<String> = edge_ids.iter().cloned().collect();
+        // Work on a copy with the picked wires removed, so a batch of moves
+        // never collides with itself (a target input is free until a wire
+        // actually moves onto it). Candidates are validated against the copy
+        // plus the wires already accepted, never against themselves.
+        let mut trial = self.graph.clone();
+        trial.edges.retain(|edge| !picked.contains(&edge.id));
+        let mut accepted: Vec<Edge> = Vec::new();
+        let mut moved = 0usize;
+        let mut rejected = 0usize;
+        for edge in self
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| picked.contains(&edge.id))
+        {
+            // A wire onto its own source would be a self loop, and checking
+            // one recurses forever in `output_types`.
+            if edge.to == new_from {
+                rejected += 1;
+                continue;
+            }
+            let mut candidate = Edge::between(new_from, new_port, &edge.to, &edge.to_port);
+            candidate.reroutes = edge.reroutes.clone();
+            if try_connect(&trial, new_from, new_port, &edge.to, &edge.to_port).is_ok() {
+                trial.edges.push(candidate.clone());
+                accepted.push(candidate);
+                moved += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        if moved > 0 {
+            let apply = |graph: &mut Graph| {
+                graph.edges.retain(|edge| !picked.contains(&edge.id));
+                graph.edges.extend(accepted.clone());
+            };
+            if self.history.open.is_some() {
+                apply(&mut self.graph);
+            } else {
+                self.mutate(apply);
+            }
+        }
+        (moved, rejected)
+    }
+
     pub fn features_accepting(&self, ty: TypeName) -> Vec<&'static FeatureDef> {
         feature::CATALOG
             .iter()
@@ -1203,6 +1311,15 @@ impl Document {
                     || (def.inputs_are_user
                         && (ty == TypeName::Dataframe || ty == TypeName::Scalar))
             })
+            .collect()
+    }
+
+    /// Features a fresh node of which could produce `ty`. The mirror of
+    /// [`Document::features_accepting`] for a drag that ends on an input.
+    pub fn features_producing(&self, ty: TypeName) -> Vec<&'static FeatureDef> {
+        feature::CATALOG
+            .iter()
+            .filter(|def| def.output == Some(ty) || def.possible_outputs.contains(&ty))
             .collect()
     }
 }
@@ -1648,5 +1765,133 @@ mod tests {
         let names =
             crate::model::python_arg_names("def run(amount: object, region):\n    return amount\n");
         assert_eq!(names, vec!["amount".to_string(), "region".to_string()]);
+    }
+
+    fn doc_with_fan() -> (Document, String, String, String, Vec<String>) {
+        let mut doc = Document::new();
+        let a = doc.add_node("read_csv", Point::new(0.0, 0.0)).unwrap();
+        let b = doc.add_node("head", Point::new(300.0, 0.0)).unwrap();
+        let c = doc.add_node("query", Point::new(300.0, 200.0)).unwrap();
+        let d = doc.add_node("read_csv", Point::new(600.0, 0.0)).unwrap();
+        let _ = doc.connect(&a, "out", &b, "in");
+        let _ = doc.connect(&a, "out", &c, "in");
+        let ids = doc.graph().edges.iter().map(|e| e.id.clone()).collect();
+        (doc, a, b, d, ids)
+    }
+
+    #[test]
+    fn rewire_sources_moves_every_wire_and_undo_restores_them() {
+        let (mut doc, a, b, d, ids) = doc_with_fan();
+        let (moved, rejected) = doc.rewire_sources(&ids, &d, "out");
+        assert_eq!((moved, rejected), (2, 0));
+        let edges = doc.graph().edges.clone();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| edge.from == d));
+        assert!(doc.graph().edges.iter().any(|edge| edge.to == b));
+        assert!(doc.undo());
+        let restored = doc.graph().edges.clone();
+        assert!(restored.iter().all(|edge| edge.from == a));
+        assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn rewire_sources_keeps_wires_the_rules_reject() {
+        let (mut doc, _, b, _, ids) = doc_with_fan();
+        // Re-sourcing each wire onto its own target would cycle.
+        let targets: Vec<String> = doc
+            .graph()
+            .edges
+            .iter()
+            .map(|edge| edge.to.clone())
+            .collect();
+        let mut total = (0usize, 0usize);
+        for (edge, target) in ids.iter().zip(targets.iter()) {
+            let (moved, rejected) = doc.rewire_sources(std::slice::from_ref(edge), target, "out");
+            total.0 += moved;
+            total.1 += rejected;
+        }
+        assert_eq!(total, (0, 2));
+        assert_eq!(doc.graph().edges.len(), 2);
+        assert!(doc.graph().edges.iter().any(|edge| edge.to == *b));
+        // A read-only document rejects the whole batch too.
+        let mut frozen = Document::from_graph(doc.graph().clone());
+        frozen.readonly = true;
+        assert_eq!(frozen.rewire_sources(&ids, &b, "out"), (0, ids.len()));
+    }
+
+    #[test]
+    fn rewire_sources_moves_only_the_picked_wires() {
+        let (mut doc, a, _, d, ids) = doc_with_fan();
+        let first = vec![ids[0].clone()];
+        let (moved, rejected) = doc.rewire_sources(&first, &d, "out");
+        assert_eq!((moved, rejected), (1, 0));
+        let from_a = doc
+            .graph()
+            .edges
+            .iter()
+            .filter(|edge| edge.from == a)
+            .count();
+        let from_d = doc
+            .graph()
+            .edges
+            .iter()
+            .filter(|edge| edge.from == d)
+            .count();
+        assert_eq!((from_a, from_d), (1, 1));
+    }
+
+    #[test]
+    fn inserting_an_existing_node_into_a_wire_is_one_undo_step() {
+        let (mut doc, a, b) = doc_with_chain();
+        let mid = doc.add_node("sort_values", Point::new(160.0, 0.0)).unwrap();
+        doc.set_param(&mid, "by", json!("amount"));
+        let edge = doc.graph().edges[0].id.clone();
+        doc.insert_node_on_edge(&edge, &mid).unwrap();
+        let edges = doc.graph().edges.clone();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|e| e.from == a && e.to == mid));
+        assert!(edges.iter().any(|e| e.from == mid && e.to == b));
+        assert_eq!(doc.graph().node(&mid).unwrap().param_str("by"), "amount");
+        assert!(doc.undo());
+        assert_eq!(doc.graph().edges.len(), 1);
+        assert_eq!(doc.graph().edges[0].from, a);
+        assert!(doc.graph().node(&mid).is_some());
+    }
+
+    #[test]
+    fn inserting_a_connected_node_into_a_wire_is_refused() {
+        let (mut doc, _a, b, _, _) = doc_with_fan();
+        let edge = doc.graph().edges[0].id.clone();
+        // `b` already has a wire, so it must not be threaded through another.
+        assert_eq!(doc.insert_node_on_edge(&edge, &b), Err(Reject::Type));
+        assert_eq!(doc.graph().edges.len(), 2);
+    }
+
+    #[test]
+    fn features_producing_lists_writers_of_a_type() {
+        let doc = Document::new();
+        let tables = doc.features_producing(TypeName::Dataframe);
+        assert!(tables.iter().any(|def| def.id == "read_csv"));
+        assert!(tables.iter().any(|def| def.id == "head"));
+        assert!(tables.iter().all(|def| {
+            def.output == Some(TypeName::Dataframe)
+                || def.possible_outputs.contains(&TypeName::Dataframe)
+        }));
+        let columns = doc.features_producing(TypeName::Series);
+        assert!(columns.iter().any(|def| def.id == "column"));
+        assert!(!columns.iter().any(|def| def.id == "read_csv"));
+    }
+
+    #[test]
+    fn clear_reroutes_keeps_the_wire() {
+        let (mut doc, _, _) = doc_with_chain();
+        let edge = doc.graph().edges[0].id.clone();
+        doc.add_reroute(&edge, 0, Point::new(160.0, 100.0));
+        doc.add_reroute(&edge, 1, Point::new(200.0, 140.0));
+        doc.clear_reroutes(&edge);
+        assert!(doc.graph().edges[0].reroutes.is_empty());
+        assert_eq!(doc.graph().edges.len(), 1);
+        assert!(doc.undo());
+        assert_eq!(doc.graph().edges[0].reroutes.len(), 2);
     }
 }
