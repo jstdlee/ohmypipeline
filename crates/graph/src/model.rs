@@ -777,6 +777,35 @@ pub fn ancestors(graph: &Graph, id: &str) -> Result<Vec<String>, String> {
     Ok(order)
 }
 
+/// Nodes reachable from `id` through outgoing edges, breadth first. `id`
+/// itself is not included.
+pub fn descendants(graph: &Graph, id: &str) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let Some(start) = graph.node(id) else {
+        return order;
+    };
+    seen.insert(start.id.clone());
+    queue.push_back(start.id.clone());
+    while let Some(current) = queue.pop_front() {
+        let mut children: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == current)
+            .map(|edge| edge.to.clone())
+            .collect();
+        children.sort();
+        for child in children {
+            if seen.insert(child.clone()) {
+                order.push(child.clone());
+                queue.push_back(child);
+            }
+        }
+    }
+    order
+}
+
 fn hash_json(value: &impl Serialize) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -784,6 +813,27 @@ fn hash_json(value: &impl Serialize) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Text of the variables `node` reads. A variable that is not declared hashes
+/// as unknown, so adding the declaration still changes the key.
+fn variable_values_text(node: &Node, graph: &Graph) -> String {
+    let refs = crate::vars::referenced_vars(node);
+    if refs.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = refs
+        .iter()
+        .map(|name| {
+            let value = graph
+                .variables
+                .iter()
+                .find(|variable| variable.name == *name)
+                .map(|variable| serde_json::to_string(&variable.value).unwrap_or_default());
+            format!("{name}={}", value.as_deref().unwrap_or("?"))
+        })
+        .collect();
+    format!("vars:{}", parts.join(","))
 }
 
 /// Identity of the computation at `id`. Positions, labels, marks, and the camera are not part of it.
@@ -812,6 +862,9 @@ pub fn dependency_key(graph: &Graph, id: &str) -> u64 {
                 serde_json::to_string(&node.output).unwrap_or_default(),
                 node.unknown
             ));
+            // The values of variables this node reads are part of the identity
+            // of its computation, so changing one invalidates only its users.
+            parts.push(variable_values_text(node, graph));
         }
     }
     let mut parts = Vec::new();
@@ -833,6 +886,7 @@ pub fn run_fingerprint(graph: &Graph) -> u64 {
                 "added_inputs": node.added_inputs,
                 "wired": node.wired,
                 "output": node.output,
+                "vars": variable_values_text(node, graph),
             })
         })
         .collect();

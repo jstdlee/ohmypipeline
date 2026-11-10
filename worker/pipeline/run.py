@@ -22,6 +22,9 @@ stats = {"computed": 0}
 
 _cache: dict[str, Any] = {}
 
+# Cache keys ever produced per node id, so a reset can find them.
+_node_keys: dict[str, set[str]] = {}
+
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -56,9 +59,30 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     window = int(window)
 
     from pipeline.scale import clear_fits, take_fit
+    from pipeline.vars import VarError, resolve_variables
 
     clear_fits()
+    if op == "reset":
+        reset_cache(job.get("nodes") or [])
+        return {
+            "generation": generation,
+            "mode": mode,
+            "node": "",
+            "columns": [],
+            "dtypes": [],
+            "index": [],
+            "rows": [],
+            "n": 0,
+            "claim": mode,
+            "error": None,
+            "computed": [],
+            "inactive": [],
+        }
     try:
+        try:
+            variables = resolve_variables(graph, job.get("overrides") or {})
+        except VarError as exc:
+            raise NodeError(node_id, str(exc)) from exc
         if not node_id:
             raise NodeError("", "no node was requested")
         order = ancestors(graph, node_id)
@@ -73,9 +97,11 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 mode=mode,
                 base_dir=base_dir,
                 overrides=overrides,
+                variables=variables,
             )
             values[current] = value
             keys[current] = key
+        computed = list(order)
         result = values[node_id]
         node = find_node(graph, node_id)
         if node and node.get("type") == "chart":
@@ -93,6 +119,12 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             payload["csv_path"] = str(path)
         else:
             payload = payload_of(result, window)
+        if job.get("stats"):
+            from pipeline.stats import column_stats
+
+            frame_stats = column_stats(result)
+            if frame_stats:
+                payload["stats"] = frame_stats
         payload.update(
             {
                 "generation": generation,
@@ -100,6 +132,8 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "node": node_id,
                 "claim": mode,
                 "error": None,
+                "computed": computed,
+                "inactive": [],
             }
         )
         if fit := take_fit(node_id):
@@ -123,6 +157,14 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 "actual": exc.actual,
             },
         }
+
+
+def reset_cache(node_ids: list[Any]) -> None:
+    """Drops every cache entry the given node ids ever produced."""
+    for raw in node_ids:
+        node_id = str(raw)
+        for key in _node_keys.pop(node_id, set()):
+            _cache.pop(key, None)
 
 
 def ancestors(graph: dict[str, Any], node_id: str) -> list[str]:
@@ -176,12 +218,23 @@ def compute_node(
     mode: str,
     base_dir: Path,
     overrides: dict[str, str],
+    variables: dict[str, Any] | None = None,
 ) -> tuple[Any, str]:
+    from pipeline.vars import VarError, substitute_node
+
     node = find_node(graph, node_id)
     if node is None:
         raise NodeError(node_id, f"unknown node {node_id}")
     if node.get("unknown"):
         raise NodeError(node_id, f"unknown feature {node.get('type')}")
+    if variables is None:
+        variables = {}
+    # Params carry ${name} references. The substituted values are what the
+    # cache key hashes, so an override never returns a stale cached result.
+    try:
+        node, var_origins = substitute_node(node, variables)
+    except VarError as exc:
+        raise NodeError(node_id, str(exc)) from exc
     parent_edges = edges_into(graph, node_id)
     parent_keys = [
         {"from": edge["from"], "port": edge.get("to_port"), "key": keys.get(edge["from"])}
@@ -200,10 +253,20 @@ def compute_node(
         "override": overrides.get(node_id),
     }
     key = hashlib.sha256(json.dumps(record, sort_keys=True, default=str).encode()).hexdigest()
+    _node_keys.setdefault(node_id, set()).add(key)
     if key in _cache:
         return _cache[key], key
     stats["computed"] += 1
-    value = execute(graph, node, values, mode=mode, base_dir=base_dir, overrides=overrides)
+    value = execute(
+        graph,
+        node,
+        values,
+        mode=mode,
+        base_dir=base_dir,
+        overrides=overrides,
+        variables=variables,
+        var_origins=var_origins,
+    )
     declared = declared_type(node, graph, values)
     if declared is not None:
         actual = actual_type(value, declared)
@@ -374,11 +437,15 @@ def execute(
     mode: str,
     base_dir: Path,
     overrides: dict[str, str],
+    variables: dict[str, Any] | None = None,
+    var_origins: dict[str, str] | None = None,
 ) -> Any:
     kind = node.get("type")
     params = dict(node.get("params") or {})
     preview = mode != "full"
     node_id = node["id"]
+    variables = variables or {}
+    var_origins = var_origins or {}
 
     def wired(port: str) -> Any | None:
         edges = edges_into(graph, node_id, port)
@@ -435,6 +502,9 @@ def execute(
         try:
             n = int(n)
         except (TypeError, ValueError) as exc:
+            origin = var_origins.get("n")
+            if origin:
+                raise NodeError(node_id, f"variable ${{{origin}}} must be an int") from exc
             raise NodeError(node_id, "n must be an integer") from exc
         return frame.head(n)
     if kind == "change_headers":
@@ -499,7 +569,7 @@ def execute(
         code = wired("code")
         if code is None:
             code = str(params.get("code") or "")
-        return run_python(node_id, str(code), graph, node, values)
+        return run_python(node_id, str(code), graph, node, values, variables=variables)
     if kind in ("chart", "preview_table"):
         return require_frame_or_series()
     from pipeline.batch import run_batch
@@ -1004,10 +1074,12 @@ def run_python(
     graph: dict[str, Any],
     node: dict[str, Any],
     values: dict[str, Any],
+    *,
+    variables: dict[str, Any] | None = None,
 ) -> Any:
     if "def run" not in code:
         raise NodeError(node_id, "code must define run(...)")
-    namespace: dict[str, Any] = {"pd": pd, "np": np}
+    namespace: dict[str, Any] = {"pd": pd, "np": np, "vars": dict(variables or {})}
     try:
         exec(code, namespace, namespace)  # noqa: S102 — a .pp code block is the feature
     except Exception as exc:  # noqa: BLE001

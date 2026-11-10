@@ -11,6 +11,8 @@ use crate::worker;
 pub struct CliRequest {
     pub pipeline: PathBuf,
     pub inputs: Vec<String>,
+    /// `--set name=value` texts for the document's variables.
+    pub overrides: std::collections::BTreeMap<String, String>,
     pub output: Option<PathBuf>,
     pub node: Option<String>,
     pub full: bool,
@@ -25,6 +27,10 @@ pub fn run_pipeline(request: CliRequest) -> i32 {
         }
     };
     let graph = doc.graph();
+    if let Err(message) = graph::apply_overrides(&graph.variables, &request.overrides) {
+        eprintln!("{message}");
+        return 2;
+    };
     let sources: Vec<_> = graph
         .nodes
         .iter()
@@ -36,8 +42,8 @@ pub fn run_pipeline(request: CliRequest) -> i32 {
         })
         .map(|node| node.id.clone())
         .collect();
-    let mut overrides = std::collections::BTreeMap::new();
-    if let Err(message) = apply_inputs(&sources, &request.inputs, &mut overrides) {
+    let mut inputs = std::collections::BTreeMap::new();
+    if let Err(message) = apply_inputs(&sources, &request.inputs, &mut inputs) {
         eprintln!("{message}");
         return 2;
     }
@@ -82,10 +88,14 @@ pub fn run_pipeline(request: CliRequest) -> i32 {
             .pipeline
             .parent()
             .map(|path| path.display().to_string()),
-        inputs: overrides,
+        inputs,
         op: JobOp::Export,
         output: Some(output.display().to_string()),
         window: Some(if request.full { TABLE_WINDOW } else { 10_000 }),
+        stats: false,
+        nodes: Vec::new(),
+        // The worker parses these again per the declared kind.
+        overrides: request.overrides.clone(),
     };
     match worker::run_job(&job) {
         Ok(reply) => {
@@ -185,6 +195,7 @@ fn apply_inputs(
 
 pub fn usage() -> &'static str {
     "\
+ompp run file.pp [--set key=value]... [--input id=path]... [--node id] [--output path] [--full]
 ompp [--pipeline file.pp] [--input path] [--input id=path] [--output path] [--node id] [--full]
 ompp gui
 ompp file.pp
@@ -192,6 +203,70 @@ ompp --version
 ompp --demo empty|graph|preview|link-snap|link-reject|inspector|chart|dark|light"
 }
 
+pub fn run_usage() -> &'static str {
+    "\
+ompp run file.pp [--set key=value]... [--input id=path]... [--node id] [--output path] [--full]
+
+--set name=value  a value for a pipeline variable, parsed per its declared kind
+--input id=path   replaces the path of a source node
+--node id         the node to export; default is the single sink
+--output path     where the CSV goes; without it the CSV goes to stdout
+--full            no 10,000-row preview cap"
+}
+
 pub fn version_line() -> String {
     format!("ompp {} {}", env!("CARGO_PKG_VERSION"), env!("OMPP_TARGET"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph::VarKind;
+    use graph::Variable;
+    use serde_json::json;
+
+    fn declared() -> Vec<Variable> {
+        vec![
+            Variable {
+                name: "rows".into(),
+                kind: VarKind::Int,
+                value: json!(3),
+            },
+            Variable {
+                name: "data".into(),
+                kind: VarKind::Path,
+                value: json!("orders.csv"),
+            },
+        ]
+    }
+
+    #[test]
+    fn override_validation_names_the_problem() {
+        let mut good = std::collections::BTreeMap::new();
+        good.insert("rows".to_string(), "2".to_string());
+        assert!(graph::apply_overrides(&declared(), &good).is_ok());
+        let mut unknown = std::collections::BTreeMap::new();
+        unknown.insert("nope".to_string(), "2".to_string());
+        let message = graph::apply_overrides(&declared(), &unknown).unwrap_err();
+        assert!(message.contains("unknown variable nope"), "{message}");
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("rows".to_string(), "two".to_string());
+        let message = graph::apply_overrides(&declared(), &bad).unwrap_err();
+        assert!(message.contains("rows"), "{message}");
+    }
+
+    #[test]
+    fn the_example_variables_file_validates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/vars.pp");
+        let doc = Document::load(&path).expect("vars.pp loads");
+        let variables = &doc.graph().variables;
+        assert_eq!(variables.len(), 2);
+        let mut good = std::collections::BTreeMap::new();
+        good.insert("rows".to_string(), "2".to_string());
+        good.insert("data".to_string(), "orders.csv".to_string());
+        assert!(graph::apply_overrides(variables, &good).is_ok());
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("rows".to_string(), "many".to_string());
+        assert!(graph::apply_overrides(variables, &bad).is_err());
+    }
 }
