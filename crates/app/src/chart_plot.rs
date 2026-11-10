@@ -1,19 +1,14 @@
 //! A chart feature drawn with GPUI Kit Plot. Cards and wires are not plotted.
 
+use canvas::PlotPoint;
 use gpui_kit::base::plot::scale::{Scale, ScaleBand, ScaleLinear};
 use gpui_kit::base::plot::shape::{Arc, Area, Bar, Line, Pie};
 use gpui_kit::base::plot::{Plot, PlotElement};
 use gpui_kit::{App, Bounds, ElementId, Hsla, IntoElement, Pixels, Window, point, px};
 
-#[derive(Clone)]
-pub struct Datum {
-    pub x: String,
-    pub y: f32,
-}
-
 pub struct FeaturePlot {
     pub mark: String,
-    pub data: Vec<Datum>,
+    pub data: Vec<PlotPoint>,
     pub color: Hsla,
     pub reduced_motion: bool,
 }
@@ -43,7 +38,7 @@ impl Plot for FeaturePlot {
         let color = self.color;
         match self.mark.as_str() {
             "bar" | "histogram" => {
-                let labels: Vec<String> = self.data.iter().map(|datum| datum.x.clone()).collect();
+                let labels: Vec<String> = self.data.iter().map(|point| point.x.clone()).collect();
                 let max = self
                     .data
                     .iter()
@@ -58,9 +53,9 @@ impl Plot for FeaturePlot {
                 Bar::new()
                     .data(rows)
                     .band_width(band)
-                    .cross(move |datum: &Datum| x.tick(&datum.x))
+                    .cross(move |point: &PlotPoint| x.tick(&point.x))
                     .base(move |_| baseline)
-                    .value(move |datum: &Datum| y.tick(&datum.y))
+                    .value(move |point: &PlotPoint| y.tick(&point.y))
                     .fill(move |_, _, _| color)
                     .paint(&bounds, window, cx);
             }
@@ -81,7 +76,7 @@ impl Plot for FeaturePlot {
             }
             "pie" => {
                 let rows = self.data.clone();
-                let pie = Pie::new().value(|datum: &Datum| Some(datum.y));
+                let pie = Pie::new().value(|point: &PlotPoint| Some(point.y));
                 let arcs = pie.arcs(&rows);
                 let radius = width.min(height) * 0.38;
                 let arc = Arc::new().inner_radius(radius * 0.45).outer_radius(radius);

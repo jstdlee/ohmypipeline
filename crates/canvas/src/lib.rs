@@ -6,9 +6,11 @@
 mod layout;
 mod model;
 mod motion;
+mod plot;
 
 pub use layout::{
     Cubic, PortSlot, Side, card_height, card_rect, cubic_point, port_slots, to_local, wire_cubic,
     wire_hit,
 };
-pub use model::{CanvasEvent, CanvasModel, Dot, Tool};
+pub use model::{CanvasEvent, CanvasModel, Dot, FrameView, Tool};
+pub use plot::{PlotPoint, feature_chart, points_from};

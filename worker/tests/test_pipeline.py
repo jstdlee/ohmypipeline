@@ -269,5 +269,117 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(reply["rows"][0][0], 1)
 
 
+    def test_csv_skiprows_drops_the_preamble(self):
+        csv_path = self.tmp / "preamble.csv"
+        csv_path.write_text("export\nnotes\nregion,qty\nN,2\nS,3\n", encoding="utf-8")
+        document = graph_of(
+            [
+                node(
+                    "n1",
+                    "read_csv",
+                    {"path": str(csv_path), "skip_rows": 2, "header": "header row", "header_row": 0},
+                )
+            ]
+        )
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n1"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"], ["region", "qty"])
+        self.assertEqual(reply["rows"][0][0], "N")
+        self.assertEqual(reply["rows"][0][1], 2)
+        self.assertEqual(reply["n"], 2)
+
+    def test_csv_header_row_is_not_the_first_line(self):
+        csv_path = self.tmp / "header_row.csv"
+        csv_path.write_text("title\nregion,qty\nN,2\n", encoding="utf-8")
+        document = graph_of(
+            [
+                node(
+                    "n1",
+                    "read_csv",
+                    {"path": str(csv_path), "skip_rows": 0, "header": "header row", "header_row": 1},
+                )
+            ]
+        )
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n1"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"], ["region", "qty"])
+        self.assertEqual(reply["rows"][0][0], "N")
+        self.assertNotIn("title", reply["columns"])
+
+    def test_sqlite_skip_rows_offsets_the_table(self):
+        db = self.tmp / "skip.sqlite"
+        if db.exists():
+            db.unlink()
+        with sqlite3.connect(db) as con:
+            con.execute("create table orders (amount real)")
+            con.executemany("insert into orders values (?)", [(0,), (1,), (2,)])
+        document = graph_of(
+            [node("n1", "read_sql", {"path": str(db), "table": "orders", "skip_rows": 1})]
+        )
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n1"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["rows"][0][0], 1)
+        self.assertEqual(reply["n"], 2)
+
+    def test_excel_header_row_skips_the_title(self):
+        from openpyxl import Workbook
+
+        path = self.tmp / "sales.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["junk"])
+        sheet.append(["region", "qty"])
+        sheet.append(["N", 2])
+        book.save(path)
+        document = graph_of(
+            [
+                node(
+                    "n1",
+                    "read_excel",
+                    {
+                        "path": str(path),
+                        "skip_rows": 0,
+                        "header": "header row",
+                        "header_row": 1,
+                    },
+                )
+            ]
+        )
+        reply = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n1"})
+        self.assertIsNone(reply.get("error"), reply.get("error"))
+        self.assertEqual(reply["columns"], ["region", "qty"])
+        self.assertEqual(reply["rows"][0][0], "N")
+
+    def test_pivot_sums_values_by_index_and_column(self):
+        csv_path = self.tmp / "pivot.csv"
+        csv_path.write_text("region,product,qty\nN,Pen,2\nN,Pen,1\nS,Book,4\n", encoding="utf-8")
+        document = graph_of(
+            [
+                node("n1", "read_csv", {"path": str(csv_path)}),
+                node(
+                    "n2",
+                    "pivot",
+                    {"index": "region", "columns": "product", "values": "qty", "agg": "sum"},
+                ),
+                node("n3", "preview_table"),
+                node("n4", "chart", {"mark": "line", "x": "region", "y": "Pen"}),
+            ],
+            [edge("n1", "n2"), edge("n2", "n3"), edge("n2", "n4")],
+        )
+        pivot = run_job({"generation": 1, "mode": "preview", "graph": document, "node": "n2"})
+        self.assertIsNone(pivot.get("error"), pivot.get("error"))
+        self.assertIn("region", pivot["columns"])
+        self.assertIn("Pen", pivot["columns"])
+        self.assertIn("Book", pivot["columns"])
+        pen = pivot["columns"].index("Pen")
+        north = next(row for row in pivot["rows"] if row[pivot["columns"].index("region")] == "N")
+        self.assertEqual(north[pen], 3)
+        table = run_job({"generation": 2, "mode": "preview", "graph": document, "node": "n3"})
+        self.assertEqual(table["rows"], pivot["rows"])
+        chart = run_job({"generation": 3, "mode": "preview", "graph": document, "node": "n4"})
+        self.assertEqual(chart["columns"], pivot["columns"])
+        self.assertIsNone(chart.get("error"), chart.get("error"))
+
+
 if __name__ == "__main__":
     unittest.main()

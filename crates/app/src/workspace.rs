@@ -4,10 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use canvas::{CanvasEvent, CanvasModel, Dot, Side, Tool, port_slots};
+use canvas::{CanvasEvent, CanvasModel, Dot, Side, Tool, feature_chart, points_from, port_slots};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::chart::BarChart;
 use gpui_kit::component::dock::{
     BasePanel, DockArea, DockLayout, DockSkin, Panel, PanelEvent, panel_handle,
 };
@@ -23,7 +22,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, S
 use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Corners, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, Window, actions, div, px,
 };
@@ -33,7 +32,7 @@ use graph::{
 };
 use serde_json::{Value, json};
 
-use crate::chart_plot::{Datum, FeaturePlot};
+use crate::chart_plot::FeaturePlot;
 use crate::worker::Worker;
 
 actions!(
@@ -87,6 +86,17 @@ pub struct Session {
     pub assist_note: Option<String>,
     pub assist_fill: Option<(String, String, String)>,
     pub assist_rx: Option<std::sync::mpsc::Receiver<crate::assist::AssistReply>>,
+    frames: BTreeMap<String, CachedFrame>,
+}
+
+#[derive(Clone)]
+struct CachedFrame {
+    columns: Vec<String>,
+    dtypes: Vec<String>,
+    index: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    n: u64,
+    status: String,
 }
 
 pub enum PathKind {
@@ -106,6 +116,20 @@ impl Session {
         } else {
             None
         }
+    }
+
+    fn show_cached(&mut self, id: &str) -> bool {
+        let Some(frame) = self.frames.get(id).cloned() else {
+            return false;
+        };
+        self.columns = frame.columns;
+        self.dtypes = frame.dtypes;
+        self.index = frame.index;
+        self.rows = frame.rows;
+        self.n = frame.n;
+        self.status = frame.status;
+        self.error = None;
+        true
     }
 
     fn recompute_dots(&self, cx: &mut App) {
@@ -192,6 +216,7 @@ impl Workspace {
             assist_note: None,
             assist_fill: None,
             assist_rx: None,
+            frames: BTreeMap::new(),
         });
         let path_input = cx.new(|cx| InputState::new(window, cx));
         let stored_model = load_model_settings();
@@ -270,6 +295,24 @@ impl Workspace {
                             session.worker.cancel();
                         });
                     }
+                    this.session.update(cx, |session, cx| {
+                        let selected = session
+                            .canvas
+                            .read(cx)
+                            .selected_node()
+                            .map(|node| (node.id.clone(), node.feature.clone()));
+                        if let Some((id, feature)) = selected
+                            && !session.show_cached(&id)
+                            && (feature == "chart" || feature == "preview_table")
+                        {
+                            session.columns.clear();
+                            session.dtypes.clear();
+                            session.index.clear();
+                            session.rows.clear();
+                            session.n = 0;
+                        }
+                        cx.notify();
+                    });
                 }
                 CanvasEvent::FocusInspector | CanvasEvent::OpenCatalog { .. } => {}
             },
@@ -313,7 +356,14 @@ impl Workspace {
         }
         if matches!(
             options.demo.as_deref(),
-            Some("preview") | Some("chart") | Some("dark") | Some("light")
+            Some("preview")
+                | Some("chart")
+                | Some("dark")
+                | Some("light")
+                | Some("outputs")
+                | Some("skip")
+                | Some("pie")
+                | Some("line")
         ) {
             workspace.run(RunMode::Preview, window, cx);
         }
@@ -480,6 +530,25 @@ impl Workspace {
                         session.n = reply.n;
                         let shown = session.rows.len();
                         session.status = status_line(reply.mode, reply.n, shown);
+                        let node_id = session.ran_node.clone().unwrap_or_default();
+                        let cached = CachedFrame {
+                            columns: session.columns.clone(),
+                            dtypes: session.dtypes.clone(),
+                            index: session.index.clone(),
+                            rows: session.rows.clone(),
+                            n: session.n,
+                            status: session.status.clone(),
+                        };
+                        let view_rows: Vec<_> = cached.rows.iter().take(64).cloned().collect();
+                        let view_columns = cached.columns.clone();
+                        let ids = output_views(session.canvas.read(cx).editor().graph(), &node_id);
+                        session.frames.insert(node_id.clone(), cached.clone());
+                        for id in &ids {
+                            session.frames.insert(id.clone(), cached.clone());
+                        }
+                        session.canvas.update(cx, |canvas, cx| {
+                            canvas.set_frames(&ids, view_columns, view_rows, cx);
+                        });
                         if reply.mode == RunMode::Preview {
                             session.full_enabled = true;
                             session.preview_fp = Some(fp);
@@ -585,7 +654,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_worker(cx);
-        let (title, dirty, readonly, full_enabled, prompt, narrow, running, mode, tool, reduced) = {
+        let (title, dirty, readonly, full_enabled, prompt, narrow, running, mode, reduced) = {
             let session = self.session.read(cx);
             let canvas = session.canvas.read(cx);
             let title = canvas
@@ -615,7 +684,6 @@ impl Render for Workspace {
                 window.viewport_size().width < px(960.0),
                 session.running,
                 session.mode,
-                canvas.tool(),
                 session.reduced_motion,
             )
         };
@@ -753,7 +821,6 @@ impl Render for Workspace {
                 full_enabled,
                 running,
                 mode,
-                tool,
                 reduced,
                 narrow,
                 cx,
@@ -846,7 +913,6 @@ impl Workspace {
         full_enabled: bool,
         running: bool,
         mode: RunMode,
-        tool: Tool,
         reduced: bool,
         narrow: bool,
         cx: &mut Context<Self>,
@@ -932,65 +998,6 @@ impl Workspace {
             )
             .content(
                 div()
-                    .ml_2()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .rounded(px(8.0))
-                    .bg(cx.theme().secondary)
-                    .child(tool_button(
-                        "tool-select",
-                        IconName::MousePointer2,
-                        "Select",
-                        tool == Tool::Select,
-                        Tool::Select,
-                        cx,
-                    ))
-                    .child(tool_button(
-                        "tool-hand",
-                        IconName::Hand,
-                        "Hand",
-                        tool == Tool::Hand,
-                        Tool::Hand,
-                        cx,
-                    ))
-                    .child(tool_button(
-                        "tool-note",
-                        IconName::StickyNote,
-                        "Note",
-                        tool == Tool::Note,
-                        Tool::Note,
-                        cx,
-                    ))
-                    .child(tool_button(
-                        "tool-rect",
-                        IconName::Square,
-                        "Rectangle",
-                        tool == Tool::Rectangle,
-                        Tool::Rectangle,
-                        cx,
-                    ))
-                    .child(tool_button(
-                        "tool-circle",
-                        IconName::Circle,
-                        "Circle",
-                        tool == Tool::Circle,
-                        Tool::Circle,
-                        cx,
-                    ))
-                    .child(tool_button(
-                        "tool-label",
-                        IconName::Type,
-                        "Label",
-                        tool == Tool::Label,
-                        Tool::Label,
-                        cx,
-                    )),
-            )
-            .content(
-                div()
                     .flex_1()
                     .min_w(px(0.0))
                     .px_3()
@@ -1058,30 +1065,6 @@ fn icon_button(
         .icon(icon)
         .tooltip_with_action(label.to_string(), action, None)
         .accessibility_label(label.to_string())
-}
-
-fn tool_button(
-    id: &str,
-    icon: IconName,
-    label: &str,
-    selected: bool,
-    tool: Tool,
-    cx: &mut gpui_kit::Context<Workspace>,
-) -> Button {
-    Button::new(SharedString::from(id.to_string()))
-        .ghost()
-        .compact()
-        .icon(icon)
-        .selected(selected)
-        .tooltip(label.to_string())
-        .accessibility_label(label.to_string())
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.session.update(cx, |session, cx| {
-                session
-                    .canvas
-                    .update(cx, |canvas, cx| canvas.set_tool(tool, cx));
-            });
-        }))
 }
 
 fn play_reel(
@@ -1268,6 +1251,60 @@ fn reel_run(session: &mut Session, t: f32, cx: &mut gpui_kit::Context<Session>) 
     }
 }
 
+fn load_sales_demo(demo: &str, canvas: &Entity<CanvasModel>, cx: &mut App) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let csv = root.join("examples/sales.csv");
+    let csv = csv.canonicalize().unwrap_or(csv);
+    canvas.update(cx, |canvas, cx| {
+        let mut doc = graph::Document::new();
+        let read = doc
+            .add_node("read_csv", graph::Point::new(48.0, 72.0))
+            .unwrap();
+        doc.set_param(&read, "path", json!(csv.display().to_string()));
+        doc.set_param(&read, "skip_rows", json!(1));
+        doc.set_param(&read, "header", json!("header row"));
+        doc.set_param(&read, "header_row", json!(0));
+        doc.set_label(&read, "sales.csv".into());
+        let pivot = doc
+            .add_node("pivot", graph::Point::new(360.0, 72.0))
+            .unwrap();
+        doc.set_label(&pivot, "Qty by region".into());
+        doc.set_param(&pivot, "index", json!("region"));
+        doc.set_param(&pivot, "columns", json!("product"));
+        doc.set_param(&pivot, "values", json!("qty"));
+        doc.set_param(&pivot, "agg", json!("sum"));
+        let table = doc
+            .add_node("preview_table", graph::Point::new(360.0, 300.0))
+            .unwrap();
+        let line = doc
+            .add_node("chart", graph::Point::new(760.0, 32.0))
+            .unwrap();
+        doc.set_label(&line, "Pen by region".into());
+        doc.set_param(&line, "mark", json!("line"));
+        doc.set_param(&line, "x", json!("region"));
+        doc.set_param(&line, "y", json!("Pen"));
+        let pie = doc
+            .add_node("chart", graph::Point::new(760.0, 300.0))
+            .unwrap();
+        doc.set_label(&pie, "Book by region".into());
+        doc.set_param(&pie, "mark", json!("pie"));
+        doc.set_param(&pie, "x", json!("region"));
+        doc.set_param(&pie, "y", json!("Book"));
+        let _ = doc.connect(&read, "out", &pivot, "in");
+        let _ = doc.connect(&pivot, "out", &table, "in");
+        let _ = doc.connect(&pivot, "out", &line, "in");
+        let _ = doc.connect(&pivot, "out", &pie, "in");
+        canvas.load_document(doc, cx);
+        let selected = match demo {
+            "skip" => read,
+            "pie" => pie,
+            "line" => line,
+            _ => pivot,
+        };
+        canvas.select_only(selected, cx);
+    });
+}
+
 fn load_demo(
     demo: &Option<String>,
     canvas: &Entity<CanvasModel>,
@@ -1292,6 +1329,10 @@ fn load_demo(
         );
     }
     if demo == "empty" {
+        return;
+    }
+    if matches!(demo.as_str(), "outputs" | "skip" | "pie" | "line") {
+        load_sales_demo(demo, canvas, cx);
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1638,6 +1679,11 @@ fn feature_icon(id: &str) -> IconName {
         "literal" => IconName::Hash,
         "python" => IconName::Code,
         "chart" => IconName::ChartColumn,
+        "preview_table" => IconName::Table,
+        "read_json" => IconName::Code,
+        "pivot" | "groupby" | "melt" => IconName::Table,
+        "assign" | "astype" => IconName::Type,
+        "sum" | "mean" | "min" | "max" | "count" | "describe" | "value_counts" => IconName::Hash,
         _ => IconName::Square,
     }
 }
@@ -1674,22 +1720,120 @@ impl Panel for GraphPanel {
     }
 }
 impl Render for GraphPanel {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.canvas.clone())
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tool = self.canvas.read(cx).tool();
+        let canvas = self.canvas.clone();
+        div()
+            .size_full()
+            .relative()
+            .child(self.canvas.clone())
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(12.0))
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .py(px(2.0))
+                            .rounded(px(8.0))
+                            .bg(cx.theme().background)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-select",
+                                IconName::MousePointer2,
+                                "Select",
+                                tool == Tool::Select,
+                                Tool::Select,
+                            ))
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-hand",
+                                IconName::Hand,
+                                "Hand",
+                                tool == Tool::Hand,
+                                Tool::Hand,
+                            ))
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-rect",
+                                IconName::Square,
+                                "Rectangle",
+                                tool == Tool::Rectangle,
+                                Tool::Rectangle,
+                            ))
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-circle",
+                                IconName::Circle,
+                                "Circle",
+                                tool == Tool::Circle,
+                                Tool::Circle,
+                            ))
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-label",
+                                IconName::Type,
+                                "Label",
+                                tool == Tool::Label,
+                                Tool::Label,
+                            ))
+                            .child(canvas_tool(
+                                &canvas,
+                                "tool-note",
+                                IconName::StickyNote,
+                                "Note",
+                                tool == Tool::Note,
+                                Tool::Note,
+                            )),
+                    ),
+            )
     }
+}
+
+fn canvas_tool(
+    canvas: &Entity<CanvasModel>,
+    id: &str,
+    icon: IconName,
+    label: &str,
+    selected: bool,
+    tool: Tool,
+) -> gpui_kit::component::button::Button {
+    let canvas = canvas.clone();
+    Button::new(SharedString::from(id.to_string()))
+        .ghost()
+        .compact()
+        .icon(icon)
+        .selected(selected)
+        .tooltip(label.to_string())
+        .accessibility_label(label.to_string())
+        .on_click(move |_, _, cx| {
+            canvas.update(cx, |canvas, cx| canvas.set_tool(tool, cx));
+        })
 }
 
 struct ChartPanel {
     focus: FocusHandle,
     session: Entity<Session>,
     drag: Option<(f32, f32)>,
+    _sub: Subscription,
 }
 impl ChartPanel {
     fn new(session: Entity<Session>, cx: &mut Context<Self>) -> Self {
+        let sub = cx.observe(&session, |_, _, cx| cx.notify());
         Self {
             focus: cx.focus_handle(),
             session,
             drag: None,
+            _sub: sub,
         }
     }
 }
@@ -1741,33 +1885,16 @@ impl Render for ChartPanel {
         };
         let x_name = node.param_str("x");
         let y_name = node.param_str("y");
+        let series_name = node.param_str("series");
         let mark = node.param_str("mark");
-        let y_index = columns.iter().position(|col| col == &y_name);
-        let x_index = columns.iter().position(|col| col == &x_name);
-        let mut data = Vec::new();
-        let mut numeric = true;
-        for row in &rows {
-            let x = x_index
-                .and_then(|ix| row.get(ix))
-                .map(cell_text)
-                .unwrap_or_else(|| data.len().to_string());
-            let y = y_index
-                .and_then(|ix| row.get(ix))
-                .and_then(|value| match value {
-                    Value::Number(n) => n.as_f64().map(|n| n as f32),
-                    Value::String(text) => text.parse().ok(),
-                    _ => None,
-                });
-            match y {
-                Some(y) => data.push(Datum { x, y }),
-                None => numeric = false,
-            }
-        }
-        if !numeric && y_index.is_some() {
+        if rows.is_empty() {
             return div()
-                .p_4()
-                .text_color(cx.theme().danger)
-                .child(format!("{y_name} is not numeric"))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .child("Run preview to draw this chart")
                 .into_any_element();
         }
         if n > CHART_POINT_CAP as u64 {
@@ -1776,42 +1903,53 @@ impl Render for ChartPanel {
                 .child(format!("{n} points. Aggregate or sample before charting."))
                 .into_any_element();
         }
+        let points = match points_from(&columns, &rows, &x_name, &y_name, &series_name) {
+            Ok(points) => points,
+            Err(message) => {
+                return div()
+                    .p_4()
+                    .text_color(cx.theme().danger)
+                    .child(message)
+                    .into_any_element();
+            }
+        };
         let title = node
             .presentation
             .as_ref()
             .and_then(|item| item.title.text.clone())
             .filter(|text| !text.is_empty())
-            .unwrap_or_else(|| "Chart".into());
-        let color = cx.theme().chart_1;
+            .unwrap_or_else(|| node.label.clone());
+        let colors = [
+            cx.theme().chart_1,
+            cx.theme().chart_2,
+            cx.theme().chart_3,
+            cx.theme().chart_4,
+            cx.theme().chart_5,
+        ];
         let note = if error.is_some() {
             error.unwrap_or_default()
         } else {
             "preview · the chart draws this window".into()
         };
         let _ = self.drag;
-        let y_label = y_name.clone();
-        let plot = if matches!(mark.as_str(), "bar" | "histogram") {
-            BarChart::new(data)
-                .id("feature-bars")
-                .band(|datum: &Datum| datum.x.clone())
-                .value(|datum: &Datum| datum.y)
-                .value_axis(true)
-                .value_tick_count(4)
-                .grid(true)
-                .padding_inner(0.32)
-                .corner_radii(Corners::all(px(3.0)))
-                .name(y_label)
-                .fill(move |_, _, _, _| color)
-                .appear(!reduced)
-                .into_any_element()
-        } else {
+        let plot = if matches!(mark.as_str(), "area" | "scatter") {
             FeaturePlot {
-                mark,
-                data,
-                color,
+                mark: mark.clone(),
+                data: points,
+                color: colors[0],
                 reduced_motion: reduced,
             }
             .into_any_element()
+        } else {
+            feature_chart(
+                &mark,
+                points,
+                colors,
+                cx.theme().foreground,
+                reduced,
+                true,
+                &node.id,
+            )
         };
         div()
             .size_full()
@@ -1857,6 +1995,7 @@ struct MapRow {
 }
 impl InspectorPanel {
     fn new(session: Entity<Session>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.observe(&session, |_, _, cx| cx.notify()).detach();
         Self {
             focus: cx.focus_handle(),
             session,
@@ -2448,7 +2587,14 @@ impl Render for InspectorPanel {
             &self.session.read(cx).columns,
         );
         let def = node.def();
+        let mark = node.param_str("mark");
         for field in &self.fields {
+            if node.feature == "chart" && field.name == "bins" && mark != "histogram" {
+                continue;
+            }
+            if node.feature == "chart" && field.name == "series" && mark == "pie" {
+                continue;
+            }
             let kind = def
                 .and_then(|def| def.params.iter().find(|param| param.name == field.name))
                 .map(|param| param.kind);
@@ -2456,7 +2602,19 @@ impl Render for InspectorPanel {
                 .and_then(|def| def.params.iter().find(|param| param.name == field.name))
                 .map(|param| param.options)
                 .unwrap_or(&[]);
-            let label = field_label(&field.name);
+            let label = if node.feature == "chart" && mark == "pie" && field.name == "x" {
+                "Category".to_string()
+            } else if node.feature == "chart" && mark == "pie" && field.name == "y" {
+                "Value".to_string()
+            } else if node.feature == "groupby" && field.name == "by" {
+                "Group by".to_string()
+            } else if node.feature == "sort_values" && field.name == "by" {
+                "Sort by".to_string()
+            } else if node.feature == "pivot" && field.name == "columns" {
+                "Columns".to_string()
+            } else {
+                field_label(&field.name)
+            };
             let help = field_help(&field.name);
             body = body.child(
                 div()
@@ -2696,20 +2854,69 @@ impl Render for InspectorPanel {
 }
 
 fn column_choices(graph: &graph::Graph, node: &str, preview: &[String]) -> Vec<String> {
+    let feature = graph
+        .node(node)
+        .map(|node| node.feature.as_str())
+        .unwrap_or("");
+    if matches!(feature, "chart" | "preview_table") && !preview.is_empty() {
+        return preview.to_vec();
+    }
     if let Ok(order) = ancestors(graph, node) {
-        for id in &order {
-            let Some(node) = graph.node(id) else {
+        for id in order.iter().rev() {
+            let Some(reader) = graph.node(id) else {
                 continue;
             };
-            if node.feature == "read_csv" {
-                let path = node.param_str("path");
-                if let Ok(headers) = graph::csv_headers(std::path::Path::new(&path)) {
-                    return headers;
-                }
+            if reader.feature != "read_csv" {
+                continue;
+            }
+            if reader.param_str("header") == "no header" {
+                break;
+            }
+            let skip = reader.param_i64("skip_rows").unwrap_or(0).max(0) as usize;
+            let header = reader.param_i64("header_row").unwrap_or(0).max(0) as usize;
+            let path = reader.param_str("path");
+            if let Ok(headers) =
+                graph::csv_headers_after(std::path::Path::new(&path), skip.saturating_add(header))
+            {
+                return headers;
             }
         }
     }
     preview.to_vec()
+}
+
+fn output_views(graph: &graph::Graph, ran: &str) -> Vec<String> {
+    let output = |id: &str| {
+        graph
+            .node(id)
+            .is_some_and(|node| node.feature == "chart" || node.feature == "preview_table")
+    };
+    let mut ids = Vec::new();
+    if output(ran) {
+        ids.push(ran.to_string());
+        let parents: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to == ran)
+            .map(|edge| edge.from.clone())
+            .collect();
+        for parent in parents {
+            for edge in &graph.edges {
+                if edge.from == parent && output(&edge.to) {
+                    ids.push(edge.to.clone());
+                }
+            }
+        }
+    } else {
+        for edge in &graph.edges {
+            if edge.from == ran && output(&edge.to) {
+                ids.push(edge.to.clone());
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn field_label(name: &str) -> String {
@@ -2723,19 +2930,41 @@ fn field_label(name: &str) -> String {
         "y" => "Y".into(),
         "series" => "Series".into(),
         "bins" => "Bins".into(),
-        "by" => "Sort by".into(),
+        "by" => "By".into(),
         "ascending" => "Ascending".into(),
         "how" => "Join".into(),
         "on" => "Key".into(),
         "kind" => "Kind".into(),
         "value" => "Value".into(),
         "code" => "Code".into(),
+        "skip_rows" => "Skip rows".into(),
+        "header" => "Header".into(),
+        "header_row" => "Header row".into(),
+        "columns" => "Columns".into(),
+        "agg" => "Aggregation".into(),
+        "index" => "Index".into(),
+        "values" => "Values".into(),
+        "id_vars" => "Id columns".into(),
+        "dtype" => "Type".into(),
+        "decimals" => "Decimals".into(),
+        "old" => "Find".into(),
+        "new" => "Replace with".into(),
         other => other.into(),
     }
 }
 
 fn field_help(name: &str) -> &'static str {
     match name {
+        "skip_rows" => "Lines to discard before the header. For SQLite, rows to skip.",
+        "header_row" => "Which remaining row is the header. 0 is the first.",
+        "header" => "Use a header row, or treat every row as data.",
+        "index" => "Row labels of the pivot.",
+        "columns" => "Which columns to keep, or the pivot column.",
+        "values" => "Numbers to aggregate.",
+        "agg" => "How the values combine.",
+        "series" => "One line for each value in this column.",
+        "x" => "Horizontal axis. On a pie chart this is the category.",
+        "y" => "Vertical axis. On a pie chart this is the slice size.",
         "n" => "How many rows to keep.",
         "expr" => "A pandas query expression.",
         "code" => "def run(...) is the block the pipeline calls.",
@@ -2745,7 +2974,7 @@ fn field_help(name: &str) -> &'static str {
 }
 
 fn coerce(name: &str, text: &str) -> Value {
-    if name == "n" || name == "bins" {
+    if matches!(name, "n" | "bins" | "skip_rows" | "header_row" | "decimals") {
         json!(text.parse::<i64>().unwrap_or(0))
     } else if name == "ascending" {
         json!(text == "true")
@@ -2762,6 +2991,7 @@ struct PreviewPanel {
     table: Entity<TableState<PreviewTable>>,
     search: Entity<InputState>,
     _sub: Subscription,
+    _search_sub: Subscription,
 }
 impl PreviewPanel {
     fn new(
@@ -2783,6 +3013,17 @@ impl PreviewPanel {
             )
         });
         let table_for_sub = table.clone();
+        let search_for_sub = search.clone();
+        let session_for_search = session.clone();
+        let search_sub = cx.subscribe(&search_for_sub, move |_, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let value = input.read(cx).value().to_string();
+                session_for_search.update(cx, |session, cx| {
+                    session.search = value;
+                    cx.notify();
+                });
+            }
+        });
         let sub = cx.observe(&session, move |_, session, cx| {
             let session = session.read(cx);
             let columns = session.columns.clone();
@@ -2815,6 +3056,7 @@ impl PreviewPanel {
             table,
             search,
             _sub: sub,
+            _search_sub: search_sub,
         }
     }
 }
@@ -2864,25 +3106,29 @@ impl Render for PreviewPanel {
                     .gap_2()
                     .items_center()
                     .child(Input::new(&self.search).small())
-                    .child(
-                        Button::new("add-search")
-                            .small()
-                            .ghost()
-                            .label("Add as node")
-                            .on_click(move |_, _, cx| {
-                                session.update(cx, |session, cx| {
-                                    let expr = session.search.clone();
+                    .when(!self.search.read(cx).value().is_empty(), |row| {
+                        let search = self.search.clone();
+                        row.child(
+                            Button::new("add-search")
+                                .small()
+                                .ghost()
+                                .label("Add as query")
+                                .on_click(move |_, _, cx| {
+                                    let expr = search.read(cx).value().to_string();
                                     if expr.is_empty() {
                                         return;
                                     }
-                                    session.canvas.update(cx, |canvas, cx| {
-                                        if let Some(id) = canvas.add_feature("query", cx) {
-                                            canvas.set_param(&id, "expr", json!(expr), cx);
-                                        }
+                                    session.update(cx, |session, cx| {
+                                        session.search = expr.clone();
+                                        session.canvas.update(cx, |canvas, cx| {
+                                            if let Some(id) = canvas.add_feature("query", cx) {
+                                                canvas.set_param(&id, "expr", json!(expr), cx);
+                                            }
+                                        });
                                     });
-                                });
-                            }),
-                    ),
+                                }),
+                        )
+                    }),
             )
             .child(if has_rows {
                 div()

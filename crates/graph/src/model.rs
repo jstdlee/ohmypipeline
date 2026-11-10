@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::CARD_WIDTH;
 use crate::feature::{self, FeatureDef};
 use crate::geom::{Camera, Point, Rect};
 use crate::types::TypeName;
@@ -458,7 +457,25 @@ impl Node {
                 }
             }
             "python" => "code block".to_string(),
-            "chart" => self.param_str("mark"),
+            "chart" => {
+                let mark = self.param_str("mark");
+                let x = self.param_str("x");
+                let y = self.param_str("y");
+                if x.is_empty() && y.is_empty() {
+                    mark
+                } else if mark == "pie" {
+                    format!("pie {x} · {y}")
+                } else {
+                    format!("{mark} {x} · {y}")
+                }
+            }
+            "pivot" => {
+                let index = self.param_str("index");
+                let columns = self.param_str("columns");
+                let values = self.param_str("values");
+                format!("{index} × {columns} · {values}")
+            }
+            "preview_table" => "table".to_string(),
             "sort_values" => {
                 let by = self.param_str("by");
                 if by.is_empty() {
@@ -668,7 +685,7 @@ pub fn bounds_of(
         let r = Rect {
             x: node.position[0],
             y: node.position[1],
-            w: CARD_WIDTH,
+            w: crate::card_width(&node.feature),
             h: card_height(node),
         };
         rect = Some(match rect {

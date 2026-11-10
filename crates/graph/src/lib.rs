@@ -32,9 +32,18 @@ pub use protocol::{
     CHART_POINT_CAP, CellText, Job, JobOp, PREVIEW_ROW_CAP, Reply, RunMode, TABLE_WINDOW,
     WorkerError, cell_text, decode_frame, encode_frame, read_frame, status_line, write_frame,
 };
-pub use sniff::{csv_headers, sniff_separator};
+pub use sniff::{csv_headers, csv_headers_after, sniff_separator};
 pub use types::TypeName;
 
 pub const FORMAT: &str = "ohmypipeline";
 pub const VERSION: u32 = 1;
 pub const CARD_WIDTH: f32 = 220.0;
+
+/// Output nodes are wider so a table or a plot can sit on the card.
+pub fn card_width(feature: &str) -> f32 {
+    match feature {
+        "chart" => 360.0,
+        "preview_table" => 300.0,
+        _ => CARD_WIDTH,
+    }
+}

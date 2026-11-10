@@ -214,8 +214,32 @@ def compute_node(
 
 def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str, Any]) -> str | None:
     kind = node.get("type")
-    if kind in ("read_csv", "read_excel", "read_sql", "change_headers", "query", "to_frame", "merge"):
+    if kind in (
+        "read_csv",
+        "read_excel",
+        "read_sql",
+        "read_json",
+        "change_headers",
+        "query",
+        "to_frame",
+        "merge",
+        "drop",
+        "filter",
+        "assign",
+        "melt",
+        "pivot",
+        "groupby",
+        "describe",
+        "set_index",
+        "nlargest",
+        "nsmallest",
+        "astype",
+        "preview_table",
+        "chart",
+    ):
         return "dataframe"
+    if kind in ("value_counts", "sum", "mean", "min", "max", "count"):
+        return "series"
     if kind == "column":
         return "series"
     if kind == "literal":
@@ -224,7 +248,20 @@ def declared_type(node: dict[str, Any], graph: dict[str, Any], values: dict[str,
         output = node.get("output") or {}
         accepts = output.get("accepts") or ["dataframe"]
         return accepts[0]
-    if kind in ("head", "sort_values", "concat"):
+    if kind in (
+        "head",
+        "tail",
+        "sample",
+        "sort_values",
+        "concat",
+        "dropna",
+        "fillna",
+        "replace",
+        "drop_duplicates",
+        "reset_index",
+        "abs",
+        "round",
+    ):
         return input_type(node, graph, values)
     return None
 
@@ -288,13 +325,12 @@ def execute(
 
     if kind == "read_csv":
         path = resolve_path(node_id, params, wired("path"), overrides, base_dir)
-        return read_csv(node_id, path, preview)
+        return read_csv(node_id, path, preview, params)
     if kind == "read_excel":
         path = resolve_path(node_id, params, wired("path"), overrides, base_dir)
         sheet = params.get("sheet") or 0
         kwargs: dict[str, Any] = {"sheet_name": sheet}
-        if preview:
-            kwargs["nrows"] = PREVIEW_ROW_CAP
+        kwargs.update(reader_kwargs(params, preview))
         try:
             return pd.read_excel(path, **kwargs)
         except Exception as exc:  # noqa: BLE001
@@ -305,8 +341,15 @@ def execute(
         if not _IDENT.match(table):
             raise NodeError(node_id, "read_sql needs a table name")
         sql = f'SELECT * FROM "{table}"'
+        skip = params.get("skip_rows")
+        try:
+            offset = 0 if skip in (None, "") else int(skip)
+        except (TypeError, ValueError):
+            offset = 0
         if preview:
-            sql += f" LIMIT {PREVIEW_ROW_CAP}"
+            sql += f" LIMIT {PREVIEW_ROW_CAP} OFFSET {offset}"
+        elif offset:
+            sql += f" LIMIT -1 OFFSET {offset}"
         try:
             with sqlite3.connect(path) as con:
                 return pd.read_sql(sql, con)
@@ -385,10 +428,196 @@ def execute(
         if code is None:
             code = str(params.get("code") or "")
         return run_python(node_id, str(code), graph, node, values)
-    if kind == "chart":
-        frame = require_frame_or_series()
-        return frame
+    if kind in ("chart", "preview_table"):
+        return require_frame_or_series()
+    extra = run_extra(kind, node_id, graph, params, wired, require_frame_or_series, preview, base_dir, overrides)
+    if extra is not _MISSING:
+        return extra
     raise NodeError(node_id, f"unknown feature {kind}")
+
+
+_MISSING = object()
+
+
+def _columns(text: Any) -> list[str]:
+    raw = "" if text is None else str(text)
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _int_param(node_id: str, value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise NodeError(node_id, "expected an integer") from exc
+
+
+def run_extra(kind, node_id, graph, params, wired, require_frame_or_series, preview, base_dir, overrides):
+    if kind == "read_json":
+        path = resolve_path(node_id, params, wired("path"), overrides, base_dir)
+        try:
+            frame = pd.read_json(path)
+        except Exception as exc:  # noqa: BLE001
+            raise NodeError(node_id, f"read_json failed: {exc}") from exc
+        if preview:
+            return frame.head(PREVIEW_ROW_CAP)
+        return frame
+    if kind not in {
+        "tail",
+        "sample",
+        "drop",
+        "filter",
+        "drop_duplicates",
+        "nlargest",
+        "nsmallest",
+        "dropna",
+        "fillna",
+        "replace",
+        "astype",
+        "reset_index",
+        "set_index",
+        "assign",
+        "melt",
+        "pivot",
+        "groupby",
+        "describe",
+        "value_counts",
+        "sum",
+        "mean",
+        "min",
+        "max",
+        "count",
+        "abs",
+        "round",
+    }:
+        return _MISSING
+    frame = require_frame_or_series()
+    try:
+        if kind == "tail":
+            return frame.tail(_int_param(node_id, params.get("n"), 5))
+        if kind == "sample":
+            n = _int_param(node_id, params.get("n"), 5)
+            return frame.sample(n=min(n, len(frame)), random_state=0)
+        if kind == "drop":
+            cols = _columns(params.get("columns"))
+            missing = [col for col in cols if col not in frame.columns]
+            if missing:
+                raise NodeError(node_id, f"missing column {missing[0]}")
+            return frame.drop(columns=cols)
+        if kind == "filter":
+            cols = _columns(params.get("columns"))
+            missing = [col for col in cols if col not in frame.columns]
+            if missing:
+                raise NodeError(node_id, f"missing column {missing[0]}")
+            return frame.loc[:, cols]
+        if kind == "drop_duplicates":
+            column = str(params.get("column") or "")
+            if column:
+                return frame.drop_duplicates(subset=[column])
+            return frame.drop_duplicates()
+        if kind in ("nlargest", "nsmallest"):
+            column = str(params.get("column") or "")
+            if column not in getattr(frame, "columns", []):
+                raise NodeError(node_id, f"missing column {column}")
+            n = _int_param(node_id, params.get("n"), 5)
+            method = frame.nlargest if kind == "nlargest" else frame.nsmallest
+            return method(n, column)
+        if kind == "dropna":
+            return frame.dropna()
+        if kind == "fillna":
+            return frame.fillna(params.get("value") if params.get("value") not in (None, "") else 0)
+        if kind == "replace":
+            return frame.replace(params.get("old"), params.get("new"))
+        if kind == "astype":
+            column = str(params.get("column") or "")
+            dtype = str(params.get("dtype") or "float")
+            mapping = {"float": "float64", "int": "int64", "string": "string", "bool": "bool"}
+            if column not in frame.columns:
+                raise NodeError(node_id, f"missing column {column}")
+            out = frame.copy()
+            out[column] = out[column].astype(mapping.get(dtype, dtype))
+            return out
+        if kind == "reset_index":
+            return frame.reset_index(drop=False)
+        if kind == "set_index":
+            column = str(params.get("column") or "")
+            if column not in frame.columns:
+                raise NodeError(node_id, f"missing column {column}")
+            return frame.set_index(column)
+        if kind == "assign":
+            name = str(params.get("name") or "")
+            expr = str(params.get("expr") or "")
+            if not name or not expr:
+                raise NodeError(node_id, "assign needs a name and an expression")
+            out = frame.copy()
+            out[name] = out.eval(expr)
+            return out
+        if kind == "melt":
+            ids = _columns(params.get("id_vars"))
+            return frame.melt(id_vars=ids or None)
+        if kind == "pivot":
+            index = str(params.get("index") or "")
+            columns = str(params.get("columns") or "")
+            values = str(params.get("values") or "")
+            agg = str(params.get("agg") or "sum")
+            if not index:
+                raise NodeError(node_id, "pivot needs an index column")
+            kwargs = {"index": index, "aggfunc": agg}
+            if columns:
+                kwargs["columns"] = columns
+            if values:
+                kwargs["values"] = values
+            table = frame.pivot_table(**kwargs)
+            table = table.reset_index()
+            if isinstance(table.columns, pd.MultiIndex):
+                table.columns = [" ".join(str(part) for part in col if str(part) != "").strip() for col in table.columns]
+            return table
+        if kind == "groupby":
+            by = str(params.get("by") or "")
+            agg = str(params.get("agg") or "sum")
+            if by not in frame.columns:
+                raise NodeError(node_id, f"missing column {by}")
+            grouped = frame.groupby(by, as_index=False)
+            if agg == "count":
+                return grouped.count()
+            if agg == "mean":
+                return grouped.mean(numeric_only=True)
+            if agg == "min":
+                return grouped.min(numeric_only=True)
+            if agg == "max":
+                return grouped.max(numeric_only=True)
+            return grouped.sum(numeric_only=True)
+        if kind == "describe":
+            return frame.describe()
+        if kind == "value_counts":
+            column = str(params.get("column") or "")
+            if column not in frame.columns:
+                raise NodeError(node_id, f"missing column {column}")
+            counts = frame[column].value_counts()
+            return counts.rename("count")
+        if kind in ("sum", "mean", "min", "max", "count"):
+            if isinstance(frame, pd.Series):
+                value = getattr(frame, kind)()
+                return pd.Series([value], name=frame.name or kind)
+            numeric = frame.select_dtypes(include="number") if kind != "count" else frame
+            reduced = getattr(numeric, kind)(numeric_only=True) if kind != "count" else frame.count()
+            return reduced
+        if kind == "abs":
+            if isinstance(frame, pd.Series):
+                return frame.abs()
+            out = frame.copy()
+            numeric = out.select_dtypes(include="number").columns
+            out[numeric] = out[numeric].abs()
+            return out
+        if kind == "round":
+            decimals = _int_param(node_id, params.get("decimals"), 2)
+            return frame.round(decimals)
+    except NodeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise NodeError(node_id, f"{kind} failed: {exc}") from exc
+    return _MISSING
 
 
 def resolve_path(
@@ -412,13 +641,34 @@ def resolve_path(
     return path
 
 
-def read_csv(node_id: str, path: Path, preview: bool) -> pd.DataFrame:
+def reader_kwargs(params: dict[str, Any], preview: bool) -> dict[str, Any]:
+    skip = params.get("skip_rows")
+    try:
+        skip_rows = 0 if skip in (None, "") else int(skip)
+    except (TypeError, ValueError):
+        skip_rows = 0
+    header_row = params.get("header_row")
+    try:
+        header_index = 0 if header_row in (None, "") else int(header_row)
+    except (TypeError, ValueError):
+        header_index = 0
+    # Skip rows first. Header row counts what remains, so a preamble and a
+    # title row are not both applied as absolute file indexes.
+    if str(params.get("header") or "header row") == "no header":
+        kwargs: dict[str, Any] = {"skiprows": skip_rows, "header": None}
+    else:
+        kwargs = {"header": skip_rows + header_index}
+    if preview:
+        kwargs["nrows"] = PREVIEW_ROW_CAP
+    return kwargs
+
+
+def read_csv(node_id: str, path: Path, preview: bool, params: dict[str, Any] | None = None) -> pd.DataFrame:
     if not path.is_file():
         raise NodeError(node_id, f"file not found: {path}")
     sep = sniff_separator(path)
-    kwargs: dict[str, Any] = {"sep": sep}
-    if preview:
-        kwargs["nrows"] = PREVIEW_ROW_CAP
+    kwargs = reader_kwargs(params or {}, preview)
+    kwargs["sep"] = sep
     try:
         return pd.read_csv(path, **kwargs)
     except Exception as exc:  # noqa: BLE001

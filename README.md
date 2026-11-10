@@ -26,6 +26,8 @@ The window, the worker, and the `*.pp` file are in the tree. The release build i
 ```text
 cargo run -p ompp
 cargo run -p ompp -- --pipeline examples/orders.pp --input examples/orders.csv
+
+`examples/sales.pp` is a longer graph: it skips a title row, pivots quantity by region and product, and ends in a preview table, a line plot, and a pie plot.
 ```
 
 The pandas worker is the `pipeline` package under `worker/`. `pandas` is pinned to the 3.1 line. Point `PYTHONPATH` at `worker/`, or set `OMPP_WORKER` to that directory. A repo-local `.venv` is used when it is present.

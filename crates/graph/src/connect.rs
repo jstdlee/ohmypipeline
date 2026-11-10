@@ -284,6 +284,7 @@ mod tests {
     use super::*;
     use crate::geom::Point;
     use crate::model::Node;
+    use crate::types::TypeName;
 
     fn node(id: &str, feature: &str) -> Node {
         Node::new(id, feature, Point::new(0.0, 0.0))
@@ -405,6 +406,34 @@ mod tests {
         ];
         let index = pick_snap(&candidates).unwrap();
         assert_eq!(candidates[index].node, "closer-ok");
+    }
+
+    #[test]
+    fn pivot_accepts_a_table_and_rejects_a_column() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "read_csv"));
+        graph.nodes.push(node("n2", "pivot"));
+        graph.nodes.push(node("n3", "column"));
+        assert!(try_connect(&graph, "n1", "out", "n2", "in").is_ok());
+        assert_eq!(produced_type(&graph, "n2"), Some(TypeName::Dataframe));
+        assert_eq!(
+            try_connect(&graph, "n3", "out", "n2", "in").unwrap_err(),
+            Reject::Type
+        );
+    }
+
+    #[test]
+    fn preview_table_and_plot_are_sinks() {
+        let table = node("t", "preview_table");
+        let plot = node("p", "chart");
+        assert!(table.output_port().is_none());
+        assert!(plot.output_port().is_none());
+        assert!(
+            table
+                .input_ports()
+                .iter()
+                .any(|port| port.accepts.contains(&TypeName::Dataframe))
+        );
     }
 
     #[test]

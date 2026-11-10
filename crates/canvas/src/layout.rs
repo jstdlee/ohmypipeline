@@ -3,7 +3,7 @@
 //! The file stores node positions, not curves. A wire's ends are the port
 //! slots of the cards it joins, so moving a card moves the wire.
 
-use graph::{CARD_WIDTH, Camera, Edge, Node, Point};
+use graph::{Camera, Edge, Node, Point, card_width};
 
 pub const PORT_ROW: f32 = 22.0;
 pub const HEADER: f32 = 28.0;
@@ -30,11 +30,20 @@ pub fn card_height(node: &Node) -> f32 {
         .len()
         .max(usize::from(node.output_port().is_some()))
         .max(1) as f32;
-    HEADER + SUMMARY + PAD_Y + PORT_ROW * rows + PAD_Y
+    let extra = match node.feature.as_str() {
+        "preview_table" => 108.0,
+        "chart" => 196.0,
+        _ => 0.0,
+    };
+    HEADER + SUMMARY + PAD_Y + PORT_ROW * rows + PAD_Y + extra
 }
 
 pub fn card_rect(node: &Node) -> (Point, f32, f32) {
-    (node.position_point(), CARD_WIDTH, card_height(node))
+    (
+        node.position_point(),
+        card_width(&node.feature),
+        card_height(node),
+    )
 }
 
 pub fn port_slots(node: &Node) -> Vec<PortSlot> {
@@ -56,7 +65,7 @@ pub fn port_slots(node: &Node) -> Vec<PortSlot> {
         slots.push(PortSlot {
             name: port.name,
             side: Side::Out,
-            center: Point::new(origin.x + CARD_WIDTH, y),
+            center: Point::new(origin.x + card_width(&node.feature), y),
         });
     }
     slots

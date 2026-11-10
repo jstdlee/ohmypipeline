@@ -41,3 +41,45 @@ Accepted: the opened graph, including a newly added card, should sit inside the 
 Changed: fit uses a 72px margin.
 
 `docs/screenshots/python.png` and `docs/screenshots/textarea.png` show the code block, the growing code field, Pretty, and the named input `frame` with a type row. Those stills were taken before the margin change. The 72px margin is in the fit code so a later open keeps the last card inside the canvas.
+
+## Output nodes
+
+Four passes on the sales graph: a title row, a pivot, a preview table, a line plot, and a pie plot. Ryugi was not run as a tool.
+
+### Round 1
+
+The chart tab stayed on "Run preview to draw this chart" after the preview dock already had rows. The cards on the graph had updated, because the canvas was told about the frame. The chart panel was not.
+
+Accepted: the chart tab and the plot card draw the same reply.
+
+Changed: the chart panel redraws when the session changes.
+
+Checked: `docs/screenshots/pie.png` and `docs/screenshots/line.png`.
+
+### Round 2
+
+Column buttons on the pivot were the first line of the file, "Weekly export", which is the title row the reader skips.
+
+Accepted: a column button is a column the node can actually use.
+
+Changed: header sniffing skips the same preamble and header row the reader uses. After a preview, a plot's buttons are the columns in that frame, so the line plot offers region, Book, and Pen.
+
+Checked: `docs/screenshots/outputs.png` (pivot buttons are region, product, qty, price) and `docs/screenshots/line.png` (X and Y offer region, Book, Pen).
+
+### Round 3
+
+The line and the pie have to be readable on the card and in the chart tab: axes and a hover tooltip for the line, slice labels and a legend for the pie.
+
+Accepted: the chart tab is the large drawing. The card is the same mark, smaller.
+
+Changed: both use GPUI Kit line and pie charts. The legend is a swatch plus the name, under the plot.
+
+Checked: `docs/screenshots/line.png` shows the axes, the Pen legend, and the hover "North / Pen 10". `docs/screenshots/pie.png` shows East, North, and South as slices with labels and a legend. `docs/screenshots/outputs.png` shows those same marks on the cards, next to the preview table.
+
+### Round 4
+
+Skip rows and header row need to be visible while the preview proves the title line is gone.
+
+Accepted: the inspector names the controls, and the table does not contain the preamble.
+
+Checked: `docs/screenshots/skip.png`. Skip rows is 1, Header is "header row", Header row is 0, and the preview columns are region, product, qty, and price. The status line is `preview · at most 10,000 source rows · 6 rows`.

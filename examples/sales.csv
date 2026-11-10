@@ -1,0 +1,8 @@
+Weekly export
+region,product,qty,price
+North,Pen,10,2.5
+North,Book,4,8
+South,Pen,6,2.5
+South,Book,3,8
+East,Pen,5,2.5
+East,Book,7,8

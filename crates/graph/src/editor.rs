@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::CARD_WIDTH;
 use crate::connect::{Reject, try_connect};
 use crate::feature::{self, FeatureDef};
 use crate::file::{self, FileError};
@@ -299,7 +298,7 @@ impl Document {
     pub fn add_after(&mut self, selected: &str, feature_id: &str) -> Option<String> {
         let source = self.graph.node(selected)?.clone();
         let position = snap_grid(Point::new(
-            source.position[0] + CARD_WIDTH + 48.0,
+            source.position[0] + crate::card_width(&source.feature) + 48.0,
             source.position[1],
         ));
         let id = self.add_node(feature_id, position)?;
@@ -719,6 +718,109 @@ impl Document {
         });
     }
 
+    pub fn paste_copies(
+        &mut self,
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+        marks: Vec<Mark>,
+    ) -> (Vec<String>, Vec<String>) {
+        if self.readonly {
+            return (Vec::new(), Vec::new());
+        }
+        let mut new_nodes = Vec::new();
+        let mut new_marks = Vec::new();
+        let mut map = BTreeMap::new();
+        self.mutate(|graph| {
+            for node in nodes {
+                let new_id = graph.alloc_node_id();
+                map.insert(node.id.clone(), new_id.clone());
+                let mut copy = node;
+                copy.id = new_id.clone();
+                let point = snap_grid(Point::new(copy.position[0] + 32.0, copy.position[1] + 32.0));
+                copy.position = [point.x, point.y];
+                graph.nodes.push(copy);
+                new_nodes.push(new_id);
+            }
+            for mut edge in edges {
+                let Some(from) = map.get(&edge.from) else {
+                    continue;
+                };
+                let Some(to) = map.get(&edge.to) else {
+                    continue;
+                };
+                edge.from = from.clone();
+                edge.to = to.clone();
+                edge.id = format!(
+                    "{}:{}->{}:{}",
+                    edge.from, edge.from_port, edge.to, edge.to_port
+                );
+                graph.edges.push(edge);
+            }
+            for mark in marks {
+                let new_id = graph.alloc_mark_id();
+                let mut copy = mark;
+                copy.id = new_id.clone();
+                let point = snap_grid(Point::new(copy.position[0] + 32.0, copy.position[1] + 32.0));
+                copy.position = [point.x, point.y];
+                graph.marks.push(copy);
+                new_marks.push(new_id);
+            }
+        });
+        (new_nodes, new_marks)
+    }
+
+    pub fn nudge(&mut self, node_ids: &[String], mark_ids: &[String], dx: f32, dy: f32) {
+        if self.readonly || (dx == 0.0 && dy == 0.0) {
+            return;
+        }
+        self.mutate(|graph| {
+            for node in &mut graph.nodes {
+                if node_ids.iter().any(|id| id == &node.id) {
+                    node.position[0] += dx;
+                    node.position[1] += dy;
+                }
+            }
+            for mark in &mut graph.marks {
+                if mark_ids.iter().any(|id| id == &mark.id) {
+                    mark.position[0] += dx;
+                    mark.position[1] += dy;
+                }
+            }
+        });
+    }
+
+    pub fn reorder(&mut self, node_ids: &[String], mark_ids: &[String], front: bool) {
+        if self.readonly {
+            return;
+        }
+        self.mutate(|graph| {
+            let node_set: BTreeSet<_> = node_ids.iter().cloned().collect();
+            let mark_set: BTreeSet<_> = mark_ids.iter().cloned().collect();
+            let (mut keep_nodes, mut move_nodes): (Vec<_>, Vec<_>) = graph
+                .nodes
+                .drain(..)
+                .partition(|node| !node_set.contains(&node.id));
+            if front {
+                keep_nodes.append(&mut move_nodes);
+                graph.nodes = keep_nodes;
+            } else {
+                move_nodes.append(&mut keep_nodes);
+                graph.nodes = move_nodes;
+            }
+            let (mut keep_marks, mut move_marks): (Vec<_>, Vec<_>) = graph
+                .marks
+                .drain(..)
+                .partition(|mark| !mark_set.contains(&mark.id));
+            if front {
+                keep_marks.append(&mut move_marks);
+                graph.marks = keep_marks;
+            } else {
+                move_marks.append(&mut keep_marks);
+                graph.marks = move_marks;
+            }
+        });
+    }
+
     pub fn raise_mark(&mut self, id: &str) {
         if self.readonly {
             return;
@@ -1005,6 +1107,15 @@ mod tests {
         assert_eq!(doc.graph().node(&id).unwrap().param_i64("n"), Some(3));
         assert!(doc.undo());
         assert_eq!(doc.graph().node(&id).unwrap().param_i64("n"), Some(5));
+    }
+
+    #[test]
+    fn nudge_moves_only_the_selection() {
+        let (mut doc, a, b) = doc_with_chain();
+        let before = doc.graph().node(&b).unwrap().position;
+        doc.nudge(&[a], &[], 16.0, 0.0);
+        assert_eq!(doc.graph().node(&b).unwrap().position, before);
+        assert!(doc.undo());
     }
 
     #[test]

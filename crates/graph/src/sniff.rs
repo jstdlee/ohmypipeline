@@ -19,9 +19,23 @@ pub fn sniff_separator(header_line: &str) -> u8 {
 }
 
 pub fn csv_headers(path: &Path) -> Result<Vec<String>, String> {
+    csv_headers_after(path, 0)
+}
+
+/// `skip_lines` is the number of records before the header, including both
+/// preamble rows and a non-zero header row.
+pub fn csv_headers_after(path: &Path, skip_lines: usize) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
+    for _ in 0..skip_lines {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        if n == 0 {
+            return Err("header is past the end of the file".into());
+        }
+    }
+    line.clear();
     let n = reader.read_line(&mut line).map_err(|err| err.to_string())?;
     if n == 0 {
         return Err("empty file".into());
@@ -81,6 +95,15 @@ mod tests {
         assert_eq!(sniff_separator("amount,region,month"), b',');
         assert_eq!(sniff_separator("amount\tregion\tmonth"), b'\t');
         assert_eq!(sniff_separator("amount;region;month"), b';');
+    }
+
+    #[test]
+    fn headers_skip_a_preamble_and_a_header_row() {
+        let path = std::env::temp_dir().join("ompp-headers.csv");
+        std::fs::write(&path, "title\nregion,qty\nN,1\n").unwrap();
+        let headers = csv_headers_after(&path, 1).unwrap();
+        assert_eq!(headers, vec!["region".to_string(), "qty".to_string()]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

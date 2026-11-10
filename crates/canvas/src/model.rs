@@ -8,20 +8,23 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, AppContext as _, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, Pixels, Point as GPoint, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px,
 };
 use graph::{
-    CARD_WIDTH, Camera, Document, Edge, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX,
-    SnapCandidate, TypeName, output_types, pick_snap, reject_message, try_connect, type_pair_label,
+    Camera, Document, Edge, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX, SnapCandidate, TypeName,
+    card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
 };
 
 use crate::layout::{self, Side, card_height, port_slots};
 use crate::motion;
+use crate::plot::{feature_chart, points_from};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -108,6 +111,12 @@ pub enum Dot {
     Running,
 }
 
+#[derive(Clone, Debug)]
+pub struct FrameView {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
 pub struct CanvasModel {
     focus: FocusHandle,
     editor: Document,
@@ -121,6 +130,10 @@ pub struct CanvasModel {
     frame_armed: bool,
     hovered: Option<String>,
     flow: f32,
+    clip: Option<Clip>,
+    label_input: Entity<gpui_kit::component::input::InputState>,
+    editing: Option<String>,
+    frames: BTreeMap<String, FrameView>,
     reduced_motion: bool,
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -128,6 +141,23 @@ pub struct CanvasModel {
 
 impl CanvasModel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let label_input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+        cx.subscribe(
+            &label_input,
+            |this, input, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Blur)
+                    && this.editing.is_some()
+                {
+                    let text = input.read(cx).value().to_string();
+                    if let Some(id) = this.editing.clone() {
+                        this.editor.set_mark_text(&id, text);
+                        this.editing = None;
+                        this.changed(cx);
+                    }
+                }
+            },
+        )
+        .detach();
         Self {
             focus: cx.focus_handle(),
             editor: Document::new(),
@@ -141,6 +171,10 @@ impl CanvasModel {
             frame_armed: false,
             hovered: None,
             flow: 0.0,
+            clip: None,
+            label_input,
+            editing: None,
+            frames: BTreeMap::new(),
             reduced_motion: false,
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
@@ -345,6 +379,204 @@ impl CanvasModel {
         cx.emit(CanvasEvent::SelectionChanged);
     }
 
+    pub fn copy_selection(&mut self) {
+        let (node_ids, mark_ids) = self.split_selection();
+        let nodes: Vec<_> = node_ids
+            .iter()
+            .filter_map(|id| self.editor.graph().node(id).cloned())
+            .collect();
+        let selected: std::collections::BTreeSet<_> = node_ids.iter().cloned().collect();
+        let edges: Vec<_> = self
+            .editor
+            .graph()
+            .edges
+            .iter()
+            .filter(|edge| selected.contains(&edge.from) && selected.contains(&edge.to))
+            .cloned()
+            .collect();
+        let marks: Vec<_> = mark_ids
+            .iter()
+            .filter_map(|id| self.editor.graph().mark(id).cloned())
+            .collect();
+        if !nodes.is_empty() || !marks.is_empty() {
+            self.clip = Some(Clip {
+                nodes,
+                edges,
+                marks,
+            });
+        }
+    }
+
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection();
+        self.delete_selection(cx);
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(clip) = self.clip.clone() else {
+            return;
+        };
+        let (nodes, marks) = self.editor.paste_copies(clip.nodes, clip.edges, clip.marks);
+        self.selection = nodes.into_iter().chain(marks).collect();
+        self.changed(cx);
+        cx.emit(CanvasEvent::SelectionChanged);
+    }
+
+    pub fn nudge(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let (nodes, marks) = self.split_selection();
+        if nodes.is_empty() && marks.is_empty() {
+            return;
+        }
+        self.editor.nudge(&nodes, &marks, dx, dy);
+        self.changed(cx);
+    }
+
+    pub fn align(&mut self, how: &str, cx: &mut Context<Self>) {
+        let (node_ids, mark_ids) = self.split_selection();
+        if node_ids.len() + mark_ids.len() < 2 {
+            return;
+        }
+        #[derive(Clone)]
+        struct Item {
+            id: String,
+            x: f32,
+            y: f32,
+            w: f32,
+            h: f32,
+            node: bool,
+        }
+        let mut items = Vec::new();
+        for id in &node_ids {
+            let Some(node) = self.editor.graph().node(id) else {
+                continue;
+            };
+            let at = node.position_point();
+            items.push(Item {
+                id: id.clone(),
+                x: at.x,
+                y: at.y,
+                w: card_width(&node.feature),
+                h: card_height(node),
+                node: true,
+            });
+        }
+        for id in &mark_ids {
+            let Some(mark) = self.editor.graph().mark(id) else {
+                continue;
+            };
+            let size = mark.size.unwrap_or([140.0, 80.0]);
+            items.push(Item {
+                id: id.clone(),
+                x: mark.position[0],
+                y: mark.position[1],
+                w: size[0],
+                h: size[1],
+                node: false,
+            });
+        }
+        if items.len() < 2 {
+            return;
+        }
+        let min_x = items.iter().map(|item| item.x).fold(f32::MAX, f32::min);
+        let min_y = items.iter().map(|item| item.y).fold(f32::MAX, f32::min);
+        let max_r = items
+            .iter()
+            .map(|item| item.x + item.w)
+            .fold(f32::MIN, f32::max);
+        let max_b = items
+            .iter()
+            .map(|item| item.y + item.h)
+            .fold(f32::MIN, f32::max);
+        let mid_x = (min_x + max_r) * 0.5;
+        let mid_y = (min_y + max_b) * 0.5;
+        if how == "distribute-h" || how == "distribute-v" {
+            let horizontal = how == "distribute-h";
+            items.sort_by(|a, b| {
+                let (left, right) = if horizontal { (a.x, b.x) } else { (a.y, b.y) };
+                left.partial_cmp(&right)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if items.len() >= 3 {
+                let first = if horizontal { items[0].x } else { items[0].y };
+                let last = items.last().unwrap();
+                let end = if horizontal { last.x } else { last.y };
+                let step = (end - first) / (items.len() - 1) as f32;
+                for (index, item) in items.iter_mut().enumerate() {
+                    if horizontal {
+                        item.x = first + step * index as f32;
+                    } else {
+                        item.y = first + step * index as f32;
+                    }
+                }
+            }
+        } else {
+            for item in &mut items {
+                match how {
+                    "left" => item.x = min_x,
+                    "right" => item.x = max_r - item.w,
+                    "hcenter" => item.x = mid_x - item.w * 0.5,
+                    "top" => item.y = min_y,
+                    "bottom" => item.y = max_b - item.h,
+                    "vcenter" => item.y = mid_y - item.h * 0.5,
+                    _ => {}
+                }
+            }
+        }
+        let mut nodes = BTreeMap::new();
+        let mut marks = BTreeMap::new();
+        for item in items {
+            if item.node {
+                nodes.insert(item.id, Point::new(item.x, item.y));
+            } else {
+                marks.insert(item.id, Point::new(item.x, item.y));
+            }
+        }
+        self.editor.place(&nodes, &marks, false);
+        self.changed(cx);
+    }
+
+    pub fn reorder_selection(&mut self, front: bool, cx: &mut Context<Self>) {
+        let (nodes, marks) = self.split_selection();
+        self.editor.reorder(&nodes, &marks, front);
+        self.changed(cx);
+    }
+
+    pub fn start_label_edit(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.editor.graph().mark(id).map(|mark| mark.text.clone()) else {
+            return;
+        };
+        let id = id.to_string();
+        self.label_input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+        });
+        self.editing = Some(id);
+        cx.notify();
+    }
+
+    pub fn set_frames(
+        &mut self,
+        ids: &[String],
+        columns: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+        cx: &mut Context<Self>,
+    ) {
+        let frame = FrameView { columns, rows };
+        for id in ids {
+            self.frames.insert(id.clone(), frame.clone());
+        }
+        cx.notify();
+    }
+
+    pub fn commit_label(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.editing.clone() else {
+            return;
+        };
+        let text = self.label_input.read(cx).value().to_string();
+        self.editor.set_mark_text(&id, text);
+        self.editing = None;
+        self.changed(cx);
+    }
+
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         if self.editor.undo() {
             self.selection.retain(|id| {
@@ -446,6 +678,34 @@ impl CanvasModel {
         cx.notify();
     }
 
+    fn select_hit(&mut self, local: GPoint<Pixels>) {
+        let canvas = self.canvas_of(local);
+        for node in self.editor.graph().nodes.iter().rev() {
+            let at = node.position_point();
+            let height = card_height(node);
+            if canvas.x >= at.x
+                && canvas.x <= at.x + card_width(&node.feature)
+                && canvas.y >= at.y
+                && canvas.y <= at.y + height
+            {
+                self.selection = vec![node.id.clone()];
+                return;
+            }
+        }
+        for mark in self.editor.graph().marks.iter().rev() {
+            let size = mark.size.unwrap_or([140.0, 80.0]);
+            if canvas.x >= mark.position[0]
+                && canvas.x <= mark.position[0] + size[0]
+                && canvas.y >= mark.position[1]
+                && canvas.y <= mark.position[1] + size[1]
+            {
+                self.selection = vec![mark.id.clone()];
+                return;
+            }
+        }
+        self.selection.clear();
+    }
+
     fn split_selection(&self) -> (Vec<String>, Vec<String>) {
         let mut nodes = Vec::new();
         let mut marks = Vec::new();
@@ -494,6 +754,12 @@ impl CanvasModel {
         }
         let local = self.local_of(event.position);
         window.focus(&self.focus, cx);
+        if event.button == MouseButton::Right {
+            self.select_hit(local);
+            cx.emit(CanvasEvent::SelectionChanged);
+            cx.notify();
+            return;
+        }
         if event.button == MouseButton::Middle || (event.button == MouseButton::Left && self.hand())
         {
             self.drag = Some(Drag::Pan { last: local });
@@ -699,11 +965,13 @@ impl CanvasModel {
                 let dx = (local.x.as_f32() - origin_local.x.as_f32()) / zoom;
                 let dy = (local.y.as_f32() - origin_local.y.as_f32()) / zoom;
                 let id = id.clone();
-                let size = [
-                    ((start_size[0] + dx).max(24.0)),
-                    ((start_size[1] + dy).max(24.0)),
-                ];
-                self.editor.resize_mark(&id, size);
+                let width = (start_size[0] + dx).max(24.0);
+                let mut height = (start_size[1] + dy).max(24.0);
+                if event.modifiers.shift {
+                    let aspect = start_size[1] / start_size[0].max(1.0);
+                    height = (width * aspect).max(24.0);
+                }
+                self.editor.resize_mark(&id, [width, height]);
             }
         }
         self.drag = Some(drag);
@@ -816,7 +1084,7 @@ impl CanvasModel {
                         let card = graph::Rect {
                             x: window.x,
                             y: window.y,
-                            w: CARD_WIDTH * zoom,
+                            w: card_width(&node.feature) * zoom,
                             h: card_height(node) * zoom,
                         };
                         if rects_overlap(rect, card) {
@@ -848,8 +1116,13 @@ impl CanvasModel {
                 self.editor.cancel_gesture();
                 let x = start.x.min(current.x);
                 let y = start.y.min(current.y);
-                let w = (start.x - current.x).abs().max(16.0);
-                let h = (start.y - current.y).abs().max(16.0);
+                let mut w = (start.x - current.x).abs().max(16.0);
+                let mut h = (start.y - current.y).abs().max(16.0);
+                if event.modifiers.shift {
+                    let side = w.max(h);
+                    w = side;
+                    h = side;
+                }
                 if let Some(id) = self.editor.add_mark(kind, Point::new(x, y), Some([w, h])) {
                     self.selection = vec![id];
                     cx.emit(CanvasEvent::SelectionChanged);
@@ -1075,6 +1348,13 @@ impl CanvasModel {
 }
 
 #[derive(Clone)]
+struct Clip {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    marks: Vec<graph::Mark>,
+}
+
+#[derive(Clone)]
 struct LinkVisual {
     from: Point,
     to: Point,
@@ -1170,6 +1450,45 @@ impl Render for CanvasModel {
         div()
             .id("node-canvas")
             .key_context("Canvas")
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                if this.editing.is_some() {
+                    return;
+                }
+                let key: &str = event.keystroke.key.as_ref();
+                let platform = event.keystroke.modifiers.platform;
+                let step = if event.keystroke.modifiers.alt {
+                    1.0
+                } else {
+                    16.0
+                };
+                if platform && key == "c" {
+                    this.copy_selection();
+                } else if platform && key == "x" {
+                    this.cut_selection(cx);
+                } else if platform && key == "v" {
+                    this.paste(cx);
+                } else if platform && key == "d" {
+                    this.duplicate_selection(cx);
+                } else if platform && key == "]" {
+                    this.reorder_selection(true, cx);
+                } else if platform && key == "[" {
+                    this.reorder_selection(false, cx);
+                } else if key == "left" {
+                    this.nudge(-step, 0.0, cx);
+                } else if key == "right" {
+                    this.nudge(step, 0.0, cx);
+                } else if key == "up" {
+                    this.nudge(0.0, -step, cx);
+                } else if key == "down" {
+                    this.nudge(0.0, step, cx);
+                } else if platform && key == "l" {
+                    this.align("left", cx);
+                } else if platform && key == "e" {
+                    this.align("hcenter", cx);
+                } else if platform && event.keystroke.modifiers.shift && key == "h" {
+                    this.align("distribute-h", cx);
+                }
+            }))
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -1313,6 +1632,7 @@ impl Render for CanvasModel {
                         chart,
                         radius,
                         mono: mono.to_string(),
+                        frame: self.frames.get(&node.id).cloned(),
                     },
                 )
             }))
@@ -1329,6 +1649,26 @@ impl Render for CanvasModel {
                     theme_primary,
                 )
             }))
+            .when_some(self.editing.clone(), |this, id| {
+                let Some(mark) = self.editor.graph().mark(&id) else {
+                    return this;
+                };
+                let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+                let width = mark.size.map(|size| size[0]).unwrap_or(168.0) * camera.zoom;
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(at.x))
+                        .top(px(at.y))
+                        .w(px(width))
+                        .bg(theme_card)
+                        .border_1()
+                        .border_color(theme_primary)
+                        .rounded(px(6.0))
+                        .p_1()
+                        .child(Input::new(&self.label_input)),
+                )
+            })
             .children(
                 if self.editor.graph().nodes.is_empty() && self.editor.graph().marks.is_empty() {
                     Some(
@@ -1390,7 +1730,56 @@ impl Render for CanvasModel {
                     )
                 },
             )
+            .context_menu({
+                let entity = cx.entity();
+                move |menu, _, _| canvas_menu(menu, entity.clone())
+            })
     }
+}
+
+fn canvas_menu(
+    menu: gpui_kit::component::menu::PopupMenu,
+    entity: Entity<CanvasModel>,
+) -> gpui_kit::component::menu::PopupMenu {
+    let paste = entity.clone();
+    let duplicate = entity.clone();
+    let delete = entity.clone();
+    let align = entity.clone();
+    let front = entity.clone();
+    let back = entity.clone();
+    let edit = entity.clone();
+    menu.item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
+        paste.update(cx, |this, cx| this.paste(cx));
+    }))
+    .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
+        duplicate.update(cx, |this, cx| this.duplicate_selection(cx));
+    }))
+    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+        delete.update(cx, |this, cx| this.delete_selection(cx));
+    }))
+    .separator()
+    .item(PopupMenuItem::new("Align left").on_click(move |_, _, cx| {
+        align.update(cx, |this, cx| this.align("left", cx));
+    }))
+    .item(
+        PopupMenuItem::new("Bring to front").on_click(move |_, _, cx| {
+            front.update(cx, |this, cx| this.reorder_selection(true, cx));
+        }),
+    )
+    .item(
+        PopupMenuItem::new("Send to back").on_click(move |_, _, cx| {
+            back.update(cx, |this, cx| this.reorder_selection(false, cx));
+        }),
+    )
+    .item(
+        PopupMenuItem::new("Edit label").on_click(move |_, window, cx| {
+            edit.update(cx, |this, cx| {
+                if let Some(id) = this.selection.first().cloned() {
+                    this.start_label_edit(&id, window, cx);
+                }
+            });
+        }),
+    )
 }
 
 fn mark_kind(tool: Tool) -> MarkKind {
@@ -1429,6 +1818,7 @@ struct CardPaint {
     chart: [gpui_kit::Hsla; 6],
     radius: Pixels,
     mono: String,
+    frame: Option<FrameView>,
 }
 
 fn type_color(ty: TypeName, chart: &[gpui_kit::Hsla; 6]) -> gpui_kit::Hsla {
@@ -1680,7 +2070,7 @@ fn card_element(
     let zoom = camera.zoom;
     let origin = node.position_point();
     let window = camera.to_window(Point::new(origin.x + offset.x, origin.y + offset.y));
-    let width = px(CARD_WIDTH * zoom);
+    let width = px(card_width(&node.feature) * zoom);
     let id = node.id.clone();
     let title = node.label.clone();
     let summary = node.summary();
@@ -1845,7 +2235,126 @@ fn card_element(
             }
             column
         })
+        .children(output_body(
+            node,
+            paint.frame.as_ref(),
+            selected,
+            reduced_motion,
+            &paint,
+        ))
         .into_any_element()
+}
+
+fn output_body(
+    node: &Node,
+    frame: Option<&FrameView>,
+    selected: bool,
+    reduced_motion: bool,
+    paint: &CardPaint,
+) -> Option<gpui_kit::AnyElement> {
+    if node.feature == "preview_table" {
+        return Some(match frame {
+            Some(frame) => mini_table(frame, paint),
+            None => div()
+                .px(px(10.0))
+                .text_xs()
+                .text_color(paint.muted)
+                .child("Run preview")
+                .into_any_element(),
+        });
+    }
+    if node.feature != "chart" {
+        return None;
+    }
+    let Some(frame) = frame else {
+        return Some(
+            div()
+                .px(px(10.0))
+                .text_xs()
+                .text_color(paint.muted)
+                .child("Run preview")
+                .into_any_element(),
+        );
+    };
+    let mark = node.param_str("mark");
+    let colors = [
+        paint.chart[0],
+        paint.chart[1],
+        paint.chart[2],
+        paint.chart[3],
+        paint.chart[4],
+    ];
+    Some(
+        match points_from(
+            &frame.columns,
+            &frame.rows,
+            &node.param_str("x"),
+            &node.param_str("y"),
+            &node.param_str("series"),
+        ) {
+            Ok(points) => div()
+                .h(px(168.0))
+                .px(px(6.0))
+                .pb(px(6.0))
+                .child(feature_chart(
+                    &mark,
+                    points,
+                    colors,
+                    paint.fg,
+                    reduced_motion,
+                    selected,
+                    &node.id,
+                ))
+                .into_any_element(),
+            Err(message) => div()
+                .px(px(10.0))
+                .text_xs()
+                .text_color(paint.danger)
+                .child(message)
+                .into_any_element(),
+        },
+    )
+}
+
+fn mini_table(frame: &FrameView, paint: &CardPaint) -> gpui_kit::AnyElement {
+    let count = frame.columns.len().min(4);
+    let mut grid = div().px(px(8.0)).pb(px(6.0)).flex().flex_col().gap(px(2.0));
+    grid = grid.child(mini_row(
+        &frame
+            .columns
+            .iter()
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>(),
+        true,
+        paint,
+    ));
+    for row in frame.rows.iter().take(4) {
+        let cells = (0..count)
+            .map(|index| row.get(index).map(graph::cell_text).unwrap_or_default())
+            .collect::<Vec<_>>();
+        grid = grid.child(mini_row(&cells, false, paint));
+    }
+    grid.into_any_element()
+}
+
+fn mini_row(cells: &[String], header: bool, paint: &CardPaint) -> gpui_kit::Div {
+    let mut row = div().flex().flex_row().gap(px(6.0));
+    for cell in cells {
+        let numeric = !header && cell.parse::<f64>().is_ok();
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_xs()
+                .when(numeric, |cell| cell.text_right())
+                .font_family(paint.mono.clone())
+                .text_color(if header { paint.fg } else { paint.muted })
+                .child(cell.clone()),
+        );
+    }
+    row
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2056,6 +2565,13 @@ fn mark_element(
             move |event, window, cx| {
                 cx.stop_propagation();
                 entity.update(cx, |this, cx| {
+                    let kind = this.editor.graph().mark(&id).map(|mark| mark.kind);
+                    if event.click_count >= 2
+                        && matches!(kind, Some(MarkKind::Label | MarkKind::Note))
+                    {
+                        this.start_label_edit(&id, window, cx);
+                        return;
+                    }
                     this.editor.raise_mark(&id);
                     this.card_down(&id, event, window, cx);
                 });
