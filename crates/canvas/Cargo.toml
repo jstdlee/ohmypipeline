@@ -1,0 +1,15 @@
+[package]
+name = "canvas"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Ohmypipeline node canvas. Cards, ports, wires, camera."
+
+[dependencies]
+graph.workspace = true
+gpui-kit = "0.9"
+serde_json.workspace = true
+
+[lints]
+workspace = true
