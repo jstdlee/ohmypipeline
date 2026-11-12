@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use graph::{Job, Reply, write_frame};
+use graph::{Job, JobOp, Reply, write_frame};
 
 struct Proc {
     child: Child,
@@ -18,7 +18,7 @@ struct Proc {
 
 pub struct Worker {
     tx: Sender<Job>,
-    rx: Receiver<(u64, Result<Reply, String>)>,
+    rx: Receiver<(u64, JobOp, Result<Reply, String>)>,
     pid: Arc<AtomicU32>,
     busy: Arc<AtomicBool>,
 }
@@ -57,21 +57,23 @@ impl Worker {
         let _ = self.tx.send(job);
     }
 
-    pub fn try_recv(&self) -> Option<(u64, Result<Reply, String>)> {
+    /// The next finished job: its generation, its op, and the outcome. A
+    /// `JobOp::Reset` reply carries no payload; errors still surface.
+    pub fn try_recv(&self) -> Option<(u64, JobOp, Result<Reply, String>)> {
         self.rx.try_recv().ok()
     }
 }
 
 fn worker_loop(
     jobs: Receiver<Job>,
-    replies: Sender<(u64, Result<Reply, String>)>,
+    replies: Sender<(u64, JobOp, Result<Reply, String>)>,
     pid: Arc<AtomicU32>,
     busy: Arc<AtomicBool>,
 ) {
     let mut proc = match start(&pid) {
         Ok(proc) => proc,
         Err(err) => {
-            let _ = replies.send((0, Err(err)));
+            let _ = replies.send((0, JobOp::Preview, Err(err)));
             return;
         }
     };
@@ -82,7 +84,7 @@ fn worker_loop(
             proc = match start(&pid) {
                 Ok(proc) => proc,
                 Err(err) => {
-                    let _ = replies.send((job.generation, Err(err)));
+                    let _ = replies.send((job.generation, job.op, Err(err)));
                     continue;
                 }
             };
@@ -92,14 +94,14 @@ fn worker_loop(
         busy.store(false, Ordering::SeqCst);
         match requested {
             Ok(reply) => {
-                let _ = replies.send((job.generation, Ok(reply)));
+                let _ = replies.send((job.generation, job.op, Ok(reply)));
             }
             Err(err) => {
-                let _ = replies.send((job.generation, Err(err)));
+                let _ = replies.send((job.generation, job.op, Err(err)));
                 proc = match start(&pid) {
                     Ok(proc) => proc,
                     Err(err) => {
-                        let _ = replies.send((job.generation, Err(err)));
+                        let _ = replies.send((job.generation, job.op, Err(err)));
                         continue;
                     }
                 };

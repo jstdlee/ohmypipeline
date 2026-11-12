@@ -26,9 +26,19 @@ The window, the worker, and the `*.pp` file are in the tree. The release build i
 ```text
 cargo run -p ompp
 cargo run -p ompp -- --pipeline examples/orders.pp --input examples/orders.csv
-
-`examples/sales.pp` is a longer graph: it skips a title row, pivots quantity by region and product, and ends in a preview table, a line plot, and a pie plot. `examples/text.pp`, `select.pp`, `clean.pp`, `windows.pp`, `crosstab.pp`, and `export.pp` cover text and dates, row selection, filling and clipping, windows, a crosstab, and a CSV writer. `examples/time.pp`, `bins.pp`, `arith.pp`, `wide.pp`, and `readers.pp` cover resample, cut and dummies, arithmetic, wide to long, and the HTML, XML, and JSON readers.
+cargo run -p ompp -- run examples/vars.pp --set rows=2 --output /tmp/v.csv
 ```
+
+## CLI
+
+```text
+ompp run file.pp [--set key=value]... [--input id=path]... [--node id] [--output path] [--full]
+ompp --pipeline file.pp [--input path] [--input id=path] [--output path] [--node id] [--full]
+```
+
+`run` is the current form. `--set name=value` fills a pipeline variable for that run: the value is parsed per the variable's declared kind, and an unknown name or a bad value exits 2. Variables are `${name}` placeholders inside string params; see the Flow variables section in DESIGN.md. `--node` picks the output node, default the single sink. `--full` removes the 10,000-row preview cap. The old `--pipeline` form keeps working. Exit 0 ok, 2 usage, 3 a node error.
+
+`examples/sales.pp` is a longer graph: it skips a title row, pivots quantity by region and product, and ends in a preview table, a line plot, and a pie plot. `examples/text.pp`, `select.pp`, `clean.pp`, `windows.pp`, `crosstab.pp`, and `export.pp` cover text and dates, row selection, filling and clipping, windows, a crosstab, and a CSV writer. `examples/time.pp`, `bins.pp`, `arith.pp`, `wide.pp`, and `readers.pp` cover resample, cut and dummies, arithmetic, wide to long, and the HTML, XML, and JSON readers. `examples/vars.pp` covers `${name}` variables.
 
 The pandas worker is the `pipeline` package under `worker/`. `pandas` is pinned to the 3.1 line. Point `PYTHONPATH` at `worker/`, or set `OMPP_WORKER` to that directory. A repo-local `.venv` is used when it is present.
 

@@ -119,3 +119,34 @@ Also checked, and left as they were: `docs/screenshots/text.png` (names lowercas
 - The inspector still prints the feature id under the title (`to_csv`, `crosstab`, `isin`). It is not JSON, and it was not removed in these two rounds.
 - The floating tool capsule in the middle of the canvas still reads as a grey bar. It was not part of this fix.
 - Text and Output sit below the first screen of the feature list. The list scrolls; these shots stay on the IO rows.
+
+## Canvas and flow v2
+
+Two passes over the new surfaces: the variables panel, the run dialog, loop and branch cards, the zoomed-out title level, and the chart card. Ryugi interface-craft (spacing, color, type, layout, then motion) and verifying-ui were read. Ryugi was not run as a tool. Apple's Human Interface Guidelines were used for hit area, labels, and motion. The checks were made on lavapipe screenshots. No gradients, no glow, no emoji. Theme colors only.
+
+### Round 1
+
+- Head with `n` set to `${rows}` drew `n=5`. The summary asked for an integer and fell back to the default, so the reference never appeared and could not be colored.
+- Add column on Loop end was a text box containing the word true.
+- The kind control in the variables panel was a plain button. It did not read as a menu until it was opened.
+- `--demo big-out` drew each distant card as one clipped glyph, and the camera stopped at zoom 0.25 so the 400 nodes did not fit.
+- `--demo zoom` left the graph under the floating toolbar.
+
+Accepted: a variable reference on a card is the text the user typed. A yes/no setting is a choice, not a string. A distant card keeps a title that fits inside it. The opened graph sits in the viewport, clear of the toolbar.
+
+Changed: a numeric summary keeps the `${name}` text when that is the whole value, and the card paints known names in the accent color and unknown names in the danger color. Add column is On / Off. The kind button carries a chevron and opens string, int, float, bool, and path. Title-level type is at most 11px and at most 60% of the card, and it is hidden when the card is under 8px tall. The camera can zoom out to 0.1, and big-out fits the whole graph. The zoom demo centers the graph. Dock resizing updates the view in memory and does not mark the document dirty.
+
+Checked: `docs/screenshots/v2/m5-big-out.png` (small titles, the whole grid, no dirty mark), `m2-zoom.png` (cards centered under the toolbar), `m7-variables.png` (`${data}` and `n=${rows}` on the cards, the panel with used-by counts), `m7-run-dialog.png`, `m8-loop.png` (On selected, eight collected rows), `m8-branch.png` (true and false ports, the true side dimmed), `m2-chart-card.png` (title and legend on the card in the same places as the Chart tab).
+
+### Round 2
+
+The shots above were checked again and not changed again.
+
+The variables panel names each row, says how many nodes use it, and commits on Enter or blur. The run dialog is 420px, lists each variable with its kind, and keeps Run full dataset off until a preview has succeeded. Escape closes it. Loop end names the paired start and does not offer the pair id as an editable field. The inactive branch is lighter, and the wires on that side are thinner. The chart card draws "Plot" at the top of the plot and the amount swatch at the top end, which is the default placement, and a drag on those labels does not move the card.
+
+### Left as they are
+
+- A loop preview still stops after the first three iterations. The worker labels that cap. The loop shot shows the three sample files concatenated, eight rows, with the loop value column filled.
+- The condition language is comparisons, `and` / `or` / `not`, `rows`, `columns`, and `${name}`. It does not do arithmetic.
+- When a chart has no title of its own, the card repeats the node label inside the plot, the same way the Chart tab does.
+- A graph that still cannot fit at zoom 0.1 is centered and clipped at that floor. The 400-node shot fits.

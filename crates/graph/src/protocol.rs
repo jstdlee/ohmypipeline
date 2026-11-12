@@ -37,6 +37,8 @@ pub enum JobOp {
     #[default]
     Preview,
     Export,
+    /// Drop the cached outputs of the given node ids. The reply is empty.
+    Reset,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +58,15 @@ pub struct Job {
     /// How many result rows to return. The worker still computes `n` for the whole result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<usize>,
+    /// Ask for per-column stats of the whole result frame.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stats: bool,
+    /// Node ids for `JobOp::Reset`. Empty everywhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// Variable value texts for this run, applied before substitution.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,6 +101,40 @@ pub struct Reply {
     /// Fitted parameters from a scaler or OLS node, when this run fit them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fitted: Option<Value>,
+    /// Every node computed or served from cache, topological order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub computed: Vec<String>,
+    /// Per-column stats of the whole result frame, when asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Vec<ColumnStats>>,
+    /// Branch nodes the worker skipped. Reserved, empty for now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inactive: Vec<String>,
+}
+
+/// Stats of one column of the whole result frame. Optional fields are absent
+/// when the dtype does not have them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub name: String,
+    pub dtype: String,
+    pub count: u64,
+    pub nulls: u64,
+    pub null_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub std: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hist: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<(Value, u64)>,
 }
 
 /// A preview cell as text. Null is an em dash, never the letters n-u-l-l.
@@ -186,12 +231,17 @@ mod tests {
             op: JobOp::Preview,
             output: None,
             window: None,
+            stats: false,
+            nodes: Vec::new(),
+            overrides: Default::default(),
         };
         let frame = encode_frame(&job).unwrap();
         let back: Job = decode_frame(&frame).unwrap();
         assert_eq!(back.generation, 1);
         assert_eq!(back.node, "n3");
         assert_eq!(back.mode, RunMode::Preview);
+        assert_eq!(back.op, JobOp::Preview);
+        assert!(!back.stats);
 
         let reply = Reply {
             generation: 1,
@@ -206,15 +256,87 @@ mod tests {
             error: None,
             csv_path: None,
             fitted: None,
+            computed: vec!["n1".into(), "n3".into()],
+            stats: None,
+            inactive: Vec::new(),
         };
         let frame = encode_frame(&reply).unwrap();
         let back: Reply = decode_frame(&frame).unwrap();
         assert_eq!(back.rows[0][0], json!("x"));
         assert!(back.error.is_none());
+        assert_eq!(back.computed, vec!["n1".to_string(), "n3".to_string()]);
+        assert!(back.stats.is_none());
+        assert!(back.inactive.is_empty());
         assert_eq!(
             status_line(RunMode::Preview, back.n, 0),
             "preview · at most 10,000 source rows · 10000 rows"
         );
+    }
+
+    #[test]
+    fn a_reset_job_and_a_stats_reply_round_trip() {
+        let mut graph = Graph::default();
+        graph
+            .nodes
+            .push(Node::new("n1", "head", Point::new(0.0, 0.0)));
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("rows".to_string(), "2".to_string());
+        let job = Job {
+            generation: 2,
+            mode: RunMode::Preview,
+            graph,
+            node: String::new(),
+            base_dir: None,
+            inputs: Default::default(),
+            op: JobOp::Reset,
+            output: None,
+            window: None,
+            stats: false,
+            nodes: vec!["n1".into()],
+            overrides,
+        };
+        let back: Job = decode_frame(&encode_frame(&job).unwrap()).unwrap();
+        assert_eq!(back.op, JobOp::Reset);
+        assert_eq!(back.nodes, vec!["n1".to_string()]);
+        assert_eq!(back.overrides.get("rows").map(String::as_str), Some("2"));
+
+        let reply = Reply {
+            generation: 1,
+            mode: RunMode::Preview,
+            node: "n1".into(),
+            columns: vec!["a".into()],
+            dtypes: vec!["int64".into()],
+            index: Vec::new(),
+            rows: Vec::new(),
+            n: 4,
+            claim: "preview".into(),
+            error: None,
+            csv_path: None,
+            fitted: None,
+            computed: Vec::new(),
+            stats: Some(vec![ColumnStats {
+                name: "a".into(),
+                dtype: "int64".into(),
+                count: 4,
+                nulls: 1,
+                null_pct: 25.0,
+                unique: Some(3),
+                min: Some(json!(1)),
+                max: Some(json!(3)),
+                mean: Some(2.0),
+                std: None,
+                hist: vec![0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+                top: vec![(json!("Ada"), 2)],
+            }]),
+            inactive: Vec::new(),
+        };
+        let back: Reply = decode_frame(&encode_frame(&reply).unwrap()).unwrap();
+        let stats = back.stats.expect("stats");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].name, "a");
+        assert_eq!(stats[0].null_pct, 25.0);
+        assert_eq!(stats[0].hist.len(), 12);
+        assert_eq!(stats[0].top, vec![(json!("Ada"), 2)]);
     }
 
     #[test]

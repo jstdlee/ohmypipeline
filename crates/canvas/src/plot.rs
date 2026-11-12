@@ -7,7 +7,33 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
-use graph::cell_text;
+use graph::{Anchor, cell_text};
+
+/// Window offset of a placed title or legend inside a plot box.
+/// `x` and `y` are fractions of the box. The anchor says which corner of the
+/// element sits on that point.
+pub fn placed_origin(
+    anchor: Anchor,
+    x: f32,
+    y: f32,
+    box_w: f32,
+    box_h: f32,
+    element_w: f32,
+    element_h: f32,
+) -> (f32, f32) {
+    let point = match anchor {
+        Anchor::TopStart => (x * box_w, y * box_h),
+        Anchor::Top => (x * box_w - element_w * 0.5, y * box_h),
+        Anchor::TopEnd => (x * box_w - element_w, y * box_h),
+        Anchor::Start => (x * box_w, y * box_h - element_h * 0.5),
+        Anchor::Center => (x * box_w - element_w * 0.5, y * box_h - element_h * 0.5),
+        Anchor::End => (x * box_w - element_w, y * box_h - element_h * 0.5),
+        Anchor::BottomStart => (x * box_w, y * box_h - element_h),
+        Anchor::Bottom => (x * box_w - element_w * 0.5, y * box_h - element_h),
+        Anchor::BottomEnd => (x * box_w - element_w, y * box_h - element_h),
+    };
+    (point.0, point.1)
+}
 
 #[derive(Clone, Debug)]
 pub struct PlotPoint {
@@ -130,6 +156,7 @@ pub fn feature_chart(
     interactive: bool,
     id_prefix: &str,
     limitation: &str,
+    show_legend: bool,
 ) -> AnyElement {
     if points.is_empty() {
         return div()
@@ -163,7 +190,7 @@ pub fn feature_chart(
             .flex_col()
             .gap_1()
             .child(div().flex_1().min_h(px(96.)).child(pie))
-            .child(legend)
+            .when(show_legend, |column| column.child(legend))
             .children(limitation_row)
             .into_any_element();
     }
@@ -206,7 +233,7 @@ pub fn feature_chart(
             .flex_col()
             .gap_1()
             .child(div().flex_1().min_h(px(96.)).child(bars))
-            .child(legend)
+            .when(show_legend, |column| column.child(legend))
             .when(!right.is_empty(), |row| {
                 row.child(
                     div()
@@ -290,7 +317,7 @@ pub fn feature_chart(
         .flex_col()
         .gap_1()
         .child(plot)
-        .child(legend)
+        .when(show_legend, |column| column.child(legend))
         .when(!right.is_empty(), |column| {
             column
                 .child(
@@ -320,6 +347,23 @@ fn series_names(points: &[PlotPoint]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Legend entries (text, color) for a chart's series, or pie slices.
+/// The chart panel uses these to draw the freely placed legend.
+pub fn legend_entries(mark: &str, points: &[PlotPoint], colors: &[Hsla; 5]) -> Vec<(String, Hsla)> {
+    if mark == "pie" {
+        return points
+            .iter()
+            .take(8)
+            .map(|point| (point.x.clone(), colors[point.index % colors.len()]))
+            .collect();
+    }
+    series_names(points)
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), colors[index % colors.len()]))
+        .collect()
 }
 
 fn y_span(points: &[PlotPoint]) -> (f32, f32) {

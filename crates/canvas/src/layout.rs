@@ -10,6 +10,38 @@ pub const HEADER: f32 = 28.0;
 pub const SUMMARY: f32 = 16.0;
 pub const PAD_Y: f32 = 8.0;
 
+/// Text bases. A card draws every glyph at `BASE * zoom` so the letters
+/// shrink and grow with the same camera as the card box.
+pub const TITLE_TEXT: f32 = 12.0;
+pub const BODY_TEXT: f32 = 11.0;
+pub const TYPE_TEXT: f32 = 10.0;
+
+/// How much of a card the camera can still ask a card to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Detail {
+    /// Everything: title, summary, port labels, inline body.
+    Full,
+    /// Title and port dots only, so distant cards stay quiet.
+    Compact,
+    /// A single bold title. For very distant cards.
+    Title,
+}
+
+pub fn detail_for(zoom: f32) -> Detail {
+    if zoom >= 0.55 {
+        Detail::Full
+    } else if zoom >= 0.3 {
+        Detail::Compact
+    } else {
+        Detail::Title
+    }
+}
+
+/// Line height that tracks a text base the way the card box tracks the zoom.
+pub fn text_with_zoom(base: f32, zoom: f32) -> (gpui_kit::Pixels, gpui_kit::Pixels) {
+    (gpui_kit::px(base * zoom), gpui_kit::px(base * zoom * 1.25))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     In,
@@ -24,11 +56,28 @@ pub struct PortSlot {
     pub center: Point,
 }
 
+/// On-screen size of a Title-level name. `None` hides it: a card under 8px
+/// tall has no room for a glyph. Otherwise the size is at most 11px and at
+/// most 60% of the card, so the letters stay inside the box.
+pub fn title_screen_px(card_px: f32) -> Option<f32> {
+    if card_px < 8.0 {
+        None
+    } else {
+        Some(11.0_f32.min(card_px * 0.6).max(0.0))
+    }
+}
+
+/// Compact titles stay readable when the camera is far, and still track zoom
+/// once 12px times zoom is larger than 9.
+pub fn compact_title_px(zoom: f32) -> f32 {
+    (12.0 * zoom).max(9.0)
+}
+
 pub fn card_height(node: &Node) -> f32 {
     let rows = node
         .input_ports()
         .len()
-        .max(usize::from(node.output_port().is_some()))
+        .max(node.output_ports().len())
         .max(1) as f32;
     let extra = match node.feature.as_str() {
         "preview_table" => 108.0,
@@ -50,9 +99,10 @@ pub fn card_rect(node: &Node) -> (Point, f32, f32) {
 pub fn port_slots(node: &Node) -> Vec<PortSlot> {
     let origin = node.position_point();
     let inputs = node.input_ports();
-    let output = node.output_port();
-    let rows = inputs.len().max(usize::from(output.is_some())).max(1);
+    let outputs = node.output_ports();
+    let rows = inputs.len().max(outputs.len()).max(1);
     let top = origin.y + HEADER + SUMMARY + PAD_Y;
+    let width = card_width(&node.feature);
     let mut slots = Vec::new();
     for (index, port) in inputs.iter().enumerate() {
         slots.push(PortSlot {
@@ -61,13 +111,28 @@ pub fn port_slots(node: &Node) -> Vec<PortSlot> {
             center: Point::new(origin.x, top + PORT_ROW * index as f32 + PORT_ROW * 0.5),
         });
     }
-    if let Some(port) = output {
-        let y = top + (rows as f32 * PORT_ROW) * 0.5;
-        slots.push(PortSlot {
-            name: port.name,
-            side: Side::Out,
-            center: Point::new(origin.x + card_width(&node.feature), y),
-        });
+    // One output stays centered against the input stack. Several outputs,
+    // such as if_switch true and false, stack the same way inputs do.
+    if outputs.len() <= 1 {
+        if let Some(port) = outputs.into_iter().next() {
+            let y = top + (rows as f32 * PORT_ROW) * 0.5;
+            slots.push(PortSlot {
+                name: port.name,
+                side: Side::Out,
+                center: Point::new(origin.x + width, y),
+            });
+        }
+    } else {
+        for (index, port) in outputs.iter().enumerate() {
+            slots.push(PortSlot {
+                name: port.name.clone(),
+                side: Side::Out,
+                center: Point::new(
+                    origin.x + width,
+                    top + PORT_ROW * index as f32 + PORT_ROW * 0.5,
+                ),
+            });
+        }
     }
     slots
 }
@@ -126,25 +191,55 @@ pub fn cubic_point(cubic: Cubic, t: f32) -> Point {
     )
 }
 
-pub fn wire_hit(cubic: Cubic, point: Point, radius: f32) -> bool {
-    let mut closest = f32::MAX;
-    for step in 0..=24 {
-        let at = cubic_point(cubic, step as f32 / 24.0);
-        let dx = at.x - point.x;
-        let dy = at.y - point.y;
-        closest = closest.min(dx * dx + dy * dy);
+/// The full wire as a chain of cubics through each reroute point.
+/// Segment `i` joins `points[i]` and `points[i + 1]`, where `points` is
+/// `from`, the reroutes in order, then `to`. Each segment follows the same
+/// tangent rule as [`wire_cubic`].
+pub fn wire_path(from: Point, reroutes: &[Point], to: Point) -> Vec<Cubic> {
+    let mut points = Vec::with_capacity(reroutes.len() + 2);
+    points.push(from);
+    points.extend_from_slice(reroutes);
+    points.push(to);
+    let mut path = Vec::with_capacity(points.len().saturating_sub(1));
+    for pair in points.windows(2) {
+        path.push(wire_cubic(pair[0], pair[1]));
     }
-    closest <= radius * radius
+    path
 }
 
-pub fn edge_cubic(nodes: &[Node], edge: &Edge) -> Option<Cubic> {
+/// Nearest segment of the chain within `radius`, as the segment index.
+/// `None` when the point misses every segment.
+pub fn wire_hit(path: &[Cubic], point: Point, radius: f32) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (index, cubic) in path.iter().enumerate() {
+        for step in 0..=24 {
+            let at = cubic_point(*cubic, step as f32 / 24.0);
+            let dx = at.x - point.x;
+            let dy = at.y - point.y;
+            let distance = dx * dx + dy * dy;
+            if distance <= radius * radius && best.is_none_or(|(closest, _)| distance < closest) {
+                best = Some((distance, index));
+            }
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
+/// The wire of `edge` as a chain, including its stored reroute points.
+/// The first segment of the chain is the plain `edge_cubic` of before.
+pub fn edge_wire_path(nodes: &[Node], edge: &Edge) -> Option<Vec<Cubic>> {
     let source = nodes.iter().find(|node| node.id == edge.from)?;
     let target = nodes.iter().find(|node| node.id == edge.to)?;
     let source_slots = port_slots(source);
     let target_slots = port_slots(target);
     let from = slot(&source_slots, &edge.from_port, Side::Out)?;
     let to = slot(&target_slots, &edge.to_port, Side::In)?;
-    Some(wire_cubic(from.center, to.center))
+    let reroutes: Vec<Point> = edge
+        .reroutes
+        .iter()
+        .map(|point| Point::new(point[0], point[1]))
+        .collect();
+    Some(wire_path(from.center, &reroutes, to.center))
 }
 
 pub fn to_local(camera: Camera, canvas: Point) -> Point {
@@ -161,9 +256,9 @@ mod tests {
         let mut source = Node::new("n1", "read_csv", Point::new(16.0, 32.0));
         let target = Node::new("n2", "head", Point::new(320.0, 32.0));
         let edge = Edge::between("n1", "out", "n2", "in");
-        let first = edge_cubic(&[source.clone(), target.clone()], &edge).unwrap();
+        let first = edge_wire_path(&[source.clone(), target.clone()], &edge).unwrap()[0];
         source.position = [48.0, 64.0];
-        let second = edge_cubic(&[source, target], &edge).unwrap();
+        let second = edge_wire_path(&[source, target], &edge).unwrap()[0];
         assert!((second.from.x - first.from.x - 32.0).abs() < 0.1);
         assert!((second.from.y - first.from.y - 32.0).abs() < 0.1);
         assert_eq!(second.to, first.to);
@@ -178,10 +273,76 @@ mod tests {
     }
 
     #[test]
+    fn an_if_switch_stacks_a_true_port_above_a_false_port() {
+        let node = Node::new("s", "if_switch", Point::new(10.0, 20.0));
+        let slots = port_slots(&node);
+        let outs: Vec<_> = slots.iter().filter(|slot| slot.side == Side::Out).collect();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].name, "true");
+        assert_eq!(outs[1].name, "false");
+        assert!(outs[1].center.y > outs[0].center.y);
+        assert!((outs[0].center.x - outs[1].center.x).abs() < 0.1);
+        let height = card_height(&node);
+        assert!(height >= HEADER + SUMMARY + PAD_Y * 2.0 + PORT_ROW * 2.0 - 0.1);
+    }
+
+    #[test]
+    fn title_text_shrinks_with_the_card_and_hides_when_it_cannot_fit() {
+        assert_eq!(title_screen_px(7.9), None);
+        let at_eight = title_screen_px(8.0).unwrap();
+        assert!((at_eight - 4.8).abs() < 1e-4, "{at_eight}");
+        assert_eq!(title_screen_px(20.0), Some(11.0));
+        assert!((compact_title_px(0.42) - 9.0).abs() < 1e-4);
+        assert!((compact_title_px(1.0) - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn detail_levels_follow_the_zoom_thresholds() {
+        assert_eq!(detail_for(0.9), Detail::Full);
+        assert_eq!(detail_for(0.55), Detail::Full);
+        assert_eq!(detail_for(0.549), Detail::Compact);
+        assert_eq!(detail_for(0.3), Detail::Compact);
+        assert_eq!(detail_for(0.299), Detail::Title);
+        assert_eq!(detail_for(0.05), Detail::Title);
+    }
+
+    #[test]
     fn a_point_on_the_cubic_hits_and_a_far_point_does_not() {
-        let cubic = wire_cubic(Point::new(0.0, 0.0), Point::new(200.0, 0.0));
-        let mid = cubic_point(cubic, 0.5);
-        assert!(wire_hit(cubic, mid, 6.0));
-        assert!(!wire_hit(cubic, Point::new(mid.x, mid.y + 40.0), 6.0));
+        let path = wire_path(Point::new(0.0, 0.0), &[], Point::new(200.0, 0.0));
+        let mid = cubic_point(path[0], 0.5);
+        assert_eq!(wire_hit(&path, mid, 6.0), Some(0));
+        assert_eq!(wire_hit(&path, Point::new(mid.x, mid.y + 40.0), 6.0), None);
+    }
+
+    #[test]
+    fn a_chain_with_reroutes_is_continuous_and_ends_where_it_should() {
+        let from = Point::new(0.0, 0.0);
+        let to = Point::new(400.0, 0.0);
+        let bends = [Point::new(120.0, 120.0), Point::new(260.0, -80.0)];
+        for reroutes in [Vec::new(), vec![bends[0]], vec![bends[0], bends[1]]] {
+            let path = wire_path(from, &reroutes, to);
+            assert_eq!(path.len(), reroutes.len() + 1);
+            assert_eq!(path[0].from, from);
+            assert_eq!(path[path.len() - 1].to, to);
+            for pair in path.windows(2) {
+                assert_eq!(pair[0].to, pair[1].from, "segments must share endpoints");
+            }
+        }
+        // Each segment leaves horizontally, so a reroute is a real corner.
+        let path = wire_path(from, &bends, to);
+        assert!((path[0].c1.y - path[0].from.y).abs() < 0.001);
+        assert!((path[2].c2.y - path[2].to.y).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_hit_on_a_chain_names_its_segment() {
+        let bends = [Point::new(120.0, 160.0)];
+        let path = wire_path(Point::new(0.0, 0.0), &bends, Point::new(400.0, 0.0));
+        // Near the bend point itself, inside the second segment.
+        let at = cubic_point(path[1], 0.5);
+        assert_eq!(wire_hit(&path, at, 8.0), Some(1));
+        let straight = wire_path(Point::new(0.0, 0.0), &[], Point::new(400.0, 0.0));
+        let mid = cubic_point(straight[0], 0.5);
+        assert_eq!(wire_hit(&straight, mid, 8.0), Some(0));
     }
 }

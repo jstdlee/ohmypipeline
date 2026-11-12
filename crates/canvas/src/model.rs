@@ -2,9 +2,10 @@
 //! decides which rule a gesture is asking for.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::ActiveTheme as _;
@@ -18,13 +19,14 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px,
 };
 use graph::{
-    Camera, Document, Edge, MarkKind, Node, Point, Reject, SNAP_RADIUS_PX, SnapCandidate, TypeName,
-    card_width, output_types, pick_snap, reject_message, try_connect, type_pair_label,
+    Camera, Document, Edge, Frame, MarkKind, Node, Point, Presentation, Reject, SNAP_RADIUS_PX,
+    SnapCandidate, TypeName, bound_names, card_width, output_types, pick_snap, reject_message,
+    split_references, try_connect, type_pair_label,
 };
 
-use crate::layout::{self, Side, card_height, port_slots};
+use crate::layout::{self, Detail, Side, card_height, port_slots};
 use crate::motion;
-use crate::plot::{feature_chart, points_from};
+use crate::plot::{feature_chart, legend_entries, placed_origin, points_from};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -35,6 +37,8 @@ pub enum Tool {
     Label,
     Note,
     Button,
+    /// Drag out an empty group frame.
+    Frame,
 }
 
 impl Tool {
@@ -46,11 +50,45 @@ impl Tool {
     }
 }
 
+/// Run or reset one node. Emitted from the card context menu; the workspace
+/// owns the execution state, so it does the work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeCommand {
+    /// Run this node as a preview job.
+    Execute,
+    /// The same run, with the menu name that says where it stops.
+    ExecuteTo,
+    /// Drop this node's cached output and everything downstream of it.
+    Reset,
+}
+
 pub enum CanvasEvent {
     Edited,
     SelectionChanged,
     FocusInspector,
-    OpenCatalog { filter: Option<TypeName> },
+    /// Open the node search popover. `from` is set when a drag left an output
+    /// port, `to` when it ended on an input side; `at` is the canvas point of
+    /// the drop and `screen` its window position.
+    OpenCatalog {
+        from: Option<(String, String)>,
+        to: Option<(String, String)>,
+        ty: Option<TypeName>,
+        at: Point,
+        screen: GPoint<Pixels>,
+    },
+    /// An Execute, Execute to here, or Reset picked from a card or the menu.
+    NodeCommand {
+        id: String,
+        command: NodeCommand,
+    },
+    /// The frame on the clicked wire. The wire's source node computes it.
+    PreviewWire {
+        edge: String,
+    },
+    /// An output port was clicked without a drag.
+    PreviewPort {
+        node: String,
+    },
 }
 
 struct Settle {
@@ -60,13 +98,60 @@ struct Settle {
     duration: Duration,
 }
 
+/// Identity of a wire's shape in canvas space. Any change re-derives the
+/// chain; panning and zooming leave it untouched, only the projection moves.
+#[derive(Clone, PartialEq)]
+struct WireKey {
+    from: Point,
+    to: Point,
+    reroutes: Vec<Point>,
+}
+
+/// A chain waiting for the next paint. Corrected whenever its input key no
+/// longer matches, and dropped wholesale on a document edit.
+struct CachedWire {
+    key: WireKey,
+    path: Arc<Vec<layout::Cubic>>,
+}
+
+/// Data the paint scene needs per wire, resolved once per render so the
+/// hot loop does no graph lookups or vector building.
+struct WirePaint {
+    id: String,
+    reroutes: Vec<Point>,
+    path: Arc<Vec<layout::Cubic>>,
+    source_color: gpui_kit::Hsla,
+    /// An inactive branch: drawn thin and faint.
+    dim: bool,
+}
+
+/// A title or legend drag on a chart card. The document changes once, on mouse up.
+#[derive(Clone)]
+struct LabelDrag {
+    node: String,
+    title: bool,
+    origin: (f32, f32),
+    live: (f32, f32),
+    start: GPoint<Pixels>,
+}
+
+#[derive(Clone, Default)]
+struct ChartMetric {
+    plot: Option<Bounds<Pixels>>,
+    title: Option<(f32, f32)>,
+    legend: Option<(f32, f32)>,
+}
+
 struct CameraAnim {
     from: Camera,
     to: Camera,
     started: Instant,
+    /// Opening a document frames the graph without marking it dirty.
+    quiet: bool,
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum Drag {
     Move {
         origin_local: GPoint<Pixels>,
@@ -76,11 +161,22 @@ enum Drag {
         duplicated: bool,
     },
     Link {
-        from: String,
-        from_port: String,
-        detached: Option<Edge>,
+        /// The output-side anchor that stays attached, when the drag keeps one.
+        from: Option<(String, String)>,
+        /// The input-side anchor the drag started from, when any.
+        to: Option<(String, String)>,
+        /// Wires picked up by a modifier drag on an output port. They are
+        /// detached for the drag; a cancel restores them.
+        rewired: Vec<Edge>,
         /// Canvas point under the pointer.
         pointer: Point,
+        /// Canvas point where the drag began, to tell a click from a move.
+        origin: Point,
+    },
+    /// Drag of one reroute point on a wire.
+    Reroute {
+        edge: String,
+        index: usize,
     },
     Marquee {
         start: GPoint<Pixels>,
@@ -100,15 +196,97 @@ enum Drag {
     Pan {
         last: GPoint<Pixels>,
     },
+    /// Dragging out an empty frame with the Frame tool.
+    FrameDraw {
+        start: Point,
+        current: Point,
+    },
+    /// Header drag. The frame and its members move together, live.
+    FrameMove {
+        id: String,
+        last: Point,
+    },
+    /// A resize handle on the bottom-right edges of a selected frame.
+    FrameResize {
+        id: String,
+        origin_local: GPoint<Pixels>,
+        start_size: [f32; 2],
+        edge: crate::frames::ResizeEdge,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dot {
-    Muted,
-    Success,
-    Warning,
-    Danger,
+/// What the inline text input edits: a mark's text or a frame's title.
+#[derive(Clone, Debug)]
+enum EditTarget {
+    Mark(String),
+    Frame(String),
+}
+
+/// Collapse or expand animation of one frame's visible height.
+struct FrameAnim {
+    /// Height when the animation started, in canvas pixels.
+    from: f32,
+    started: Instant,
+}
+
+/// How long a badge color blends into the next one.
+const BADGE_FADE: Duration = Duration::from_millis(120);
+
+/// What the header badge of a card says. The reason and the message come
+/// from the session, which owns the execution state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Badge {
+    /// Hollow ring. The reason, when it is known, goes in the tooltip.
+    NotConfigured(Option<String>),
+    /// Filled muted dot.
+    Configured,
+    /// Accent dot, pulsing while reduced motion is off.
     Running,
+    /// Filled success dot.
+    Executed,
+    /// Filled danger dot, plus a danger border on the card.
+    Error(String),
+    /// Filled warning dot.
+    Stale,
+    /// The branch is skipped. The whole card draws at 40 percent opacity.
+    Inactive,
+}
+
+impl Badge {
+    /// Stable index of the badge's color class. A change between two dot
+    /// classes fades over 120 ms; a change into or out of the ring, or of
+    /// the inactive dimming, jumps straight to the new look.
+    fn class(&self) -> u8 {
+        match self {
+            Self::NotConfigured(_) => 0,
+            Self::Configured => 1,
+            Self::Running => 2,
+            Self::Executed => 3,
+            Self::Error(_) => 4,
+            Self::Stale => 5,
+            Self::Inactive => 6,
+        }
+    }
+
+    fn is_dot(&self) -> bool {
+        matches!(self.class(), 1..=5)
+    }
+
+    /// The tooltip text of the badge.
+    pub fn tooltip_text(&self) -> String {
+        match self {
+            Self::NotConfigured(reason) => match reason {
+                Some(reason) => format!("Not configured: {reason}"),
+                None => "Not configured".to_string(),
+            },
+            Self::Configured => "Configured".to_string(),
+            Self::Running => "Running".to_string(),
+            Self::Executed => "Executed".to_string(),
+            Self::Error(message) => format!("Error: {message}"),
+            Self::Stale => "Stale: an input or setting changed".to_string(),
+            Self::Inactive => "Inactive branch".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,24 +298,50 @@ pub struct FrameView {
 pub struct CanvasModel {
     focus: FocusHandle,
     editor: Document,
-    dots: BTreeMap<String, Dot>,
-    selection: Vec<String>,
+    badges: BTreeMap<String, Badge>,
+    /// Color of the badge before the last change, and when it changed. A
+    /// badge color blends into the next one over 120 ms when motion is on.
+    badge_fade: BTreeMap<String, (Badge, Instant)>,
+    pub(crate) selection: Vec<String>,
     tool: Tool,
     space_hand: bool,
     drag: Option<Drag>,
     settle: Option<Settle>,
     camera_anim: Option<CameraAnim>,
+    /// Visible-height animation of collapsing or expanding frames.
+    frame_anim: BTreeMap<String, FrameAnim>,
+    /// Drag in progress on the minimap; the camera follows immediately.
+    minimap_drag: bool,
+    /// When the minimap fade started, with the direction it heads.
+    minimap_fade: Option<(bool, Instant)>,
     frame_armed: bool,
     hovered: Option<String>,
+    /// Wire the pointer is over, with the nearest segment.
+    hover_wire: Option<(String, usize)>,
+    /// Reroute point the pointer is over.
+    hover_reroute: Option<(String, usize)>,
+    /// Reroute point the user selected, for Delete.
+    picked_reroute: Option<(String, usize)>,
+    /// Edge the context menu was opened on, with the pointer point.
+    wire_pick: Option<(String, Point, usize)>,
+    /// Wire a dragged node could be inserted into.
+    insert_hint: Option<String>,
     flow: f32,
     clip: Option<Clip>,
     label_input: Entity<gpui_kit::component::input::InputState>,
-    editing: Option<String>,
+    editing: Option<EditTarget>,
     frames: BTreeMap<String, FrameView>,
     notes: BTreeMap<String, String>,
     reduced_motion: bool,
     status: String,
     viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    wire_cache: HashMap<String, CachedWire>,
+    /// Live drag of a chart card's title or legend.
+    label_drag: Option<LabelDrag>,
+    /// Which chart label the pointer is over, for the hover outline.
+    label_hover: Option<(String, bool)>,
+    /// Plot box and label sizes, filled while the card paints.
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
 }
 
 impl CanvasModel {
@@ -146,15 +350,20 @@ impl CanvasModel {
         cx.subscribe(
             &label_input,
             |this, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                if matches!(event, gpui_kit::component::input::InputEvent::Blur)
-                    && this.editing.is_some()
-                {
-                    let text = input.read(cx).value().to_string();
-                    if let Some(id) = this.editing.clone() {
-                        this.editor.set_mark_text(&id, text);
-                        this.editing = None;
-                        this.changed(cx);
+                match event {
+                    gpui_kit::component::input::InputEvent::Blur => {
+                        if this.editing.is_some() {
+                            this.commit_edit_target(&input, cx);
+                        }
                     }
+                    // Enter commits the inline edit; the input keeps newline
+                    // handling for multi-line marks.
+                    gpui_kit::component::input::InputEvent::PressEnter { .. }
+                        if this.editing.is_some() =>
+                    {
+                        this.commit_edit_target(&input, cx);
+                    }
+                    _ => {}
                 }
             },
         )
@@ -162,15 +371,24 @@ impl CanvasModel {
         Self {
             focus: cx.focus_handle(),
             editor: Document::new(),
-            dots: BTreeMap::new(),
+            badges: BTreeMap::new(),
+            badge_fade: BTreeMap::new(),
             selection: Vec::new(),
             tool: Tool::Select,
             space_hand: false,
             drag: None,
             settle: None,
             camera_anim: None,
+            frame_anim: BTreeMap::new(),
+            minimap_drag: false,
+            minimap_fade: None,
             frame_armed: false,
             hovered: None,
+            hover_wire: None,
+            hover_reroute: None,
+            picked_reroute: None,
+            wire_pick: None,
+            insert_hint: None,
             flow: 0.0,
             clip: None,
             label_input,
@@ -180,6 +398,10 @@ impl CanvasModel {
             reduced_motion: false,
             status: String::new(),
             viewport: Rc::new(RefCell::new(None)),
+            wire_cache: HashMap::new(),
+            label_drag: None,
+            label_hover: None,
+            chart_metrics: Rc::new(RefCell::new(BTreeMap::new())),
         }
         .with_focus(window)
     }
@@ -293,10 +515,30 @@ impl CanvasModel {
         cx.notify();
     }
 
-    pub fn set_dots(&mut self, dots: BTreeMap<String, Dot>, cx: &mut Context<Self>) {
-        let running = dots.values().any(|dot| *dot == Dot::Running);
-        self.dots = dots;
-        let _ = running;
+    pub fn set_badges(&mut self, badges: BTreeMap<String, Badge>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut gain = Vec::new();
+        for (id, badge) in &badges {
+            let old = self.badges.get(id).cloned().unwrap_or(Badge::Configured);
+            if old == *badge || !old.is_dot() || !badge.is_dot() {
+                continue;
+            }
+            gain.push(id.clone());
+            self.badge_fade.insert(id.clone(), (old, now));
+        }
+        self.badges = badges;
+        if !gain.is_empty() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(BADGE_FADE + Duration::from_millis(40))
+                    .await;
+                // The motion tick loop paints the blend on frames that run.
+                // This timer is the floor: it repaints the settled color even
+                // when the window draws no motion frames at all.
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -304,8 +546,9 @@ impl CanvasModel {
         self.reduced_motion = reduced;
         if reduced {
             self.settle = None;
+            self.badge_fade.clear();
             if let Some(anim) = self.camera_anim.take() {
-                self.editor.set_camera(anim.to);
+                self.place_camera(anim.to, anim.quiet);
             }
         }
         cx.notify();
@@ -321,6 +564,17 @@ impl CanvasModel {
         self.drag = None;
         self.settle = None;
         self.camera_anim = None;
+        self.frame_anim.clear();
+        self.wire_cache.clear();
+        self.badge_fade.clear();
+        self.badges.clear();
+        self.minimap_drag = false;
+        self.minimap_fade = None;
+        self.hover_wire = None;
+        self.hover_reroute = None;
+        self.picked_reroute = None;
+        self.wire_pick = None;
+        self.insert_hint = None;
         cx.emit(CanvasEvent::Edited);
         cx.emit(CanvasEvent::SelectionChanged);
         cx.notify();
@@ -342,6 +596,41 @@ impl CanvasModel {
             .find_map(|id| self.editor.graph().node(id))
     }
 
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.selection.clear();
+        cx.emit(CanvasEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    /// Park the camera at `zoom`, with the graph centered in the viewport.
+    pub fn pin_zoom_centered(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.viewport.borrow() else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .editor
+            .graph()
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        let Some(rect) = graph::bounds_of(self.editor.graph(), &ids, card_height) else {
+            return;
+        };
+        let center = Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+        self.camera_anim = None;
+        self.editor.set_camera(Camera {
+            zoom,
+            x: bounds.size.width.as_f32() * 0.5 - center.x * zoom,
+            y: bounds.size.height.as_f32() * 0.5 - center.y * zoom,
+        });
+        cx.emit(CanvasEvent::Edited);
+        cx.notify();
+    }
+
     pub fn add_feature(&mut self, feature: &str, cx: &mut Context<Self>) -> Option<String> {
         let origin = self.local_origin();
         let at = self
@@ -349,6 +638,24 @@ impl CanvasModel {
             .graph()
             .camera
             .to_canvas(Point::new(origin.0, origin.1));
+        // A loop is a pair. The end lands 400px to the right of the start.
+        if feature == "loop_start" {
+            let at = if let Some(selected) = self.selected_node() {
+                Point::new(
+                    selected.position[0] + card_width(&selected.feature) + 48.0,
+                    selected.position[1],
+                )
+            } else {
+                at
+            };
+            let (start, _) = self.editor.add_loop(at)?;
+            self.selection = vec![start.clone()];
+            self.enter_node(&start);
+            self.changed(cx);
+            cx.emit(CanvasEvent::FocusInspector);
+            cx.emit(CanvasEvent::SelectionChanged);
+            return Some(start);
+        }
         let id = if let Some(selected) = self.selected_node().map(|node| node.id.clone()) {
             self.editor.add_after(&selected, feature)
         } else {
@@ -363,11 +670,30 @@ impl CanvasModel {
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        let (nodes, marks) = self.split_selection();
-        if nodes.is_empty() && marks.is_empty() {
+        if let Some((edge, index)) = self.picked_reroute.take() {
+            self.editor.remove_reroute(&edge, index);
+            self.changed(cx);
             return;
         }
+        let (nodes, marks) = self.split_selection();
+        let frames = self.selected_frames();
+        let edges: Vec<String> = self
+            .selection
+            .iter()
+            .filter(|id| self.editor.graph().edges.iter().any(|edge| &edge.id == *id))
+            .cloned()
+            .collect();
+        if nodes.is_empty() && marks.is_empty() && edges.is_empty() && frames.is_empty() {
+            return;
+        }
+        self.editor.begin_gesture();
+        for edge in &edges {
+            self.editor.detach(edge);
+        }
+        // Deleting a frame removes the group only; its members stay.
+        self.editor.delete_frames(&frames);
         self.editor.delete(&nodes, &marks);
+        self.editor.commit_gesture();
         self.selection.clear();
         self.changed(cx);
         cx.emit(CanvasEvent::SelectionChanged);
@@ -551,8 +877,55 @@ impl CanvasModel {
         self.label_input.update(cx, |state, cx| {
             state.set_value(text, window, cx);
         });
-        self.editing = Some(id);
+        let handle = self.label_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.editing = Some(EditTarget::Mark(id));
         cx.notify();
+    }
+
+    /// Inline rename of a frame title. Enter commits, Escape cancels.
+    pub fn start_frame_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let text = frame.title.clone();
+        self.label_input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+        });
+        let handle = self.label_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.editing = Some(EditTarget::Frame(id.to_string()));
+        cx.notify();
+    }
+
+    /// Commit the inline edit to whichever target is being renamed.
+    fn commit_edit_target(
+        &mut self,
+        input: &Entity<gpui_kit::component::input::InputState>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.editing.take() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        match target {
+            EditTarget::Mark(id) => self.editor.set_mark_text(&id, text),
+            EditTarget::Frame(id) => self.editor.set_frame_title(&id, text),
+        }
+        self.changed(cx);
+    }
+
+    /// Escape pressed while renaming: drop the edit without writing.
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn set_frames(
@@ -580,12 +953,17 @@ impl CanvasModel {
     }
 
     pub fn commit_label(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.editing.clone() else {
+        if self.editing.is_none() {
+            return;
+        }
+        let text = self.label_input.read(cx).value().to_string();
+        let Some(target) = self.editing.take() else {
             return;
         };
-        let text = self.label_input.read(cx).value().to_string();
-        self.editor.set_mark_text(&id, text);
-        self.editing = None;
+        match target {
+            EditTarget::Mark(id) => self.editor.set_mark_text(&id, text),
+            EditTarget::Frame(id) => self.editor.set_frame_title(&id, text),
+        }
         self.changed(cx);
     }
 
@@ -607,14 +985,19 @@ impl CanvasModel {
     }
 
     pub fn fit_all(&mut self, cx: &mut Context<Self>) {
-        self.fit_ids(false, cx);
+        self.fit_ids(false, false, cx);
+    }
+
+    /// Frame the graph the way an open does: no dirty mark.
+    pub fn fit_all_quiet(&mut self, cx: &mut Context<Self>) {
+        self.fit_ids(false, true, cx);
     }
 
     pub fn fit(&mut self, cx: &mut Context<Self>) {
-        self.fit_ids(true, cx);
+        self.fit_ids(true, false, cx);
     }
 
-    fn fit_ids(&mut self, selection_only: bool, cx: &mut Context<Self>) {
+    fn fit_ids(&mut self, selection_only: bool, quiet: bool, cx: &mut Context<Self>) {
         let bounds = self
             .viewport
             .borrow()
@@ -636,7 +1019,7 @@ impl CanvasModel {
         let Some(rect) = graph::bounds_of(self.editor.graph(), &ids, card_height) else {
             return;
         };
-        self.animate_camera(graph::fit_camera(w, h, rect, 72.0), cx);
+        self.animate_camera(graph::fit_camera(w, h, rect, 72.0), quiet, cx);
     }
 
     pub fn zoom_by(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -658,10 +1041,11 @@ impl CanvasModel {
     /// Move an in-progress link drag. Used by the screenshot reel.
     pub fn show_link(&mut self, from: &str, from_port: &str, at: Point, cx: &mut Context<Self>) {
         self.drag = Some(Drag::Link {
-            from: from.to_string(),
-            from_port: from_port.to_string(),
-            detached: None,
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            rewired: Vec::new(),
             pointer: at,
+            origin: at,
         });
         self.refresh_link_status();
         cx.notify();
@@ -676,12 +1060,37 @@ impl CanvasModel {
         cx: &mut Context<Self>,
     ) {
         self.drag = Some(Drag::Link {
-            from: from.to_string(),
-            from_port: from_port.to_string(),
-            detached: None,
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            rewired: Vec::new(),
             pointer: self.canvas_of(point(px(local.0), px(local.1))),
+            origin: self.canvas_of(point(px(local.0), px(local.1))),
         });
         self.refresh_link_status();
+        cx.notify();
+    }
+
+    /// Open the node search as if a wire from an output was dropped at `at`.
+    /// Used by the screenshot reel.
+    pub fn seed_search_drop(
+        &mut self,
+        from: &str,
+        from_port: &str,
+        at: Point,
+        cx: &mut Context<Self>,
+    ) {
+        let ty = graph::output_types(self.editor.graph(), from)
+            .into_iter()
+            .next();
+        let local = self.editor.graph().camera.to_window(at);
+        let screen = self.screen_of(point(px(local.x), px(local.y)));
+        cx.emit(CanvasEvent::OpenCatalog {
+            from: Some((from.to_string(), from_port.to_string())),
+            to: None,
+            ty,
+            at,
+            screen,
+        });
         cx.notify();
     }
 
@@ -692,7 +1101,11 @@ impl CanvasModel {
 
     fn select_hit(&mut self, local: GPoint<Pixels>) {
         let canvas = self.canvas_of(local);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         for node in self.editor.graph().nodes.iter().rev() {
+            if hidden.contains_key(&node.id) {
+                continue;
+            }
             let at = node.position_point();
             let height = card_height(node);
             if canvas.x >= at.x
@@ -732,7 +1145,301 @@ impl CanvasModel {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        // Wire shapes derive from the document; an edit invalidates every
+        // cached chain. Camera-only updates skip this and keep theirs.
+        self.wire_cache.clear();
         cx.emit(CanvasEvent::Edited);
+        cx.notify();
+    }
+
+    /// Public emit for menu handlers that live outside this module.
+    pub fn notify_edited(&mut self, cx: &mut Context<Self>) {
+        self.changed(cx);
+    }
+
+    /// Window-space bounds of the canvas panel, for popovers that must stay
+    /// inside it.
+    pub fn panel_bounds(&self) -> Option<Bounds<Pixels>> {
+        *self.viewport.borrow()
+    }
+
+    /// Frame ids in the selection.
+    fn selected_frames(&self) -> Vec<String> {
+        self.selection
+            .iter()
+            .filter(|id| self.editor.graph().frames.iter().any(|f| f.id == **id))
+            .cloned()
+            .collect()
+    }
+
+    /// Group the selection with 24 px of padding around it.
+    pub fn group_selection(&mut self, cx: &mut Context<Self>) {
+        let (nodes, marks) = self.split_selection();
+        if nodes.is_empty() && marks.is_empty() {
+            return;
+        }
+        let Some(id) = self
+            .editor
+            .frame_around(&nodes, &marks, crate::frames::GROUP_PAD)
+        else {
+            return;
+        };
+        self.selection = vec![id.clone()];
+        self.changed(cx);
+        cx.emit(CanvasEvent::SelectionChanged);
+    }
+
+    /// Layered left-to-right layout of the selection, or of everything when
+    /// fewer than two nodes are selected. One undo step, animated.
+    pub fn auto_layout(&mut self, cx: &mut Context<Self>) {
+        if self.editor.is_readonly() {
+            return;
+        }
+        let (nodes, _) = self.split_selection();
+        let ids: Vec<String> = if nodes.len() >= 2 {
+            nodes
+        } else {
+            self.editor
+                .graph()
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect()
+        };
+        if ids.len() < 2 {
+            return;
+        }
+        let placed = crate::autolayout::layered_layout(self.editor.graph(), &ids);
+        if placed.is_empty() {
+            return;
+        }
+        let mut offsets = BTreeMap::new();
+        for (id, next) in &placed {
+            if let Some(node) = self.editor.graph().node(id) {
+                offsets.insert(
+                    id.clone(),
+                    Point::new(node.position[0] - next.x, node.position[1] - next.y),
+                );
+            }
+        }
+        self.editor.place_many(&placed);
+        if !self.reduced_motion
+            && offsets
+                .values()
+                .any(|offset| offset.x.abs() + offset.y.abs() > 0.5)
+        {
+            self.settle = Some(Settle {
+                offsets,
+                started: Instant::now(),
+                duration: motion::LAYOUT,
+            });
+        }
+        // Fit the camera to the laid-out result.
+        let view = self
+            .viewport
+            .borrow()
+            .map(|bounds| (bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+        if let Some((w, h)) = view {
+            let rect = graph::bounds_of(self.editor.graph(), &ids, card_height);
+            if let Some(rect) = rect {
+                self.animate_camera(graph::fit_camera(w, h, rect, 72.0), false, cx);
+            }
+        }
+        self.changed(cx);
+    }
+
+    /// Flip the minimap on or off. The flag lives in the document view, so
+    /// the next open remembers it; no undo step is written.
+    pub fn toggle_minimap(&mut self, cx: &mut Context<Self>) {
+        let mut view = self.editor.graph().view;
+        view.minimap = !view.minimap;
+        self.editor.set_view(view);
+        self.minimap_fade = Some((view.minimap, Instant::now()));
+        self.changed(cx);
+    }
+
+    /// Opacity of the minimap during its fade, 1 when steady.
+    fn minimap_alpha(&self, showing: bool) -> f32 {
+        let Some((target, started)) = self.minimap_fade else {
+            return u8::from(showing) as f32;
+        };
+        let t = (started.elapsed().as_secs_f32() / motion::FADE.as_secs_f32()).clamp(0.0, 1.0);
+        let t = 1.0 - (1.0 - t).powi(3);
+        if target { t } else { 1.0 - t }
+    }
+
+    fn minimap_point(&self, event_position: GPoint<Pixels>) -> Option<Point> {
+        let bounds = (*self.viewport.borrow())?;
+        let local = event_position - bounds.origin;
+        let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+        let content = crate::minimap::content_bounds(self.editor.graph(), card_height, view);
+        let map = crate::minimap::Map::fit(content, crate::minimap::SIZE);
+        let panel = Point::new(
+            local.x.as_f32() - (view.0 - crate::minimap::SIZE[0] - crate::minimap::MARGIN),
+            local.y.as_f32() - (view.1 - crate::minimap::SIZE[1] - crate::minimap::MARGIN),
+        );
+        Some(map.to_canvas(panel))
+    }
+
+    /// Click on the minimap: animate the camera so the point centers.
+    pub fn minimap_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(canvas) = self.minimap_point(event.position) else {
+            return;
+        };
+        self.minimap_drag = true;
+        self.center_camera_on(canvas, true, cx);
+    }
+
+    /// Drag on the minimap: the camera follows the pointer immediately.
+    pub fn minimap_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.minimap_drag {
+            return;
+        }
+        if let Some(canvas) = self.minimap_point(event.position) {
+            self.center_camera_on(canvas, false, cx);
+        }
+    }
+
+    /// Camera of the viewport centered on `at`, keeping the current zoom.
+    fn center_camera_on(&mut self, at: Point, animate: bool, cx: &mut Context<Self>) {
+        let Some(bounds) = *self.viewport.borrow() else {
+            return;
+        };
+        let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+        let zoom = self.editor.graph().camera.zoom;
+        let camera = Camera {
+            x: view.0 * 0.5 - at.x * zoom,
+            y: view.1 * 0.5 - at.y * zoom,
+            zoom,
+        };
+        if animate {
+            self.animate_camera(camera, false, cx);
+        } else {
+            self.camera_anim = None;
+            self.editor.set_camera(camera);
+            cx.emit(CanvasEvent::Edited);
+            cx.notify();
+        }
+    }
+
+    /// Press on a frame header: select the frame and open a move gesture.
+    pub fn frame_header_down(
+        &mut self,
+        id: &str,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || self.editor.is_readonly() {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        if !self.selection.iter().any(|item| item == id) {
+            self.selection = vec![id.to_string()];
+            cx.emit(CanvasEvent::SelectionChanged);
+        }
+        let Some(_frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let last = self.canvas_of(self.local_of(event.position));
+        self.editor.begin_gesture();
+        self.drag = Some(Drag::FrameMove {
+            id: id.to_string(),
+            last,
+        });
+        cx.notify();
+    }
+
+    /// Press on a resize handle: open a frame resize gesture.
+    pub fn frame_resize_down(
+        &mut self,
+        id: &str,
+        edge: crate::frames::ResizeEdge,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || self.editor.is_readonly() {
+            return;
+        }
+        let start_size = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+            .map(|frame| frame.size);
+        let Some(start_size) = start_size else {
+            return;
+        };
+        let origin_local = self.local_of(event.position);
+        self.editor.begin_gesture();
+        self.drag = Some(Drag::FrameResize {
+            id: id.to_string(),
+            origin_local,
+            start_size,
+            edge,
+        });
+        cx.notify();
+    }
+
+    /// Collapse or expand a frame, animating the height.
+    pub fn toggle_frame_collapsed(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(frame) = self
+            .editor
+            .graph()
+            .frames
+            .iter()
+            .find(|frame| frame.id == id)
+        else {
+            return;
+        };
+        let target = !frame.collapsed;
+        let from = self.frame_height(frame);
+        self.editor.set_frame_collapsed(id, target);
+        if !self.reduced_motion {
+            self.frame_anim.insert(
+                id.to_string(),
+                FrameAnim {
+                    from,
+                    started: Instant::now(),
+                },
+            );
+        } else {
+            self.frame_anim.remove(id);
+        }
+        self.changed(cx);
+    }
+
+    /// Visible height of a frame, honoring the collapse animation.
+    fn frame_height(&self, frame: &Frame) -> f32 {
+        let target = if frame.collapsed {
+            crate::frames::HEADER_H
+        } else {
+            frame.size[1]
+        };
+        if self.reduced_motion {
+            return target;
+        }
+        match self.frame_anim.get(&frame.id) {
+            Some(anim) => {
+                let t = (anim.started.elapsed().as_secs_f32() / motion::COLLAPSE.as_secs_f32())
+                    .clamp(0.0, 1.0);
+                motion::lerp(anim.from, target, t)
+            }
+            None => target,
+        }
+    }
+
+    /// Select every node the frame covers.
+    pub fn select_frame_members(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.selection = graph::frame_members(self.editor.graph(), id);
+        cx.emit(CanvasEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -768,6 +1475,15 @@ impl CanvasModel {
         window.focus(&self.focus, cx);
         if event.button == MouseButton::Right {
             self.select_hit(local);
+            let canvas = self.canvas_of(local);
+            self.wire_pick = if self.selection.is_empty() {
+                self.wire_hit_at(canvas).map(|(edge, segment)| {
+                    self.selection = vec![edge.clone()];
+                    (edge, canvas, segment)
+                })
+            } else {
+                None
+            };
             cx.emit(CanvasEvent::SelectionChanged);
             cx.notify();
             return;
@@ -794,6 +1510,74 @@ impl CanvasModel {
             cx.notify();
             return;
         }
+        if self.tool == Tool::Frame {
+            if self.editor.is_readonly() {
+                return;
+            }
+            let canvas = self.canvas_of(local);
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::FrameDraw {
+                start: canvas,
+                current: canvas,
+            });
+            cx.notify();
+            return;
+        }
+        let canvas = self.canvas_of(local);
+        // A double click adds a bend to a wire, removes a bend point, or
+        // opens the node search on empty canvas.
+        if event.click_count >= 2 {
+            if let Some((edge, index)) = self.reroute_at(canvas) {
+                self.picked_reroute = None;
+                self.editor.remove_reroute(&edge, index);
+                self.changed(cx);
+                return;
+            }
+            if let Some((edge, segment)) = self.wire_hit_at(canvas) {
+                if self.editor.is_readonly() {
+                    return;
+                }
+                self.editor.begin_gesture();
+                self.editor.add_reroute(&edge, segment, canvas);
+                self.editor.commit_gesture();
+                self.changed(cx);
+                return;
+            }
+            if self.editor.is_readonly() {
+                return;
+            }
+            let screen = self.screen_of(local);
+            cx.emit(CanvasEvent::OpenCatalog {
+                from: None,
+                to: None,
+                ty: None,
+                at: canvas,
+                screen,
+            });
+            cx.notify();
+            return;
+        }
+        if let Some((edge, index)) = self.reroute_at(canvas) {
+            self.picked_reroute = Some((edge.clone(), index));
+            self.selection.clear();
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::Reroute { edge, index });
+            cx.emit(CanvasEvent::SelectionChanged);
+            cx.notify();
+            return;
+        }
+        if let Some((edge, _)) = self.wire_hit_at(canvas) {
+            self.picked_reroute = None;
+            self.selection = vec![edge.clone()];
+            cx.emit(CanvasEvent::SelectionChanged);
+            // A click on a wire shows the frame it carries. The workspace
+            // turns this into a preview job for the wire's source node.
+            if event.click_count == 1 {
+                cx.emit(CanvasEvent::PreviewWire { edge });
+            }
+            cx.notify();
+            return;
+        }
         self.drag = Some(Drag::Marquee {
             start: local,
             current: local,
@@ -816,13 +1600,35 @@ impl CanvasModel {
         }
         let local = self.local_of(event.position);
         window.focus(&self.focus, cx);
+        let pointer = self.canvas_of(local);
+        let origin = pointer;
         if side == Side::Out {
             self.editor.begin_gesture();
+            let wires: Vec<Edge> = self
+                .editor
+                .graph()
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node && edge.from_port == port)
+                .cloned()
+                .collect();
+            // Ctrl or Alt picks up every wire of the output instead of
+            // starting one new wire.
+            let pickup = event.modifiers.control || event.modifiers.alt;
+            let mut rewired = Vec::new();
+            if pickup {
+                for edge in wires {
+                    if let Some(detached) = self.editor.detach(&edge.id) {
+                        rewired.push(detached);
+                    }
+                }
+            }
             self.drag = Some(Drag::Link {
-                from: node.to_string(),
-                from_port: port.to_string(),
-                detached: None,
-                pointer: self.canvas_of(local),
+                from: Some((node.to_string(), port.to_string())),
+                to: None,
+                rewired,
+                pointer,
+                origin,
             });
         } else if let Some(edge) = self
             .editor
@@ -834,14 +1640,26 @@ impl CanvasModel {
         {
             self.editor.begin_gesture();
             let detached = self.editor.detach(&edge.id);
-            if let Some(detached) = detached.as_ref() {
+            if let Some(detached) = detached {
                 self.drag = Some(Drag::Link {
-                    from: detached.from.clone(),
-                    from_port: detached.from_port.clone(),
-                    detached: Some(detached.clone()),
-                    pointer: self.canvas_of(local),
+                    from: Some((detached.from.clone(), detached.from_port.clone())),
+                    to: Some((node.to_string(), port.to_string())),
+                    rewired: Vec::new(),
+                    pointer,
+                    origin,
                 });
             }
+        } else {
+            // A drag from an unconnected input port: the new wire keeps the
+            // input as its anchor and reaches for an output.
+            self.editor.begin_gesture();
+            self.drag = Some(Drag::Link {
+                from: None,
+                to: Some((node.to_string(), port.to_string())),
+                rewired: Vec::new(),
+                pointer,
+                origin,
+            });
         }
         self.refresh_link_status();
         cx.notify();
@@ -910,6 +1728,7 @@ impl CanvasModel {
         }
         self.editor.begin_gesture();
         self.settle = None;
+        self.insert_hint = None;
         self.drag = Some(Drag::Move {
             origin_local: local,
             nodes,
@@ -919,9 +1738,137 @@ impl CanvasModel {
         cx.notify();
     }
 
+    /// Press on a chart card's title or legend. The card itself must not move.
+    pub fn chart_label_down(
+        &mut self,
+        node: &str,
+        title: bool,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        cx.stop_propagation();
+        if event.click_count >= 2 {
+            self.label_drag = None;
+            self.reset_chart_label(node, title, cx);
+            return;
+        }
+        if self.editor.is_readonly() {
+            return;
+        }
+        let presentation = self
+            .editor
+            .graph()
+            .node(node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        let origin = if title {
+            (presentation.title.x, presentation.title.y)
+        } else {
+            (presentation.legend.x, presentation.legend.y)
+        };
+        self.label_drag = Some(LabelDrag {
+            node: node.to_string(),
+            title,
+            origin,
+            live: origin,
+            start: event.position,
+        });
+        cx.notify();
+    }
+
+    pub fn chart_label_hover(
+        &mut self,
+        node: &str,
+        title: bool,
+        over: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = over.then(|| (node.to_string(), title));
+        if self.label_hover != next {
+            self.label_hover = next;
+            cx.notify();
+        }
+    }
+
+    fn move_chart_label(&mut self, at: GPoint<Pixels>) {
+        let Some(drag) = self.label_drag.clone() else {
+            return;
+        };
+        let metric = self
+            .chart_metrics
+            .borrow()
+            .get(&drag.node)
+            .cloned()
+            .unwrap_or_default();
+        let Some(plot) = metric.plot else {
+            return;
+        };
+        let width = plot.size.width.as_f32().max(1.0);
+        let height = plot.size.height.as_f32().max(1.0);
+        let dx = (at.x - drag.start.x).as_f32();
+        let dy = (at.y - drag.start.y).as_f32();
+        let live = (
+            (drag.origin.0 + dx / width).clamp(0.0, 1.0),
+            (drag.origin.1 + dy / height).clamp(0.0, 1.0),
+        );
+        self.label_drag = Some(LabelDrag { live, ..drag });
+    }
+
+    fn commit_chart_label(&mut self, drag: &LabelDrag, cx: &mut Context<Self>) {
+        let mut next = self
+            .editor
+            .graph()
+            .node(&drag.node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        if drag.title {
+            next.title.x = drag.live.0;
+            next.title.y = drag.live.1;
+        } else {
+            next.legend.x = drag.live.0;
+            next.legend.y = drag.live.1;
+        }
+        let node = drag.node.clone();
+        self.editor.set_presentation(&node, next);
+        self.changed(cx);
+    }
+
+    fn reset_chart_label(&mut self, node: &str, title: bool, cx: &mut Context<Self>) {
+        if self.editor.is_readonly() {
+            return;
+        }
+        let mut next = self
+            .editor
+            .graph()
+            .node(node)
+            .and_then(|node| node.presentation.clone())
+            .unwrap_or_default();
+        let fresh = Presentation::default();
+        if title {
+            next.title.x = fresh.title.x;
+            next.title.y = fresh.title.y;
+            next.title.anchor = fresh.title.anchor;
+        } else {
+            next.legend.x = fresh.legend.x;
+            next.legend.y = fresh.legend.y;
+            next.legend.anchor = fresh.legend.anchor;
+        }
+        self.editor.set_presentation(node, next);
+        self.changed(cx);
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.label_drag.is_some() {
+            self.move_chart_label(event.position);
+            cx.notify();
+            return;
+        }
         let local = self.local_of(event.position);
         let Some(mut drag) = self.drag.clone() else {
+            self.track_hover(local, cx);
             return;
         };
         let mut refresh_link = false;
@@ -957,10 +1904,26 @@ impl CanvasModel {
                     .map(|(id, origin)| (id.clone(), Point::new(origin.x + dx, origin.y + dy)))
                     .collect();
                 self.editor.place(&placed_nodes, &placed_marks, false);
+                // A single unconnected node near a wire can be inserted into it.
+                self.insert_hint = None;
+                if marks.is_empty() && nodes.len() == 1 {
+                    let id = nodes.keys().next().cloned().unwrap_or_default();
+                    self.update_insert_hint(&id, self.canvas_of(local));
+                }
             }
             Drag::Link { pointer, .. } => {
                 *pointer = self.canvas_of(local);
                 refresh_link = true;
+            }
+            Drag::Reroute { edge, index } => {
+                let at = self.canvas_of(local);
+                // The snap-disable modifier is the one card drags use.
+                let at = if event.modifiers.alt {
+                    at
+                } else {
+                    graph::snap_grid(at)
+                };
+                self.editor.move_reroute(edge, *index, at);
             }
             Drag::Marquee { current, .. } => {
                 *current = local;
@@ -985,6 +1948,33 @@ impl CanvasModel {
                 }
                 self.editor.resize_mark(&id, [width, height]);
             }
+            Drag::FrameDraw { current, .. } => {
+                *current = self.canvas_of(local);
+            }
+            Drag::FrameMove { id, last } => {
+                let at = self.canvas_of(local);
+                let delta = Point::new(at.x - last.x, at.y - last.y);
+                *last = at;
+                self.editor.move_frame(id, delta);
+            }
+            Drag::FrameResize {
+                id,
+                origin_local,
+                start_size,
+                edge,
+            } => {
+                let zoom = self.editor.graph().camera.zoom.max(0.05);
+                let dx = (local.x.as_f32() - origin_local.x.as_f32()) / zoom;
+                let dy = (local.y.as_f32() - origin_local.y.as_f32()) / zoom;
+                let mut size = *start_size;
+                if *edge != crate::frames::ResizeEdge::Bottom {
+                    size[0] = (start_size[0] + dx).max(24.0);
+                }
+                if *edge != crate::frames::ResizeEdge::Right {
+                    size[1] = (start_size[1] + dy).max(24.0);
+                }
+                self.editor.resize_frame(id, size);
+            }
         }
         self.drag = Some(drag);
         if refresh_link {
@@ -993,8 +1983,32 @@ impl CanvasModel {
         cx.notify();
     }
 
+    /// Remember which wire and bend point sit under the pointer.
+    fn track_hover(&mut self, local: GPoint<Pixels>, cx: &mut Context<Self>) {
+        let canvas = self.canvas_of(local);
+        let reroute = self.reroute_at(canvas);
+        let wire = if reroute.is_none() {
+            self.wire_hit_at(canvas)
+        } else {
+            None
+        };
+        if self.hover_reroute != reroute || self.hover_wire != wire {
+            self.hover_reroute = reroute;
+            self.hover_wire = wire;
+            cx.notify();
+        }
+    }
+
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.label_drag.is_some() {
+            self.move_chart_label(event.position);
+            if let Some(drag) = self.label_drag.take() {
+                self.commit_chart_label(&drag, cx);
+            }
+            return;
+        }
         let local = self.local_of(event.position);
+        self.minimap_drag = false;
         let drag = self.drag.take();
         match drag {
             Some(Drag::Pan { .. }) => {}
@@ -1036,6 +2050,30 @@ impl CanvasModel {
                     self.selection = vec![focus];
                     cx.emit(CanvasEvent::SelectionChanged);
                 }
+                // Dropping one unconnected node on a highlighted wire threads
+                // it in; the move and the insert share the open gesture.
+                if let Some(edge) = self.insert_hint.take()
+                    && marks.is_empty()
+                    && nodes.len() == 1
+                    && let Some(id) = nodes.keys().next()
+                    && self
+                        .editor
+                        .graph()
+                        .edges
+                        .iter()
+                        .all(|wire| wire.from != *id && wire.to != *id)
+                {
+                    match self.editor.insert_node_on_edge(&edge, id) {
+                        Ok(()) => {
+                            self.selection = vec![id.clone()];
+                            self.status = "node inserted into wire".to_string();
+                            cx.emit(CanvasEvent::SelectionChanged);
+                        }
+                        Err(reason) => {
+                            self.status = reject_message(reason, "node", "wire");
+                        }
+                    }
+                }
                 self.editor.commit_gesture();
                 if !self.reduced_motion
                     && offsets
@@ -1052,29 +2090,103 @@ impl CanvasModel {
             }
             Some(Drag::Link {
                 from,
-                from_port,
-                detached,
+                to,
+                rewired,
                 pointer,
+                origin,
+                ..
             }) => {
-                let snap = self.snap_at(pointer, &from, &from_port);
-                if let Some((to, to_port)) = snap {
-                    let _ = self.editor.connect(&from, &from_port, &to, &to_port);
-                    self.status.clear();
-                } else if detached.is_some() {
-                    self.status = "wire removed".to_string();
-                } else {
-                    self.status.clear();
-                    let filter = self.editor.graph().node(&from).and_then(|_| {
-                        graph::output_types(self.editor.graph(), &from)
-                            .into_iter()
-                            .next()
-                    });
-                    if snap.is_none() && detached.is_none() {
-                        cx.emit(CanvasEvent::OpenCatalog { filter });
+                if !rewired.is_empty() {
+                    let ids: Vec<String> = rewired.iter().map(|edge| edge.id.clone()).collect();
+                    let origin = from.clone().unwrap_or_default().0;
+                    if let Some((node, port)) = self.output_drop_at(pointer, &origin) {
+                        let (moved, rejected) = self.editor.rewire_sources(&ids, &node, &port);
+                        self.editor.commit_gesture();
+                        self.status = if rejected > 0 {
+                            format!("moved {moved}, rejected {rejected}")
+                        } else if moved == 1 {
+                            "moved 1 wire".to_string()
+                        } else {
+                            format!("moved {moved} wires")
+                        };
+                    } else {
+                        // Empty space cancels: the gesture restores the wires.
+                        self.editor.cancel_gesture();
+                        self.status.clear();
                     }
+                    self.changed(cx);
+                } else if let Some((from_node, from_port)) = from.clone()
+                    && let Some((to_node, to_port)) = self.snap_at(pointer, &from_node, &from_port)
+                {
+                    let _ = self
+                        .editor
+                        .connect(&from_node, &from_port, &to_node, &to_port);
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if from.is_none()
+                    && let Some((to_node, to_port)) = to.clone()
+                    && let Some((node, port)) = self.output_drop_at(pointer, "")
+                {
+                    let _ = self.editor.connect(&node, &port, &to_node, &to_port);
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if let Some((to_node, to_port)) = to.clone() {
+                    // An input end was dropped on empty space: offer nodes
+                    // that can feed the input again.
+                    self.status.clear();
+                    let ty = self
+                        .editor
+                        .graph()
+                        .node(&to_node)
+                        .and_then(|node| {
+                            node.input_ports()
+                                .into_iter()
+                                .find(|slot| slot.name == to_port)
+                        })
+                        .and_then(|slot| slot.accepts.first().copied());
+                    let screen = self.screen_of(local);
+                    cx.emit(CanvasEvent::OpenCatalog {
+                        from: None,
+                        to: Some((to_node, to_port)),
+                        ty,
+                        at: pointer,
+                        screen,
+                    });
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else if let Some((from_node, _)) = from.clone()
+                    // A click on the output port that never dragged: show the
+                    // frame this output produces. A real drag a few pixels
+                    // away still opens the catalog.
+                    && (pointer.x - origin.x).abs() + (pointer.y - origin.y).abs() < 6.0 / self.zoom()
+                {
+                    self.status.clear();
+                    self.editor.commit_gesture();
+                    self.selection = vec![from_node.clone()];
+                    cx.emit(CanvasEvent::SelectionChanged);
+                    cx.emit(CanvasEvent::PreviewPort { node: from_node });
+                    cx.notify();
+                } else if let Some((from_node, from_port)) = from.clone() {
+                    self.status.clear();
+                    let ty = graph::output_types(self.editor.graph(), &from_node)
+                        .into_iter()
+                        .next();
+                    let screen = self.screen_of(local);
+                    cx.emit(CanvasEvent::OpenCatalog {
+                        from: Some((from_node, from_port)),
+                        to: None,
+                        ty,
+                        at: pointer,
+                        screen,
+                    });
+                    self.editor.commit_gesture();
+                    self.changed(cx);
+                } else {
+                    self.editor.commit_gesture();
+                    self.changed(cx);
                 }
-                self.editor.commit_gesture();
-                self.changed(cx);
             }
             Some(Drag::Marquee {
                 start,
@@ -1088,8 +2200,12 @@ impl CanvasModel {
                         cx.emit(CanvasEvent::SelectionChanged);
                     }
                 } else {
+                    let hidden = crate::frames::collapsed_members(self.editor.graph());
                     let mut hits = Vec::new();
                     for node in &self.editor.graph().nodes {
+                        if hidden.contains_key(&node.id) {
+                            continue;
+                        }
                         let origin = node.position_point();
                         let window = self.editor.graph().camera.to_window(origin);
                         let zoom = self.editor.graph().camera.zoom;
@@ -1116,7 +2232,36 @@ impl CanvasModel {
                 }
                 cx.notify();
             }
+            Some(Drag::Reroute { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
             Some(Drag::Resize { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
+            Some(Drag::FrameDraw { start, current }) => {
+                self.editor.cancel_gesture();
+                let x = start.x.min(current.x);
+                let y = start.y.min(current.y);
+                let w = (start.x - current.x).abs().max(0.0);
+                let h = (start.y - current.y).abs().max(0.0);
+                if w >= 24.0
+                    && h >= 24.0
+                    && let Some(id) = self
+                        .editor
+                        .add_frame(String::new(), Point::new(x, y), [w, h])
+                {
+                    self.selection = vec![id];
+                    cx.emit(CanvasEvent::SelectionChanged);
+                }
+                self.changed(cx);
+            }
+            Some(Drag::FrameMove { .. }) => {
+                self.editor.commit_gesture();
+                self.changed(cx);
+            }
+            Some(Drag::FrameResize { .. }) => {
                 self.editor.commit_gesture();
                 self.changed(cx);
             }
@@ -1147,9 +2292,10 @@ impl CanvasModel {
 
     fn snap_at(&self, pointer: Point, from: &str, from_port: &str) -> Option<(String, String)> {
         let zoom = self.editor.graph().camera.zoom.max(0.05);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         let mut candidates = Vec::new();
         for node in &self.editor.graph().nodes {
-            if node.id == from {
+            if node.id == from || hidden.contains_key(&node.id) {
                 continue;
             }
             for slot in port_slots(node) {
@@ -1179,28 +2325,47 @@ impl CanvasModel {
     fn refresh_link_status(&mut self) {
         let Some(Drag::Link {
             from,
-            from_port,
+            to,
             pointer,
+            rewired,
             ..
         }) = &self.drag
         else {
             return;
         };
         let from = from.clone();
-        let from_port = from_port.clone();
+        let to = to.clone();
         let pointer = *pointer;
-        let snap = self.snap_at(pointer, &from, &from_port);
-        if let Some((to, to_port)) = snap {
-            let (left, right) = type_pair_label(self.editor.graph(), &from, &to, &to_port);
+        let rewired = rewired.len();
+        if rewired > 0 {
+            self.status = format!("moving {rewired} wires");
+            return;
+        }
+        if let Some((from_node, from_port)) = from {
+            let snap = self.snap_at(pointer, &from_node, &from_port);
+            if let Some((to_node, to_port)) = snap {
+                let (left, right) =
+                    type_pair_label(self.editor.graph(), &from_node, &to_node, &to_port);
+                self.status = format!("{} → {}", shorten_types(&left), shorten_types(&right));
+                return;
+            }
+            if let Some((node, port, reason)) = self.nearest_reject(pointer, &from_node, &from_port)
+            {
+                let (left, right) = type_pair_label(self.editor.graph(), &from_node, &node, &port);
+                self.status = reject_message(reason, &shorten_types(&left), &shorten_types(&right));
+            } else {
+                self.status.clear();
+            }
+            return;
+        }
+        if let Some((to_node, to_port)) = to
+            && let Some((node, _)) = self.output_drop_at(pointer, "")
+        {
+            let (left, right) = type_pair_label(self.editor.graph(), &node, &to_node, &to_port);
             self.status = format!("{} → {}", shorten_types(&left), shorten_types(&right));
             return;
         }
-        if let Some((node, port, reason)) = self.nearest_reject(pointer, &from, &from_port) {
-            let (left, right) = type_pair_label(self.editor.graph(), &from, &node, &port);
-            self.status = reject_message(reason, &shorten_types(&left), &shorten_types(&right));
-        } else {
-            self.status.clear();
-        }
+        self.status.clear();
     }
 
     fn nearest_reject(
@@ -1210,9 +2375,10 @@ impl CanvasModel {
         from_port: &str,
     ) -> Option<(String, String, Reject)> {
         let zoom = self.editor.graph().camera.zoom.max(0.05);
+        let hidden = crate::frames::collapsed_members(self.editor.graph());
         let mut best: Option<(f32, String, String, Reject)> = None;
         for node in &self.editor.graph().nodes {
-            if node.id == from {
+            if node.id == from || hidden.contains_key(&node.id) {
                 continue;
             }
             for slot in port_slots(node) {
@@ -1252,7 +2418,7 @@ impl CanvasModel {
         });
     }
 
-    fn animate_camera(&mut self, to: Camera, cx: &mut Context<Self>) {
+    fn animate_camera(&mut self, to: Camera, quiet: bool, cx: &mut Context<Self>) {
         let from = self.editor.graph().camera;
         if self.reduced_motion
             || ((from.x - to.x).abs() < 0.5
@@ -1260,8 +2426,10 @@ impl CanvasModel {
                 && (from.zoom - to.zoom).abs() < 0.001)
         {
             self.camera_anim = None;
-            self.editor.set_camera(to);
-            cx.emit(CanvasEvent::Edited);
+            self.place_camera(to, quiet);
+            if !quiet {
+                cx.emit(CanvasEvent::Edited);
+            }
             cx.notify();
             return;
         }
@@ -1269,14 +2437,25 @@ impl CanvasModel {
             from,
             to,
             started: Instant::now(),
+            quiet,
         });
         cx.notify();
+    }
+
+    fn place_camera(&mut self, camera: Camera, quiet: bool) {
+        if quiet {
+            self.editor.set_camera_quiet(camera);
+        } else {
+            self.editor.set_camera(camera);
+        }
     }
 
     fn motion_active(&self) -> bool {
         self.settle.is_some()
             || self.camera_anim.is_some()
-            || (self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion)
+            || !self.frame_anim.is_empty()
+            || self.minimap_fade.is_some()
+            || (self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion)
     }
 
     fn tick_motion(&mut self) {
@@ -1285,19 +2464,32 @@ impl CanvasModel {
         {
             self.settle = None;
         }
+        self.frame_anim
+            .retain(|_, anim| anim.started.elapsed() < motion::COLLAPSE);
+        if let Some((_, started)) = &self.minimap_fade
+            && started.elapsed() >= motion::FADE
+        {
+            self.minimap_fade = None;
+        }
         if let Some(anim) = &self.camera_anim {
             let t = (anim.started.elapsed().as_secs_f32() / motion::CAMERA.as_secs_f32())
                 .clamp(0.0, 1.0);
-            self.editor.set_camera(Camera {
-                x: motion::lerp(anim.from.x, anim.to.x, t),
-                y: motion::lerp(anim.from.y, anim.to.y, t),
-                zoom: motion::lerp(anim.from.zoom, anim.to.zoom, t),
-            });
+            let quiet = anim.quiet;
+            self.place_camera(
+                Camera {
+                    x: motion::lerp(anim.from.x, anim.to.x, t),
+                    y: motion::lerp(anim.from.y, anim.to.y, t),
+                    zoom: motion::lerp(anim.from.zoom, anim.to.zoom, t),
+                },
+                quiet,
+            );
             if t >= 1.0 {
                 self.camera_anim = None;
             }
         }
-        if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
+        self.badge_fade
+            .retain(|_, (_, started)| started.elapsed() < BADGE_FADE);
+        if self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion {
             self.flow = (self.flow + 0.02) % 1.0;
         }
     }
@@ -1318,31 +2510,84 @@ impl CanvasModel {
     fn link_visual(&self) -> Option<LinkVisual> {
         let Drag::Link {
             from,
-            from_port,
+            to,
             pointer,
+            rewired,
             ..
         } = self.drag.as_ref()?
         else {
             return None;
         };
-        let source = self.editor.graph().node(from)?;
-        let slot = port_slots(source)
+        if !rewired.is_empty() {
+            // Every picked wire draws from its own source port to the pointer.
+            let mut starts = Vec::new();
+            for edge in rewired {
+                let source = self.editor.graph().node(&edge.from)?;
+                let slot = port_slots(source)
+                    .into_iter()
+                    .find(|slot| slot.name == edge.from_port && slot.side == Side::Out)?;
+                starts.push(slot.center);
+            }
+            let first = *starts.first()?;
+            return Some(LinkVisual {
+                from: first,
+                to: *pointer,
+                extra_from: starts[1..].to_vec(),
+                snapped: None,
+                reject: None,
+                message: self.status.clone(),
+            });
+        }
+        if let Some((from_node, from_port)) = from {
+            let source = self.editor.graph().node(from_node.as_str())?;
+            let slot = port_slots(source)
+                .into_iter()
+                .find(|slot| slot.name == from_port.as_str() && slot.side == Side::Out)?;
+            let snap = self.snap_at(*pointer, from_node, from_port);
+            let reject = if snap.is_none() {
+                self.nearest_reject(*pointer, from_node, from_port)
+            } else {
+                None
+            };
+            let end = if let Some((to, to_port)) = &snap {
+                self.editor
+                    .graph()
+                    .node(to)
+                    .and_then(|node| {
+                        port_slots(node)
+                            .into_iter()
+                            .find(|slot| slot.name == *to_port && slot.side == Side::In)
+                            .map(|slot| slot.center)
+                    })
+                    .unwrap_or(*pointer)
+            } else {
+                *pointer
+            };
+            return Some(LinkVisual {
+                from: slot.center,
+                to: end,
+                extra_from: Vec::new(),
+                snapped: snap,
+                reject: reject.map(|(_, _, reason)| reason),
+                message: self.status.clone(),
+            });
+        }
+        // A drag from an input side: the wire hangs from the pointer and
+        // reaches for an output.
+        let (to_node, to_port) = to.as_ref()?;
+        let target = self.editor.graph().node(to_node)?;
+        let slot = port_slots(target)
             .into_iter()
-            .find(|slot| slot.name == *from_port && slot.side == Side::Out)?;
-        let snap = self.snap_at(*pointer, from, from_port);
-        let reject = if snap.is_none() {
-            self.nearest_reject(*pointer, from, from_port)
-        } else {
-            None
-        };
-        let end = if let Some((to, to_port)) = &snap {
+            .find(|slot| slot.name == *to_port && slot.side == Side::In)?;
+        let snap = self.output_drop_at(*pointer, "");
+        let end = if let Some((node, port)) = &snap {
             self.editor
                 .graph()
-                .node(to)
+                .node(node)
                 .and_then(|node| {
                     port_slots(node)
                         .into_iter()
-                        .find(|slot| slot.name == *to_port && slot.side == Side::In)
+                        .find(|slot| slot.name == *port && slot.side == Side::Out)
                         .map(|slot| slot.center)
                 })
                 .unwrap_or(*pointer)
@@ -1350,12 +2595,156 @@ impl CanvasModel {
             *pointer
         };
         Some(LinkVisual {
-            from: slot.center,
-            to: end,
+            from: end,
+            to: slot.center,
+            extra_from: Vec::new(),
             snapped: snap,
-            reject: reject.map(|(_, _, reason)| reason),
+            reject: None,
             message: self.status.clone(),
         })
+    }
+
+    /// Window position of a canvas-local point, for popovers that anchor to
+    /// the pointer.
+    fn screen_of(&self, local: GPoint<Pixels>) -> GPoint<Pixels> {
+        let origin = self
+            .viewport
+            .borrow()
+            .map(|bounds| bounds.origin)
+            .unwrap_or_else(|| point(px(0.0), px(0.0)));
+        origin + local
+    }
+
+    fn zoom(&self) -> f32 {
+        self.editor.graph().camera.zoom.max(0.05)
+    }
+
+    /// Nearest wire segment within 8 screen px, as edge id and segment index.
+    /// Wires route through collapsed frame headers, and wires with both ends
+    /// hidden do not hit at all.
+    fn wire_hit_at(&self, canvas: Point) -> Option<(String, usize)> {
+        let graph = self.editor.graph();
+        let hidden = crate::frames::collapsed_members(graph);
+        let radius = 8.0 / self.zoom();
+        for edge in graph.edges.iter().rev() {
+            if let Some(path) =
+                crate::frames::edge_wire_path_routed(&graph.nodes, &graph.frames, &hidden, edge)
+                && let Some(segment) = layout::wire_hit(&path, canvas, radius)
+            {
+                return Some((edge.id.clone(), segment));
+            }
+        }
+        None
+    }
+
+    /// Nearest reroute point within 7 screen px, as edge id and point index.
+    fn reroute_at(&self, canvas: Point) -> Option<(String, usize)> {
+        let graph = self.editor.graph();
+        let radius = 7.0 / self.zoom();
+        let mut best: Option<(f32, String, usize)> = None;
+        for edge in graph.edges.iter().rev() {
+            for (index, point) in edge.reroutes.iter().enumerate() {
+                let dx = point[0] - canvas.x;
+                let dy = point[1] - canvas.y;
+                let distance = dx * dx + dy * dy;
+                if distance <= radius * radius
+                    && best.as_ref().is_none_or(|(top, _, _)| distance < *top)
+                {
+                    best = Some((distance, edge.id.clone(), index));
+                }
+            }
+        }
+        best.map(|(_, edge, index)| (edge, index))
+    }
+
+    /// Nearest output port within the snap radius. `origin` excludes the port
+    /// the drag started from; an empty origin means every output counts.
+    fn output_drop_at(&self, pointer: Point, origin: &str) -> Option<(String, String)> {
+        let graph = self.editor.graph();
+        let zoom = self.zoom();
+        let hidden = crate::frames::collapsed_members(graph);
+        let origin_types = if origin.is_empty() {
+            Vec::new()
+        } else {
+            graph::output_types(graph, origin)
+        };
+        let mut candidates = Vec::new();
+        for node in &graph.nodes {
+            if node.id == origin || hidden.contains_key(&node.id) {
+                continue;
+            }
+            for slot in port_slots(node) {
+                if slot.side != Side::Out {
+                    continue;
+                }
+                let dx = (slot.center.x - pointer.x) * zoom;
+                let dy = (slot.center.y - pointer.y) * zoom;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let types = graph::output_types(graph, &node.id);
+                let compatible = if origin_types.is_empty() {
+                    !types.is_empty()
+                } else {
+                    types.iter().any(|ty| origin_types.contains(ty))
+                };
+                candidates.push(SnapCandidate {
+                    node: node.id.clone(),
+                    port: slot.name.clone(),
+                    distance_px: distance,
+                    compatible,
+                });
+            }
+        }
+        let index = pick_snap(&candidates)?;
+        Some((
+            candidates[index].node.clone(),
+            candidates[index].port.clone(),
+        ))
+    }
+
+    /// The wire a dragged unconnected node could be inserted into, when the
+    /// pointer is within 8 screen px and both connect rules would accept it.
+    fn update_insert_hint(&mut self, node_id: &str, pointer: Point) {
+        self.insert_hint = None;
+        let graph = self.editor.graph();
+        let Some(node) = graph.node(node_id) else {
+            return;
+        };
+        if graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == node_id || edge.to == node_id)
+        {
+            return;
+        }
+        let Some(input) = node.input_ports().into_iter().next() else {
+            return;
+        };
+        let Some(output) = node.output_port() else {
+            return;
+        };
+        let radius = 8.0 / self.zoom();
+        let hidden = crate::frames::collapsed_members(graph);
+        for edge in &graph.edges {
+            if edge.from == node_id || edge.to == node_id {
+                continue;
+            }
+            let Some(path) =
+                crate::frames::edge_wire_path_routed(&graph.nodes, &graph.frames, &hidden, edge)
+            else {
+                continue;
+            };
+            if layout::wire_hit(&path, pointer, radius).is_none() {
+                continue;
+            }
+            let mut trial = graph.clone();
+            trial.edges.retain(|item| item.id != edge.id);
+            if try_connect(&trial, &edge.from, &edge.from_port, node_id, &input.name).is_ok()
+                && try_connect(&trial, node_id, &output.name, &edge.to, &edge.to_port).is_ok()
+            {
+                self.insert_hint = Some(edge.id.clone());
+                return;
+            }
+        }
     }
 }
 
@@ -1370,9 +2759,21 @@ struct Clip {
 struct LinkVisual {
     from: Point,
     to: Point,
+    /// More source ports when several wires are picked up at once.
+    extra_from: Vec<Point>,
     snapped: Option<(String, String)>,
     reject: Option<Reject>,
     message: String,
+}
+
+/// What the wire layer needs to know about hover, selection, and the drop
+/// hint, beyond the selection itself.
+#[derive(Clone, Default)]
+struct WireOverlay {
+    hover: Option<String>,
+    hover_point: Option<(String, usize)>,
+    picked: Option<(String, usize)>,
+    hint: Option<String>,
 }
 
 impl EventEmitter<CanvasEvent> for CanvasModel {}
@@ -1445,18 +2846,104 @@ impl Render for CanvasModel {
             .collect();
         let link_from = match &self.drag {
             Some(Drag::Link {
-                from, from_port, ..
-            }) => Some((from.clone(), from_port.clone())),
+                from: Some((node, port)),
+                ..
+            }) => Some((node.clone(), port.clone())),
             _ => None,
         };
-        let snap_target = link.as_ref().and_then(|item| item.snapped.clone());
-        let flow = if self.dots.values().any(|dot| *dot == Dot::Running) && !self.reduced_motion {
-            Some(self.flow)
-        } else {
-            None
+        let overlay = WireOverlay {
+            hover: self.hover_wire.as_ref().map(|(id, _)| id.clone()),
+            hover_point: self.hover_reroute.clone(),
+            picked: self.picked_reroute.clone(),
+            hint: self.insert_hint.clone(),
         };
+        let snap_target = link.as_ref().and_then(|item| item.snapped.clone());
+        let flow =
+            if self.badges.values().any(|badge| *badge == Badge::Running) && !self.reduced_motion {
+                Some(self.flow)
+            } else {
+                None
+            };
         let graph = self.editor.graph().clone();
         let hovered = self.hovered.clone();
+        let hidden = crate::frames::collapsed_members(&graph);
+        // Visible slice of the viewport, in element window space. Culling is
+        // a render-time optimization: selection and gestures stay model based.
+        let view_rect = self.viewport.borrow().map(|bounds| graph::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: bounds.size.width.as_f32(),
+            h: bounds.size.height.as_f32(),
+        });
+        let placed = shifted(&nodes, &settle_ids);
+        // Probe graph with the drawn positions so the pure culling helpers
+        // see exactly what the paint will see, settle offsets included.
+        let placed_graph = graph::Graph {
+            nodes: placed,
+            ..graph::Graph::default()
+        };
+        let card_on = if view_rect.is_some() {
+            let mut flags = vec![false; nodes.len()];
+            for index in crate::perf::visible_nodes(
+                &placed_graph,
+                &camera,
+                view_rect.unwrap_or(graph::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                }),
+                crate::perf::MARGIN_PX,
+            ) {
+                flags[index] = true;
+            }
+            flags
+        } else {
+            vec![true; nodes.len()]
+        };
+        let wire_paints: Vec<WirePaint> = {
+            let mut cache = std::mem::take(&mut self.wire_cache);
+            let mut paints: Vec<WirePaint> = Vec::with_capacity(edges.len());
+            let inactive: std::collections::BTreeSet<String> = self
+                .badges
+                .iter()
+                .filter(|(_, badge)| matches!(badge, Badge::Inactive))
+                .map(|(id, _)| id.clone())
+                .collect();
+            build_wire_paints(
+                &placed_graph.nodes,
+                &graph,
+                &hidden,
+                &edges,
+                camera,
+                view_rect,
+                &chart,
+                theme_muted,
+                &inactive,
+                &mut cache,
+                &mut paints,
+            );
+            self.wire_cache = cache;
+            paints
+        };
+        let frame_paints: Vec<crate::frames::FramePaint> = graph
+            .frames
+            .iter()
+            .map(|frame| crate::frames::FramePaint {
+                color: crate::frames::swatch_color(&frame.swatch, &chart, theme_muted),
+                height: self.frame_height(frame),
+                selected: selection.iter().any(|id| id == &frame.id),
+                members: graph::frame_members(&graph, &frame.id).len(),
+                frame: frame.clone(),
+            })
+            .collect();
+        let frame_draw = match &self.drag {
+            Some(Drag::FrameDraw { start, current }) => Some((*start, *current)),
+            _ => None,
+        };
+        let minimap_on = self.editor.graph().view.minimap;
+        let minimap_alpha = self.minimap_alpha(minimap_on);
+        let _minimap_animating = self.minimap_fade.is_some();
 
         let entity = cx.entity();
         div()
@@ -1499,6 +2986,38 @@ impl Render for CanvasModel {
                     this.align("hcenter", cx);
                 } else if platform && event.keystroke.modifiers.shift && key == "h" {
                     this.align("distribute-h", cx);
+                } else if platform && key == "g" {
+                    this.group_selection(cx);
+                } else if !platform
+                    && event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && key == "l"
+                {
+                    this.auto_layout(cx);
+                } else if !platform
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                {
+                    // Tool shortcuts. Plain letters, so a paste chord never reaches them.
+                    let next = match key {
+                        "v" => Some(Tool::Select),
+                        "h" => Some(Tool::Hand),
+                        "r" => Some(Tool::Rectangle),
+                        "o" => Some(Tool::Circle),
+                        "t" => Some(Tool::Label),
+                        "n" => Some(Tool::Note),
+                        "f" => Some(Tool::Frame),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.tool = next;
+                        cx.notify();
+                    } else if key == "m" {
+                        this.toggle_minimap(cx);
+                    } else if key == "escape" {
+                        this.cancel_edit(cx);
+                    }
                 }
             }))
             .track_focus(&self.focus)
@@ -1579,8 +3098,10 @@ impl Render for CanvasModel {
             .child({
                 let painted_selection = selection.clone();
                 let painted_chart = chart;
-                let painted_settle = settle_ids.clone();
                 let painted_link = link.clone();
+                let painted_overlay = overlay.clone();
+                let painted_placed = placed_graph.nodes;
+                let painted_wires = wire_paints;
                 canvas(
                     move |bounds, _, _| {
                         *viewport.borrow_mut() = Some(bounds);
@@ -1589,17 +3110,17 @@ impl Render for CanvasModel {
                         paint_scene(
                             bounds,
                             camera,
-                            &nodes,
-                            &edges,
-                            &marks,
+                            &painted_placed,
                             &painted_selection,
-                            &painted_settle,
                             painted_link.as_ref(),
                             flow,
                             theme_muted,
                             theme_primary,
                             theme_danger,
+                            theme_border,
+                            &painted_overlay,
                             &painted_chart,
+                            &painted_wires,
                             window,
                             cx,
                         );
@@ -1608,66 +3129,206 @@ impl Render for CanvasModel {
                 .absolute()
                 .size_full()
             })
-            .children(self.editor.graph().nodes.iter().map(|node| {
-                let offset = settle_ids
+            // Frame layers sit above the wires but below the cards, so a
+            // card overlapping a frame stays on top. Off-screen frames are
+            // culled entirely, members included.
+            .children(
+                frame_paints
                     .iter()
-                    .find(|(id, _)| id == &node.id)
-                    .map(|(_, offset)| *offset)
-                    .unwrap_or_else(|| Point::new(0.0, 0.0));
-                card_element(
-                    entity.clone(),
-                    node,
-                    &graph,
-                    self.dots.get(&node.id).copied().unwrap_or(if node.unknown {
-                        Dot::Danger
-                    } else {
-                        Dot::Muted
+                    .filter(|paint| {
+                        let at = camera.to_window(Point::new(
+                            paint.frame.position[0],
+                            paint.frame.position[1],
+                        ));
+                        let rect = graph::Rect {
+                            x: at.x,
+                            y: at.y,
+                            w: paint.frame.size[0] * camera.zoom,
+                            h: paint.height * camera.zoom,
+                        };
+                        view_rect.is_none_or(|view| {
+                            crate::perf::rects_intersect(
+                                rect,
+                                crate::perf::grow(view, crate::perf::MARGIN_PX),
+                            )
+                        })
+                    })
+                    .map(|paint| {
+                        crate::frames::frame_element(
+                            entity.clone(),
+                            paint.clone(),
+                            crate::frames::FrameTheme {
+                                fg: theme_fg,
+                                muted: theme_muted,
+                                accent: theme_primary,
+                                card: theme_raised,
+                            },
+                            camera,
+                            paint.frame.collapsed,
+                        )
                     }),
-                    self.reduced_motion,
-                    camera,
-                    offset,
-                    selection.iter().any(|id| id == &node.id),
-                    hovered.as_deref() == Some(node.id.as_str()),
-                    dragging.iter().any(|id| id == &node.id),
-                    link_from.clone(),
-                    snap_target.clone(),
-                    CardPaint {
-                        card: theme_card,
-                        raised: theme_raised,
-                        fg: theme_fg,
-                        muted: theme_muted,
-                        primary: theme_primary,
-                        border: theme_border,
-                        success: theme_success,
-                        warning: theme_warning,
-                        danger: theme_danger,
-                        chart,
-                        radius,
-                        mono: mono.to_string(),
-                        frame: self.frames.get(&node.id).cloned(),
-                        note: self.notes.get(&node.id).cloned(),
+            )
+            .children(
+                self.editor
+                    .graph()
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, node)| card_on[*index] && !hidden.contains_key(&node.id))
+                    .map(|(_, node)| {
+                        let offset = settle_ids
+                            .iter()
+                            .find(|(id, _)| id == &node.id)
+                            .map(|(_, offset)| *offset)
+                            .unwrap_or_else(|| Point::new(0.0, 0.0));
+                        let badge = self
+                            .badges
+                            .get(&node.id)
+                            .cloned()
+                            .unwrap_or(Badge::Configured);
+                        let fade = self.badge_fade.get(&node.id).and_then(|(from, started)| {
+                            if self.reduced_motion {
+                                return None;
+                            }
+                            let t = started.elapsed().as_secs_f32() / BADGE_FADE.as_secs_f32();
+                            (t < 1.0).then(|| {
+                                let from = badge_color(
+                                    from,
+                                    theme_muted,
+                                    theme_primary,
+                                    theme_success,
+                                    theme_warning,
+                                    theme_danger,
+                                );
+                                (from, t)
+                            })
+                        });
+                        card_element(
+                            entity.clone(),
+                            node,
+                            &graph,
+                            &badge,
+                            fade,
+                            self.reduced_motion,
+                            camera,
+                            offset,
+                            selection.iter().any(|id| id == &node.id),
+                            hovered.as_deref() == Some(node.id.as_str()),
+                            dragging.iter().any(|id| id == &node.id),
+                            link_from.clone(),
+                            snap_target.clone(),
+                            self.label_drag
+                                .as_ref()
+                                .filter(|drag| drag.node == node.id)
+                                .cloned(),
+                            self.label_hover.clone(),
+                            self.chart_metrics.clone(),
+                            CardPaint {
+                                card: theme_card,
+                                raised: theme_raised,
+                                fg: theme_fg,
+                                muted: theme_muted,
+                                primary: theme_primary,
+                                border: theme_border,
+                                success: theme_success,
+                                warning: theme_warning,
+                                danger: theme_danger,
+                                chart,
+                                radius,
+                                mono: mono.to_string(),
+                                frame: self.frames.get(&node.id).cloned(),
+                                note: self.notes.get(&node.id).cloned(),
+                            },
+                        )
+                    }),
+            )
+            .children(
+                mark_views
+                    .iter()
+                    .filter(|mark| {
+                        let size = mark.size.unwrap_or(match mark.kind {
+                            MarkKind::Label | MarkKind::Note | MarkKind::Button => [168.0, 36.0],
+                            MarkKind::Rectangle | MarkKind::Circle => [140.0, 88.0],
+                        });
+                        let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+                        let rect = graph::Rect {
+                            x: at.x,
+                            y: at.y,
+                            w: size[0] * camera.zoom,
+                            h: size[1] * camera.zoom,
+                        };
+                        view_rect.is_none_or(|view| {
+                            crate::perf::rects_intersect(
+                                rect,
+                                crate::perf::grow(view, crate::perf::MARGIN_PX),
+                            )
+                        })
+                    })
+                    .map(|mark| {
+                        mark_element(
+                            entity.clone(),
+                            mark,
+                            camera,
+                            selection.iter().any(|id| id == &mark.id),
+                            theme_fg,
+                            theme_muted,
+                            theme_border,
+                            theme_card,
+                            theme_primary,
+                        )
+                    }),
+            )
+            .when_some(self.editing.clone(), |this, target| {
+                let (at, width) = match &target {
+                    EditTarget::Mark(id) => {
+                        let Some(mark) = self.editor.graph().mark(id) else {
+                            return this;
+                        };
+                        let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
+                        let width = mark.size.map(|size| size[0]).unwrap_or(168.0) * camera.zoom;
+                        (at, width)
+                    }
+                    EditTarget::Frame(id) => {
+                        let Some(frame) = self
+                            .editor
+                            .graph()
+                            .frames
+                            .iter()
+                            .find(|frame| frame.id == *id)
+                        else {
+                            return this;
+                        };
+                        let at = camera.to_window(Point::new(frame.position[0], frame.position[1]));
+                        let width = (frame.size[0] * camera.zoom).max(px(160.0).as_f32());
+                        (Point::new(at.x + 4.0, at.y + 4.0), (width - 8.0).max(120.0))
+                    }
+                };
+                // Escape drops the edit. The catcher registers a capture
+                // phase key listener for as long as the overlay paints, so
+                // Escape is seen before the focused input.
+                let cancel = cx.entity().downgrade();
+                let escape_catcher = gpui_kit::canvas(
+                    move |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_key_event(
+                            move |event: &gpui_kit::KeyDownEvent,
+                                  phase: gpui_kit::DispatchPhase,
+                                  _window,
+                                  cx| {
+                                if phase != gpui_kit::DispatchPhase::Capture {
+                                    return;
+                                }
+                                if event.keystroke.key == "escape" {
+                                    let _ = cancel.update(cx, |this, cx| {
+                                        this.cancel_edit(cx);
+                                    });
+                                }
+                            },
+                        );
                     },
                 )
-            }))
-            .children(mark_views.iter().map(|mark| {
-                mark_element(
-                    entity.clone(),
-                    mark,
-                    camera,
-                    selection.iter().any(|id| id == &mark.id),
-                    theme_fg,
-                    theme_muted,
-                    theme_border,
-                    theme_card,
-                    theme_primary,
-                )
-            }))
-            .when_some(self.editing.clone(), |this, id| {
-                let Some(mark) = self.editor.graph().mark(&id) else {
-                    return this;
-                };
-                let at = camera.to_window(Point::new(mark.position[0], mark.position[1]));
-                let width = mark.size.map(|size| size[0]).unwrap_or(168.0) * camera.zoom;
+                .absolute()
+                .size_full();
                 this.child(
                     div()
                         .absolute()
@@ -1681,6 +3342,7 @@ impl Render for CanvasModel {
                         .p_1()
                         .child(Input::new(&self.label_input)),
                 )
+                .child(escape_catcher)
             })
             .children(
                 if self.editor.graph().nodes.is_empty() && self.editor.graph().marks.is_empty() {
@@ -1743,9 +3405,47 @@ impl Render for CanvasModel {
                     )
                 },
             )
+            .when_some(frame_draw, |this, (start, current)| {
+                let at =
+                    camera.to_window(Point::new(start.x.min(current.x), start.y.min(current.y)));
+                let w = (start.x - current.x).abs() * camera.zoom;
+                let h = (start.y - current.y).abs() * camera.zoom;
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(at.x))
+                        .top(px(at.y))
+                        .w(px(w))
+                        .h(px(h))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme_muted.opacity(0.35))
+                        .bg(theme_muted.opacity(0.06)),
+                )
+            })
+            .when(minimap_on || minimap_alpha > 0.001, |this| {
+                let Some(bounds) = *self.viewport.borrow() else {
+                    return this;
+                };
+                let view = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+                let content = crate::minimap::content_bounds(&graph, card_height, view);
+                let map = crate::minimap::Map::fit(content, crate::minimap::SIZE);
+                let entity = entity.clone();
+                let graph = graph.clone();
+                let selection = selection.clone();
+                this.child(crate::minimap::minimap_element(
+                    entity,
+                    &graph,
+                    &selection,
+                    map,
+                    minimap_alpha,
+                    view,
+                    cx,
+                ))
+            })
             .context_menu({
                 let entity = cx.entity();
-                move |menu, _, _| canvas_menu(menu, entity.clone())
+                move |menu, _, cx| canvas_menu(menu, entity.clone(), cx)
             })
     }
 }
@@ -1753,6 +3453,7 @@ impl Render for CanvasModel {
 fn canvas_menu(
     menu: gpui_kit::component::menu::PopupMenu,
     entity: Entity<CanvasModel>,
+    cx: &App,
 ) -> gpui_kit::component::menu::PopupMenu {
     let paste = entity.clone();
     let duplicate = entity.clone();
@@ -1761,38 +3462,121 @@ fn canvas_menu(
     let front = entity.clone();
     let back = entity.clone();
     let edit = entity.clone();
-    menu.item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
-        paste.update(cx, |this, cx| this.paste(cx));
-    }))
-    .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
-        duplicate.update(cx, |this, cx| this.duplicate_selection(cx));
-    }))
-    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
-        delete.update(cx, |this, cx| this.delete_selection(cx));
-    }))
-    .separator()
-    .item(PopupMenuItem::new("Align left").on_click(move |_, _, cx| {
-        align.update(cx, |this, cx| this.align("left", cx));
-    }))
-    .item(
-        PopupMenuItem::new("Bring to front").on_click(move |_, _, cx| {
-            front.update(cx, |this, cx| this.reorder_selection(true, cx));
-        }),
-    )
-    .item(
-        PopupMenuItem::new("Send to back").on_click(move |_, _, cx| {
-            back.update(cx, |this, cx| this.reorder_selection(false, cx));
-        }),
-    )
-    .item(
-        PopupMenuItem::new("Edit label").on_click(move |_, window, cx| {
-            edit.update(cx, |this, cx| {
-                if let Some(id) = this.selection.first().cloned() {
-                    this.start_label_edit(&id, window, cx);
-                }
-            });
-        }),
-    )
+    let mut menu = menu
+        .item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
+            paste.update(cx, |this, cx| this.paste(cx));
+        }))
+        .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
+            duplicate.update(cx, |this, cx| this.duplicate_selection(cx));
+        }))
+        .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+            delete.update(cx, |this, cx| this.delete_selection(cx));
+        }))
+        .separator()
+        .item(PopupMenuItem::new("Align left").on_click(move |_, _, cx| {
+            align.update(cx, |this, cx| this.align("left", cx));
+        }))
+        .item(
+            PopupMenuItem::new("Bring to front").on_click(move |_, _, cx| {
+                front.update(cx, |this, cx| this.reorder_selection(true, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Send to back").on_click(move |_, _, cx| {
+                back.update(cx, |this, cx| this.reorder_selection(false, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Edit label").on_click(move |_, window, cx| {
+                edit.update(cx, |this, cx| {
+                    if let Some(id) = this.selection.first().cloned() {
+                        this.start_label_edit(&id, window, cx);
+                    }
+                });
+            }),
+        );
+    let group = entity.clone();
+    let layout = entity.clone();
+    menu = menu
+        .separator()
+        .item(PopupMenuItem::new("Group").on_click(move |_, _, cx| {
+            group.update(cx, |this, cx| this.group_selection(cx));
+        }))
+        .item(PopupMenuItem::new("Auto-layout").on_click(move |_, _, cx| {
+            layout.update(cx, |this, cx| this.auto_layout(cx));
+        }));
+    // A right click on a card leaves its node selected. The execution
+    // commands then land next to the edit ones.
+    let node = entity.read(cx).selection.iter().find_map(|id| {
+        entity
+            .read(cx)
+            .editor()
+            .graph()
+            .node(id)
+            .map(|node| node.id.clone())
+    });
+    if let Some(node) = node {
+        let run = entity.clone();
+        let run_to = entity.clone();
+        let reset = entity.clone();
+        let run_node = node.clone();
+        let run_to_node = node.clone();
+        menu = menu
+            .separator()
+            .item(PopupMenuItem::new("Execute").on_click(move |_, _, cx| {
+                run.update(cx, |_, cx| {
+                    cx.emit(CanvasEvent::NodeCommand {
+                        id: run_node.clone(),
+                        command: NodeCommand::Execute,
+                    })
+                });
+            }))
+            .item(
+                PopupMenuItem::new("Execute to here").on_click(move |_, _, cx| {
+                    run_to.update(cx, |_, cx| {
+                        cx.emit(CanvasEvent::NodeCommand {
+                            id: run_to_node.clone(),
+                            command: NodeCommand::ExecuteTo,
+                        })
+                    });
+                }),
+            )
+            .item(PopupMenuItem::new("Reset").on_click(move |_, _, cx| {
+                reset.update(cx, |_, cx| {
+                    cx.emit(CanvasEvent::NodeCommand {
+                        id: node.clone(),
+                        command: NodeCommand::Reset,
+                    })
+                });
+            }));
+    }
+    // A right click on a wire adds bend commands to the same menu.
+    if let Some((edge, at, segment)) = entity.read(cx).wire_pick.clone() {
+        let add = entity.clone();
+        let clear = entity.clone();
+        let clear_edge = edge.clone();
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new("Add reroute point").on_click(move |_, _, cx| {
+                    add.update(cx, |this, cx| {
+                        this.editor.begin_gesture();
+                        this.editor.add_reroute(&edge, segment, at);
+                        this.editor.commit_gesture();
+                        this.changed(cx);
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Remove reroute points").on_click(move |_, _, cx| {
+                    clear.update(cx, |this, cx| {
+                        this.editor.clear_reroutes(&clear_edge);
+                        this.changed(cx);
+                    });
+                }),
+            );
+    }
+    menu
 }
 
 fn mark_kind(tool: Tool) -> MarkKind {
@@ -1901,16 +3685,16 @@ fn paint_scene(
     bounds: Bounds<Pixels>,
     camera: Camera,
     nodes: &[Node],
-    edges: &[Edge],
-    _marks: &[graph::Mark],
     selection: &[String],
-    settle: &[(String, Point)],
     link: Option<&LinkVisual>,
     flow: Option<f32>,
     muted: gpui_kit::Hsla,
     primary: gpui_kit::Hsla,
     danger: gpui_kit::Hsla,
+    border: gpui_kit::Hsla,
+    overlay: &WireOverlay,
     chart: &[gpui_kit::Hsla; 6],
+    wires: &[WirePaint],
     window: &mut Window,
     _cx: &mut App,
 ) {
@@ -1943,41 +3727,216 @@ fn paint_scene(
         }
     }
 
-    let placed = shifted(nodes, settle);
-    for edge in edges {
-        let Some(cubic) = layout::edge_cubic(&placed, edge) else {
-            continue;
+    paint_loop_pairs(origin, camera, nodes, primary, window);
+
+    // Wires paint behind the frames, cards, and marks. Frames arrive as
+    // translucent element layers above this scene.
+    for wire in wires {
+        let selected = selection.iter().any(|id| id == &wire.id);
+        let hovered = overlay.hover.as_deref() == Some(wire.id.as_str());
+        let hinted = overlay.hint.as_deref() == Some(wire.id.as_str());
+        let base = wire.source_color.opacity(if selected { 1.0 } else { 0.85 });
+        let (color, width) = if hinted {
+            (primary, 2.5)
+        } else if wire.dim {
+            (wire.source_color.opacity(0.35), 1.0)
+        } else if selected {
+            (wire.source_color, 1.75)
+        } else {
+            (base, 1.25)
         };
-        let selected = selection.iter().any(|id| id == &edge.id);
-        let ty = output_types_first(nodes, &edge.from);
-        let color = ty
-            .map(|ty| type_color(ty, chart))
-            .unwrap_or(muted)
-            .opacity(if selected { 1.0 } else { 0.85 });
-        paint_cubic(
-            origin,
-            camera,
-            cubic,
-            color,
-            px(if selected { 1.75 } else { 1.25 }),
-            window,
-        );
+        for cubic in wire.path.iter().copied() {
+            paint_cubic(origin, camera, cubic, color, px(width), window);
+        }
         if let Some(phase) = flow {
-            let at = layout::cubic_point(cubic, phase);
+            let at = layout::cubic_point(wire.path[0], phase);
             paint_dot(origin, camera, at, 3.0, color, window);
+        }
+        // Bend points show when they matter: near the camera, or when the
+        // wire or one of the points is being looked at.
+        if wire.reroutes.is_empty() {
+            continue;
+        }
+        let is_picked = |index: usize| {
+            overlay
+                .picked
+                .as_ref()
+                .is_some_and(|(id, i)| id == &wire.id && *i == index)
+        };
+        let is_hover_point = |index: usize| {
+            overlay
+                .hover_point
+                .as_ref()
+                .is_some_and(|(id, i)| id == &wire.id && *i == index)
+        };
+        for (index, point) in wire.reroutes.iter().copied().enumerate() {
+            let active = selected || hovered || is_picked(index) || is_hover_point(index);
+            if zoom < 0.55 && !active {
+                continue;
+            }
+            let accent = is_picked(index) || is_hover_point(index);
+            paint_dot(
+                origin,
+                camera,
+                point,
+                3.5,
+                if accent { primary } else { border },
+                window,
+            );
         }
     }
     if let Some(link) = link {
-        let cubic = layout::wire_cubic(link.from, link.to);
+        let mut starts = vec![link.from];
+        starts.extend(link.extra_from.iter().copied());
         let color = if link.reject.is_some() {
             danger
-        } else if link.snapped.is_some() {
+        } else if link.snapped.is_some() || !link.extra_from.is_empty() {
             link_source_color(nodes, link, chart, primary)
         } else {
             muted
         };
-        paint_cubic(origin, camera, cubic, color, px(1.5), window);
+        for start in starts {
+            let cubic = layout::wire_cubic(start, link.to);
+            paint_cubic(origin, camera, cubic, color, px(1.5), window);
+        }
     }
+}
+
+/// Resolve the visible wires for the next paint. Each edge gets its chain
+/// from the cache when the key still matches, so panning and zooming only
+/// re-project; an edit clears the cache and everything rebuilds once. Wires
+/// whose control box falls outside the viewport plus the margin are skipped,
+/// but their cache entries survive so panning them back in is free.
+#[allow(clippy::too_many_arguments)]
+fn build_wire_paints(
+    placed: &[Node],
+    graph: &graph::Graph,
+    hidden: &std::collections::BTreeMap<String, String>,
+    edges: &[Edge],
+    camera: Camera,
+    viewport: Option<graph::Rect>,
+    chart: &[gpui_kit::Hsla; 6],
+    muted: gpui_kit::Hsla,
+    inactive: &std::collections::BTreeSet<String>,
+    cache: &mut HashMap<String, CachedWire>,
+    out: &mut Vec<WirePaint>,
+) {
+    let view = viewport.map(|rect| crate::perf::grow(rect, crate::perf::MARGIN_PX));
+    for edge in edges {
+        let Some((from, to)) = crate::frames::edge_endpoints(placed, &graph.frames, hidden, edge)
+        else {
+            continue;
+        };
+        let reroutes: Vec<Point> = edge
+            .reroutes
+            .iter()
+            .map(|point| Point::new(point[0], point[1]))
+            .collect();
+        let key = WireKey { from, to, reroutes };
+        let chain = match cache.get(&edge.id) {
+            Some(cached) if cached.key == key => cached.path.clone(),
+            _ => {
+                let path = Arc::new(layout::wire_path(from, &key.reroutes, to));
+                cache.insert(
+                    edge.id.clone(),
+                    CachedWire {
+                        key: key.clone(),
+                        path: path.clone(),
+                    },
+                );
+                path
+            }
+        };
+        let rect = crate::perf::chain_window_box(&chain, camera);
+        let dim = wire_is_dim(graph, edge, inactive);
+        let Some(view) = view else {
+            out.push(wire_paint(edge, chain, key, graph, chart, muted, dim));
+            continue;
+        };
+        if !crate::perf::rects_intersect(rect, view) {
+            continue;
+        }
+        out.push(wire_paint(edge, chain, key, graph, chart, muted, dim));
+    }
+}
+
+/// A wire on the inactive side of a branch, or a wire whose both ends are
+/// inactive, draws faint.
+fn wire_is_dim(
+    graph: &graph::Graph,
+    edge: &Edge,
+    inactive: &std::collections::BTreeSet<String>,
+) -> bool {
+    let source = inactive.contains(&edge.from);
+    let target = inactive.contains(&edge.to);
+    if source && target {
+        return true;
+    }
+    target
+        && graph
+            .node(&edge.from)
+            .is_some_and(|node| node.feature == "if_switch")
+}
+
+fn wire_paint(
+    edge: &Edge,
+    chain: Arc<Vec<layout::Cubic>>,
+    key: WireKey,
+    graph: &graph::Graph,
+    chart: &[gpui_kit::Hsla; 6],
+    muted: gpui_kit::Hsla,
+    dim: bool,
+) -> WirePaint {
+    let source_color = output_types(graph, &edge.from)
+        .into_iter()
+        .next()
+        .map(|ty| type_color(ty, chart))
+        .unwrap_or(muted);
+    WirePaint {
+        id: edge.id.clone(),
+        reroutes: key.reroutes,
+        path: chain,
+        source_color,
+        dim,
+    }
+}
+
+/// A 1px accent line at 30% opacity between a loop start and its paired end.
+fn paint_loop_pairs(
+    origin: GPoint<Pixels>,
+    camera: Camera,
+    nodes: &[Node],
+    accent: gpui_kit::Hsla,
+    window: &mut Window,
+) {
+    for end in nodes.iter().filter(|node| node.feature == "loop_end") {
+        let pair = end.param_str("pair");
+        let Some(start) = nodes
+            .iter()
+            .find(|node| node.id == pair && node.feature == "loop_start")
+        else {
+            continue;
+        };
+        let from = header_center(start);
+        let to = header_center(end);
+        let map = |at: Point| {
+            let window_point = camera.to_window(at);
+            origin + point(px(window_point.x), px(window_point.y))
+        };
+        let mut path = gpui_kit::PathBuilder::stroke(px(1.0));
+        path.move_to(map(from));
+        path.line_to(map(to));
+        if let Ok(path) = path.build() {
+            window.paint_path(path, accent.opacity(0.3));
+        }
+    }
+}
+
+fn header_center(node: &Node) -> Point {
+    Point::new(
+        node.position[0] + card_width(&node.feature) * 0.5,
+        node.position[1] + layout::PAD_Y + layout::HEADER * 0.5,
+    )
 }
 
 fn output_types_first(nodes: &[Node], id: &str) -> Option<TypeName> {
@@ -2065,12 +4024,72 @@ fn card_shadow(dragging: bool, ink: gpui_kit::Hsla) -> Vec<gpui_kit::BoxShadow> 
     }
 }
 
+/// Fill color of a badge. The hollow ring uses the border color instead,
+/// which `card_element` handles.
+fn badge_color(
+    badge: &Badge,
+    muted: gpui_kit::Hsla,
+    primary: gpui_kit::Hsla,
+    success: gpui_kit::Hsla,
+    warning: gpui_kit::Hsla,
+    danger: gpui_kit::Hsla,
+) -> gpui_kit::Hsla {
+    match badge {
+        Badge::NotConfigured(_) | Badge::Configured | Badge::Inactive => muted.opacity(0.55),
+        Badge::Running => primary,
+        Badge::Executed => success,
+        Badge::Error(_) => danger,
+        Badge::Stale => warning,
+    }
+}
+
+/// Linear blend of two theme colors, eased with the shared curve.
+fn mix_color(from: gpui_kit::Hsla, to: gpui_kit::Hsla, t: f32) -> gpui_kit::Hsla {
+    let t = motion::ease_out(t);
+    gpui_kit::Hsla {
+        h: from.h + (to.h - from.h) * t,
+        s: from.s + (to.s - from.s) * t,
+        l: from.l + (to.l - from.l) * t,
+        a: from.a + (to.a - from.a) * t,
+    }
+}
+
+/// The badge that sits at the end of a card header. Shows a tooltip with the
+/// state the canvas is claiming for the node.
+fn badge_element(
+    node_id: &str,
+    badge: &Badge,
+    color: gpui_kit::Hsla,
+    ring: gpui_kit::Hsla,
+    zoom: f32,
+) -> gpui_kit::AnyElement {
+    let size = px(7.0 * zoom);
+    let id = SharedString::from(format!("badge-{node_id}"));
+    let text = badge.tooltip_text();
+    let base = div()
+        .id(id)
+        .size(size)
+        .flex_shrink_0()
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+        });
+    if matches!(badge, Badge::NotConfigured(_)) {
+        base.rounded_full()
+            .border_1()
+            .border_color(ring)
+            .into_any_element()
+    } else {
+        base.rounded_full().bg(color).into_any_element()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn card_element(
     entity: Entity<CanvasModel>,
     node: &Node,
     graph: &graph::Graph,
-    dot_kind: Dot,
+    badge: &Badge,
+    fade: Option<(gpui_kit::Hsla, f32)>,
     reduced_motion: bool,
     camera: Camera,
     offset: Point,
@@ -2079,37 +4098,47 @@ fn card_element(
     dragging: bool,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
     paint: CardPaint,
 ) -> gpui_kit::AnyElement {
     let zoom = camera.zoom;
     let origin = node.position_point();
     let window = camera.to_window(Point::new(origin.x + offset.x, origin.y + offset.y));
     let width = px(card_width(&node.feature) * zoom);
+    let height = px(layout::card_height(node) * zoom);
+    let detail = layout::detail_for(zoom);
     let id = node.id.clone();
     let title = node.label.clone();
     let summary = node.summary();
-    let inputs = node.input_ports();
-    let output = node.output_port();
-    let rows = inputs.len().max(usize::from(output.is_some())).max(1);
     let accent = node
         .def()
         .map(|def| group_color(def.group, &paint.chart))
         .unwrap_or(paint.muted);
-    let pulse = if dot_kind == Dot::Running && !reduced_motion {
+    let ring = matches!(badge, Badge::NotConfigured(_));
+    let pulse = if matches!(badge, Badge::Running) && !reduced_motion {
         let wave = (Instant::now().elapsed().as_secs_f32() * 4.0).sin().abs();
         0.45 + 0.55 * wave
     } else {
         1.0
     };
-    let dot = match dot_kind {
-        Dot::Success => paint.success,
-        Dot::Warning => paint.warning,
-        Dot::Danger => paint.danger,
-        Dot::Running => paint.primary,
-        Dot::Muted => paint.muted.opacity(0.55),
-    }
+    let target = badge_color(
+        badge,
+        paint.muted,
+        paint.primary,
+        paint.success,
+        paint.warning,
+        paint.danger,
+    )
     .opacity(pulse);
-    let border_color = if dot_kind == Dot::Danger {
+    // A badge color takes 120 ms to settle into the next one. Reduced motion
+    // (and a ring, which has no fill to blend with) skips the blend.
+    let dot = match fade {
+        Some((from, t)) if !ring && t < 1.0 => mix_color(from, target, t),
+        _ => target,
+    };
+    let border_color = if matches!(badge, Badge::Error(_)) {
         paint.danger
     } else if selected {
         paint.primary
@@ -2124,12 +4153,13 @@ fn card_element(
         paint.card
     };
 
-    div()
+    let mut card = div()
         .id(SharedString::from(format!("card-{id}")))
         .absolute()
         .left(px(window.x))
         .top(px(window.y))
         .w(width)
+        .h(height)
         .flex()
         .flex_col()
         .rounded(paint.radius)
@@ -2138,6 +4168,8 @@ fn card_element(
         .border_color(border_color)
         .shadow(card_shadow(dragging, paint.fg))
         .overflow_hidden()
+        // An inactive branch draws its whole card dimmed.
+        .when(matches!(badge, Badge::Inactive), |card| card.opacity(0.4))
         .on_hover({
             let entity = entity.clone();
             let id = id.clone();
@@ -2159,113 +4191,147 @@ fn card_element(
                 cx.stop_propagation();
                 entity.update(cx, |this, cx| this.card_down(&id, event, window, cx));
             }
-        })
-        .child(
-            div()
-                .h(px(layout::HEADER * zoom))
-                .mt(px(layout::PAD_Y * zoom))
-                .px(px(10.0 * zoom))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0 * zoom))
-                .child(
+        });
+    card = match detail {
+        Detail::Title => {
+            // The glyph stays inside the card. Under 8px tall there is no title.
+            let on_screen = layout::card_height(node) * zoom;
+            let column = port_column(
+                entity.clone(),
+                node,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                &paint,
+                true,
+            );
+            let mut card = card.child(column);
+            if let Some(size) = layout::title_screen_px(on_screen) {
+                card = card.child(
                     div()
-                        .w(px(3.0 * zoom))
-                        .h(px(14.0 * zoom))
-                        .rounded(px(2.0))
-                        .bg(accent),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .h(px(on_screen))
+                        .px(px((4.0 * zoom).max(1.0)))
+                        .flex()
+                        .items_center()
                         .overflow_hidden()
-                        .text_sm()
-                        .text_color(paint.fg)
-                        .child(title),
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .overflow_hidden()
+                                .truncate()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_size(px(size))
+                                .line_height(px(size))
+                                .text_color(paint.fg)
+                                .child(title),
+                        ),
+                );
+            }
+            card
+        }
+        Detail::Compact | Detail::Full => {
+            let (title_size, title_line) = if detail == Detail::Compact {
+                let size = layout::compact_title_px(zoom);
+                (px(size), px(size * 1.15))
+            } else {
+                layout::text_with_zoom(layout::TITLE_TEXT, zoom)
+            };
+            card
+                // The summary row keeps its height in every detail so the port
+                // block and the wires stay where the layout puts them.
+                .child(
+                    div()
+                        .h(px(layout::HEADER * zoom))
+                        .mt(px(layout::PAD_Y * zoom))
+                        .px(px(10.0 * zoom))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0 * zoom))
+                        .child(
+                            div()
+                                .w(px(3.0 * zoom))
+                                .h(px(14.0 * zoom))
+                                .rounded(px(2.0))
+                                .bg(accent),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(title_size)
+                                .line_height(title_line)
+                                .text_color(paint.fg)
+                                .child(title),
+                        )
+                        .child(badge_element(&id, badge, dot, paint.muted, zoom)),
                 )
-                .child(div().size(px(7.0 * zoom)).rounded_full().bg(dot)),
-        )
-        .child(
-            div()
-                .h(px(layout::SUMMARY * zoom))
-                .px(px(10.0 * zoom))
-                .overflow_hidden()
-                .text_xs()
-                .text_color(paint.muted)
-                .font_family(paint.mono.clone())
-                .child(summary),
-        )
-        .child({
-            let block = layout::PORT_ROW * rows as f32;
-            let mut column = div()
-                .relative()
-                .mb(px(layout::PAD_Y * zoom))
-                .h(px(block * zoom));
-            if inputs.len() <= 1 {
-                column = column.child(port_pair(
+                .child(
+                    div()
+                        .h(px(layout::SUMMARY * zoom))
+                        .px(px(10.0 * zoom))
+                        .overflow_hidden()
+                        .when(detail == Detail::Full, |row| {
+                            let (size, line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
+                            row.text_size(size)
+                                .line_height(line)
+                                .text_color(paint.muted)
+                                .font_family(paint.mono.clone())
+                                .child(reference_line(&summary, graph, &paint))
+                        }),
+                )
+                .child(port_column(
                     entity.clone(),
-                    &id,
-                    inputs.first(),
-                    output.as_ref(),
-                    0.0,
+                    node,
                     zoom,
+                    detail,
                     graph,
                     link_from.clone(),
                     snap_target.clone(),
                     &paint,
-                ));
-            } else {
-                for (index, port) in inputs.iter().enumerate() {
-                    column = column.child(port_pair(
+                    false,
+                ))
+                .when(detail == Detail::Full, |card| {
+                    card.children(output_body(
                         entity.clone(),
-                        &id,
-                        Some(port),
-                        None,
-                        layout::PORT_ROW * index as f32,
-                        zoom,
-                        graph,
-                        link_from.clone(),
-                        snap_target.clone(),
+                        node,
+                        paint.frame.as_ref(),
+                        selected,
+                        reduced_motion,
                         &paint,
-                    ));
-                }
-                if let Some(port) = output.as_ref() {
-                    let top = (block - layout::PORT_ROW) * 0.5;
-                    column = column.child(port_pair(
-                        entity.clone(),
-                        &id,
-                        None,
-                        Some(port),
-                        top,
                         zoom,
-                        graph,
-                        None,
-                        None,
-                        &paint,
-                    ));
-                }
-            }
-            column
-        })
-        .children(output_body(
-            node,
-            paint.frame.as_ref(),
-            selected,
-            reduced_motion,
-            &paint,
-        ))
-        .into_any_element()
+                        label_drag.clone(),
+                        label_hover.clone(),
+                        chart_metrics.clone(),
+                    ))
+                })
+        }
+    };
+    card.into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn output_body(
+    entity: Entity<CanvasModel>,
     node: &Node,
     frame: Option<&FrameView>,
     selected: bool,
     reduced_motion: bool,
     paint: &CardPaint,
+    zoom: f32,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
 ) -> Option<gpui_kit::AnyElement> {
+    let (size, line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
     if matches!(
         node.feature.as_str(),
         "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_sql"
@@ -2277,8 +4343,9 @@ fn output_body(
         };
         return Some(
             div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(color)
                 .child(text)
                 .into_any_element(),
@@ -2286,10 +4353,11 @@ fn output_body(
     }
     if node.feature == "preview_table" {
         return Some(match frame {
-            Some(frame) => mini_table(frame, paint),
+            Some(frame) => mini_table(frame, paint, zoom),
             None => div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.muted)
                 .child("Run preview")
                 .into_any_element(),
@@ -2301,8 +4369,9 @@ fn output_body(
     let Some(frame) = frame else {
         return Some(
             div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.muted)
                 .child("Run preview")
                 .into_any_element(),
@@ -2324,24 +4393,24 @@ fn output_body(
             &node.param_str("y"),
             &node.param_str("series"),
         ) {
-            Ok(points) => div()
-                .h(px(168.0))
-                .px(px(6.0))
-                .pb(px(6.0))
-                .child(feature_chart(
-                    &mark,
-                    points,
-                    colors,
-                    paint.fg,
-                    reduced_motion,
-                    selected,
-                    &node.id,
-                    "",
-                ))
-                .into_any_element(),
+            Ok(points) => chart_on_card(
+                entity,
+                node,
+                &mark,
+                points,
+                colors,
+                paint,
+                reduced_motion,
+                selected,
+                zoom,
+                label_drag,
+                label_hover,
+                chart_metrics,
+            ),
             Err(message) => div()
-                .px(px(10.0))
-                .text_xs()
+                .px(px(10.0 * zoom))
+                .text_size(size)
+                .line_height(line)
                 .text_color(paint.danger)
                 .child(message)
                 .into_any_element(),
@@ -2349,7 +4418,7 @@ fn output_body(
     )
 }
 
-fn mini_table(frame: &FrameView, paint: &CardPaint) -> gpui_kit::AnyElement {
+fn mini_table(frame: &FrameView, paint: &CardPaint, zoom: f32) -> gpui_kit::AnyElement {
     let count = frame.columns.len().min(4);
     let mut grid = div().px(px(8.0)).pb(px(6.0)).flex().flex_col().gap(px(2.0));
     grid = grid.child(mini_row(
@@ -2361,26 +4430,29 @@ fn mini_table(frame: &FrameView, paint: &CardPaint) -> gpui_kit::AnyElement {
             .collect::<Vec<_>>(),
         true,
         paint,
+        zoom,
     ));
     for row in frame.rows.iter().take(4) {
         let cells = (0..count)
             .map(|index| row.get(index).map(graph::cell_text).unwrap_or_default())
             .collect::<Vec<_>>();
-        grid = grid.child(mini_row(&cells, false, paint));
+        grid = grid.child(mini_row(&cells, false, paint, zoom));
     }
     grid.into_any_element()
 }
 
-fn mini_row(cells: &[String], header: bool, paint: &CardPaint) -> gpui_kit::Div {
-    let mut row = div().flex().flex_row().gap(px(6.0));
+fn mini_row(cells: &[String], header: bool, paint: &CardPaint, zoom: f32) -> gpui_kit::Div {
+    let (size, line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom);
+    let mut row = div().flex().flex_row().gap(px(6.0 * zoom));
     for cell in cells {
         let numeric = !header && cell.parse::<f64>().is_ok();
         row = row.child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .overflow_hidden()
-                .text_xs()
+                .truncate()
+                .text_size(size)
+                .line_height(line)
                 .when(numeric, |cell| cell.text_right())
                 .font_family(paint.mono.clone())
                 .text_color(if header { paint.fg } else { paint.muted })
@@ -2388,6 +4460,374 @@ fn mini_row(cells: &[String], header: bool, paint: &CardPaint) -> gpui_kit::Div 
         );
     }
     row
+}
+
+fn reference_line(text: &str, graph: &graph::Graph, paint: &CardPaint) -> gpui_kit::AnyElement {
+    let known = bound_names(graph);
+    let mut row = div().flex().flex_row().overflow_hidden().min_w(px(0.0));
+    for (index, piece) in split_references(text).into_iter().enumerate() {
+        if let Some(name) = piece.variable.clone() {
+            let known_name = known.contains(&name);
+            let color = if known_name {
+                paint.primary
+            } else {
+                paint.danger
+            };
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("ref-{index}-{name}")))
+                    .flex_shrink_0()
+                    .text_color(color)
+                    .child(piece.text.clone())
+                    .when(!known_name, |el| {
+                        el.tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("unknown variable")
+                                .build(window, cx)
+                        })
+                    }),
+            );
+        } else {
+            row = row.child(
+                div()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .truncate()
+                    .text_color(paint.muted)
+                    .child(piece.text),
+            );
+        }
+    }
+    row.into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn port_column(
+    entity: Entity<CanvasModel>,
+    node: &Node,
+    zoom: f32,
+    detail: layout::Detail,
+    graph: &graph::Graph,
+    link_from: Option<(String, String)>,
+    snap_target: Option<(String, String)>,
+    paint: &CardPaint,
+    absolute: bool,
+) -> gpui_kit::Div {
+    let inputs = node.input_ports();
+    let outputs = node.output_ports();
+    let rows = inputs.len().max(outputs.len()).max(1);
+    let block = layout::PORT_ROW * rows as f32;
+    let mut column = div();
+    column = if absolute {
+        let port_top = (layout::PAD_Y + layout::HEADER + layout::SUMMARY) * zoom;
+        column
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(port_top))
+            .h(px(block * zoom))
+    } else {
+        column
+            .relative()
+            .mb(px(layout::PAD_Y * zoom))
+            .h(px(block * zoom))
+    };
+    let id = node.id.as_str();
+    if outputs.len() <= 1 && inputs.len() <= 1 {
+        column = column.child(port_pair(
+            entity,
+            id,
+            inputs.first(),
+            outputs.first(),
+            0.0,
+            zoom,
+            detail,
+            graph,
+            link_from,
+            snap_target,
+            paint,
+        ));
+    } else if outputs.len() <= 1 {
+        for (index, port) in inputs.iter().enumerate() {
+            column = column.child(port_pair(
+                entity.clone(),
+                id,
+                Some(port),
+                None,
+                layout::PORT_ROW * index as f32,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                paint,
+            ));
+        }
+        if let Some(port) = outputs.first() {
+            let top = (block - layout::PORT_ROW) * 0.5;
+            column = column.child(port_pair(
+                entity,
+                id,
+                None,
+                Some(port),
+                top,
+                zoom,
+                detail,
+                graph,
+                None,
+                None,
+                paint,
+            ));
+        }
+    } else {
+        for index in 0..rows {
+            column = column.child(port_pair(
+                entity.clone(),
+                id,
+                inputs.get(index),
+                outputs.get(index),
+                layout::PORT_ROW * index as f32,
+                zoom,
+                detail,
+                graph,
+                link_from.clone(),
+                snap_target.clone(),
+                paint,
+            ));
+        }
+    }
+    column
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chart_on_card(
+    entity: Entity<CanvasModel>,
+    node: &Node,
+    mark: &str,
+    points: Vec<crate::plot::PlotPoint>,
+    colors: [gpui_kit::Hsla; 5],
+    paint: &CardPaint,
+    reduced_motion: bool,
+    selected: bool,
+    zoom: f32,
+    label_drag: Option<LabelDrag>,
+    label_hover: Option<(String, bool)>,
+    chart_metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
+) -> gpui_kit::AnyElement {
+    let presentation = node.presentation.clone().unwrap_or_default();
+    let metric = chart_metrics
+        .borrow()
+        .get(&node.id)
+        .cloned()
+        .unwrap_or_default();
+    let box_w = metric
+        .plot
+        .map(|bounds| bounds.size.width.as_f32())
+        .unwrap_or(card_width(&node.feature) * zoom);
+    let box_h = metric
+        .plot
+        .map(|bounds| bounds.size.height.as_f32())
+        .unwrap_or(168.0 * zoom);
+    let title_size = metric.title.unwrap_or((0.0, 0.0));
+    let legend_size = metric.legend.unwrap_or((0.0, 0.0));
+    let (title_x, title_y) = label_drag
+        .as_ref()
+        .filter(|drag| drag.title)
+        .map(|drag| drag.live)
+        .unwrap_or((presentation.title.x, presentation.title.y));
+    let (legend_x, legend_y) = label_drag
+        .as_ref()
+        .filter(|drag| !drag.title)
+        .map(|drag| drag.live)
+        .unwrap_or((presentation.legend.x, presentation.legend.y));
+    let (title_left, title_top) = placed_origin(
+        presentation.title.anchor,
+        title_x,
+        title_y,
+        box_w,
+        box_h,
+        title_size.0,
+        title_size.1,
+    );
+    let (legend_left, legend_top) = placed_origin(
+        presentation.legend.anchor,
+        legend_x,
+        legend_y,
+        box_w,
+        box_h,
+        legend_size.0,
+        legend_size.1,
+    );
+    let title = presentation
+        .title
+        .text
+        .clone()
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| node.label.clone());
+    let legend_items = legend_entries(mark, &points, &colors);
+    let (text_size, text_line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom.max(0.85));
+    let title_hot = label_hover
+        .as_ref()
+        .is_some_and(|(id, title)| id == &node.id && *title)
+        || label_drag.as_ref().is_some_and(|drag| drag.title);
+    let legend_hot = label_hover
+        .as_ref()
+        .is_some_and(|(id, title)| id == &node.id && !*title)
+        || label_drag.as_ref().is_some_and(|drag| !drag.title);
+    let mut legend = div().flex().flex_row().flex_wrap().gap(px(4.0 * zoom));
+    for (name, color) in &legend_items {
+        legend = legend.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.0 * zoom))
+                .child(
+                    div()
+                        .size(px(6.0 * zoom.max(0.8)))
+                        .rounded_full()
+                        .bg(*color),
+                )
+                .child(
+                    div()
+                        .text_size(text_size)
+                        .line_height(text_line)
+                        .text_color(paint.fg)
+                        .child(name.clone()),
+                ),
+        );
+    }
+    let node_id = node.id.clone();
+    div()
+        .relative()
+        .h(px(168.0 * zoom))
+        .px(px(6.0 * zoom))
+        .pb(px(6.0 * zoom))
+        .child(feature_chart(
+            mark,
+            points,
+            colors,
+            paint.fg,
+            reduced_motion,
+            selected,
+            &node.id,
+            "",
+            false,
+        ))
+        .child(metric_probe(chart_metrics.clone(), node_id.clone(), 0))
+        .when(!title.is_empty(), |box_element| {
+            let entity = entity.clone();
+            let id = node_id.clone();
+            let metrics = chart_metrics.clone();
+            box_element.child(
+                div()
+                    .id(SharedString::from(format!("card-title-{id}")))
+                    .absolute()
+                    .left(px(title_left))
+                    .top(px(title_top))
+                    .max_w(px(box_w * 0.8))
+                    .px(px(2.0))
+                    .text_size(text_size)
+                    .line_height(text_line)
+                    .text_color(paint.fg)
+                    .truncate()
+                    .cursor(CursorStyle::PointingHand)
+                    .when(title_hot, |element| {
+                        element
+                            .border_1()
+                            .border_dashed()
+                            .rounded(px(4.0))
+                            .border_color(paint.fg.opacity(0.5))
+                    })
+                    .child(title)
+                    .child(metric_probe(metrics, id.clone(), 1))
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |event, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_down(&id, true, event, cx);
+                            });
+                        }
+                    })
+                    .on_hover({
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |over, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_hover(&id, true, *over, cx);
+                            });
+                        }
+                    }),
+            )
+        })
+        .when(!legend_items.is_empty(), |box_element| {
+            let entity = entity.clone();
+            let id = node_id.clone();
+            let metrics = chart_metrics.clone();
+            box_element.child(
+                div()
+                    .id(SharedString::from(format!("card-legend-{id}")))
+                    .absolute()
+                    .left(px(legend_left))
+                    .top(px(legend_top))
+                    .max_w(px(box_w * 0.7))
+                    .cursor(CursorStyle::PointingHand)
+                    .when(legend_hot, |element| {
+                        element
+                            .border_1()
+                            .border_dashed()
+                            .rounded(px(4.0))
+                            .border_color(paint.fg.opacity(0.5))
+                    })
+                    .child(legend)
+                    .child(metric_probe(metrics, id.clone(), 2))
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |event, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_down(&id, false, event, cx);
+                            });
+                        }
+                    })
+                    .on_hover({
+                        let entity = entity.clone();
+                        let id = id.clone();
+                        move |over, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.chart_label_hover(&id, false, *over, cx);
+                            });
+                        }
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+fn metric_probe(
+    metrics: Rc<RefCell<BTreeMap<String, ChartMetric>>>,
+    id: String,
+    kind: u8,
+) -> gpui_kit::AnyElement {
+    gpui_kit::canvas(
+        move |bounds, _, _| {
+            let mut map = metrics.borrow_mut();
+            let entry = map.entry(id.clone()).or_default();
+            match kind {
+                0 => entry.plot = Some(bounds),
+                1 => {
+                    entry.title = Some((bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                }
+                _ => {
+                    entry.legend = Some((bounds.size.width.as_f32(), bounds.size.height.as_f32()));
+                }
+            }
+        },
+        move |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2398,6 +4838,7 @@ fn port_pair(
     output: Option<&graph::PortRecord>,
     top: f32,
     zoom: f32,
+    detail: layout::Detail,
     graph: &graph::Graph,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
@@ -2426,6 +4867,7 @@ fn port_pair(
             port,
             Side::In,
             zoom,
+            detail,
             graph,
             link_from.clone(),
             snap_target.clone(),
@@ -2441,6 +4883,7 @@ fn port_pair(
             port,
             Side::Out,
             zoom,
+            detail,
             graph,
             None,
             None,
@@ -2457,13 +4900,13 @@ fn port_hit(
     port: &graph::PortRecord,
     side: Side,
     zoom: f32,
+    detail: layout::Detail,
     graph: &graph::Graph,
     link_from: Option<(String, String)>,
     snap_target: Option<(String, String)>,
     paint: &CardPaint,
 ) -> gpui_kit::AnyElement {
     let name = port.name.clone();
-    let caption = port_caption(&port.name, &port.accepts);
     let ty = port.accepts.first().copied().unwrap_or(TypeName::Dataframe);
     let color = type_color(ty, &paint.chart);
     let compatible = match (&link_from, side) {
@@ -2491,16 +4934,62 @@ fn port_hit(
         } else {
             color.opacity(0.45)
         });
+    // Port labels and type labels only when the camera is near enough
+    // for them to be read.
+    if detail != layout::Detail::Full {
+        let node_id = node_id.to_string();
+        return div()
+            .id(SharedString::from(format!(
+                "{}-{node_id}-{name}",
+                if side == Side::In { "in" } else { "out" }
+            )))
+            .flex()
+            .items_center()
+            .h(px(layout::PORT_ROW * zoom))
+            .child(dot)
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                cx.stop_propagation();
+                entity.update(cx, |this, cx| {
+                    this.port_down(&node_id, &name, side, event, window, cx);
+                });
+            })
+            .into_any_element();
+    }
+    let generic = name == "in" || name == "out" || name.is_empty();
+    let (label_size, label_line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
+    let (type_size, type_line) = layout::text_with_zoom(layout::TYPE_TEXT, zoom);
     let label = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0 * zoom))
         .max_w(px(78.0 * zoom))
-        .overflow_hidden()
-        .text_xs()
-        .text_color(if dim {
-            paint.muted.opacity(0.4)
-        } else {
-            paint.muted
-        })
-        .child(caption);
+        .min_w(px(0.0))
+        .child(
+            div()
+                .truncate()
+                .text_size(label_size)
+                .line_height(label_line)
+                .text_color(if dim {
+                    paint.muted.opacity(0.4)
+                } else {
+                    paint.muted
+                })
+                .when(!generic, |label| label.child(name.clone())),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(type_size)
+                .line_height(type_line)
+                .font_family(paint.mono.clone())
+                .text_color(if dim {
+                    paint.muted.opacity(0.4)
+                } else {
+                    paint.muted.opacity(0.75)
+                })
+                .child(shorten_types(&port_caption("", &port.accepts))),
+        );
     let node_id = node_id.to_string();
     let row = div()
         .id(SharedString::from(format!(
@@ -2557,6 +5046,7 @@ fn mark_element(
         mark.text.clone()
     };
     let shape = matches!(mark.kind, MarkKind::Rectangle | MarkKind::Circle);
+    let (text_size, text_line) = layout::text_with_zoom(layout::BODY_TEXT, zoom);
     let mut body = div()
         .id(SharedString::from(format!("mark-{id}")))
         .absolute()
@@ -2567,7 +5057,8 @@ fn mark_element(
         .px(px(8.0 * zoom))
         .flex()
         .items_center()
-        .text_sm()
+        .text_size(text_size)
+        .line_height(text_line)
         .text_color(if placeholder { muted } else { fg })
         .when(mark.kind == MarkKind::Circle, |el| el.rounded_full())
         .when(mark.kind == MarkKind::Rectangle, |el| el.rounded(px(8.0)))

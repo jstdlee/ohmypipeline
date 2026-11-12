@@ -148,6 +148,9 @@ pub struct Edge {
     pub from_port: String,
     pub to: String,
     pub to_port: String,
+    /// Canvas-space bend points along the wire, in wire order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reroutes: Vec<[f32; 2]>,
 }
 
 impl Edge {
@@ -158,6 +161,7 @@ impl Edge {
             from_port: from_port.to_string(),
             to: to.to_string(),
             to_port: to_port.to_string(),
+            reroutes: Vec::new(),
         }
     }
 }
@@ -214,6 +218,69 @@ fn de_size<'de, D: serde::Deserializer<'de>>(
     Option::<[f32; 2]>::deserialize(deserializer)
 }
 
+/// A group frame drawn around nodes. Membership is derived, not stored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub id: String,
+    pub title: String,
+    #[serde(default = "neutral_swatch")]
+    pub swatch: String,
+    #[serde(serialize_with = "ser_point", deserialize_with = "de_point")]
+    pub position: [f32; 2],
+    #[serde(serialize_with = "ser_point", deserialize_with = "de_point")]
+    pub size: [f32; 2],
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VarKind {
+    String,
+    Int,
+    Float,
+    Bool,
+    Path,
+}
+
+/// A typed pipeline variable. `value` is a JSON literal of `kind`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Variable {
+    pub name: String,
+    pub kind: VarKind,
+    #[serde(default)]
+    pub value: Value,
+}
+
+/// The dock sizes and minimap flag the user left behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DockSizes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct View {
+    #[serde(default)]
+    pub dock: DockSizes,
+    #[serde(default)]
+    pub minimap: bool,
+}
+
+impl View {
+    /// True when nothing was saved, so the field stays out of the file.
+    pub fn is_default(&self) -> bool {
+        self.dock.left.is_none()
+            && self.dock.right.is_none()
+            && self.dock.bottom.is_none()
+            && !self.minimap
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     #[serde(default = "default_format")]
@@ -226,6 +293,15 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     #[serde(default)]
     pub marks: Vec<Mark>,
+    /// Grouping frames. Membership is derived from positions, not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<Frame>,
+    /// Typed pipeline variables for `${name}` substitution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<Variable>,
+    /// Window layout the user expects back on the next open.
+    #[serde(default, skip_serializing_if = "View::is_default")]
+    pub view: View,
     #[serde(default)]
     pub camera: Camera,
 }
@@ -246,6 +322,9 @@ impl Default for Graph {
             nodes: Vec::new(),
             edges: Vec::new(),
             marks: Vec::new(),
+            frames: Vec::new(),
+            variables: Vec::new(),
+            view: View::default(),
             camera: Camera::default(),
         }
     }
@@ -280,6 +359,10 @@ impl Graph {
 
     pub fn alloc_mark_id(&self) -> String {
         alloc_id(self.marks.iter().map(|mark| mark.id.as_str()), 'm')
+    }
+
+    pub fn alloc_frame_id(&self) -> String {
+        alloc_id(self.frames.iter().map(|frame| frame.id.as_str()), 'f')
     }
 }
 
@@ -398,6 +481,20 @@ impl Node {
         ports
     }
 
+    /// All output ports. Most features have one; `if_switch` has `true` and
+    /// `false`. Falls back to the single output for every existing feature.
+    pub fn output_ports(&self) -> Vec<PortRecord> {
+        if self.feature == "chart" || self.unknown {
+            return Vec::new();
+        }
+        if let Some(def) = self.def()
+            && !def.outputs.is_empty()
+        {
+            return def.outputs.iter().map(PortRecord::from_def).collect();
+        }
+        self.output_port().into_iter().collect()
+    }
+
     pub fn output_port(&self) -> Option<PortRecord> {
         if self.feature == "chart" || self.unknown {
             return None;
@@ -439,7 +536,14 @@ impl Node {
                         .unwrap_or(path)
                 }
             }
-            "head" => format!("n={}", self.param_i64("n").unwrap_or(5)),
+            "head" => {
+                let raw = self.param_str("n");
+                if raw.contains("${") {
+                    format!("n={raw}")
+                } else {
+                    format!("n={}", self.param_i64("n").unwrap_or(5))
+                }
+            }
             "change_headers" => mapping_summary(self.params.get(HEADER_PAIRS)),
             "query" => {
                 let expr = self.param_str("expr");
@@ -556,6 +660,29 @@ impl Node {
             "merge" => format!("how={}", self.param_str("how")),
             "concat" => "concat".to_string(),
             "to_frame" => "series to frame".to_string(),
+            "loop_start" => {
+                let mode = self.param_str("mode");
+                let detail = match mode.as_str() {
+                    "groups" => self.param_str("column"),
+                    "values" => self.param_str("values"),
+                    _ => self.param_str("pattern"),
+                };
+                if detail.is_empty() {
+                    mode
+                } else {
+                    format!("{mode} {detail}")
+                }
+            }
+            "loop_end" => "collect".to_string(),
+            "if_switch" => {
+                let condition = self.param_str("condition");
+                if condition.is_empty() {
+                    "no condition".to_string()
+                } else {
+                    condition
+                }
+            }
+            "end_if" => "merge branches".to_string(),
             _ => self.feature.clone(),
         }
     }
@@ -631,11 +758,45 @@ pub fn duplicate_headers(pairs: &[(String, String)]) -> Option<String> {
 }
 
 /// Nodes with no outgoing edge. Chart nodes count: they are sinks.
+/// A loop_start whose paired loop_end exists does not: the flow ends at the
+/// loop_end, and the start with no wires is still a legal body loop.
 pub fn sinks(graph: &Graph) -> Vec<String> {
+    let paired: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.feature == "loop_end")
+        .filter_map(|node| {
+            node.params
+                .get("pair")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
     graph
         .nodes
         .iter()
         .filter(|node| !graph.edges.iter().any(|edge| edge.from == node.id))
+        .filter(|node| !(node.feature == "loop_start" && paired.contains(&node.id)))
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+/// Nodes of `graph` whose top-left corner lies inside the frame rectangle.
+/// Membership is derived from positions so the file has one source of truth.
+pub fn frame_members(graph: &Graph, frame_id: &str) -> Vec<String> {
+    let Some(frame) = graph.frames.iter().find(|frame| frame.id == frame_id) else {
+        return Vec::new();
+    };
+    let rect = Rect {
+        x: frame.position[0],
+        y: frame.position[1],
+        w: frame.size[0],
+        h: frame.size[1],
+    };
+    graph
+        .nodes
+        .iter()
+        .filter(|node| rect.contains(node.position_point()))
         .map(|node| node.id.clone())
         .collect()
 }
@@ -674,6 +835,35 @@ pub fn ancestors(graph: &Graph, id: &str) -> Result<Vec<String>, String> {
     Ok(order)
 }
 
+/// Nodes reachable from `id` through outgoing edges, breadth first. `id`
+/// itself is not included.
+pub fn descendants(graph: &Graph, id: &str) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let Some(start) = graph.node(id) else {
+        return order;
+    };
+    seen.insert(start.id.clone());
+    queue.push_back(start.id.clone());
+    while let Some(current) = queue.pop_front() {
+        let mut children: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == current)
+            .map(|edge| edge.to.clone())
+            .collect();
+        children.sort();
+        for child in children {
+            if seen.insert(child.clone()) {
+                order.push(child.clone());
+                queue.push_back(child);
+            }
+        }
+    }
+    order
+}
+
 fn hash_json(value: &impl Serialize) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -681,6 +871,27 @@ fn hash_json(value: &impl Serialize) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Text of the variables `node` reads. A variable that is not declared hashes
+/// as unknown, so adding the declaration still changes the key.
+fn variable_values_text(node: &Node, graph: &Graph) -> String {
+    let refs = crate::vars::referenced_vars(node);
+    if refs.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = refs
+        .iter()
+        .map(|name| {
+            let value = graph
+                .variables
+                .iter()
+                .find(|variable| variable.name == *name)
+                .map(|variable| serde_json::to_string(&variable.value).unwrap_or_default());
+            format!("{name}={}", value.as_deref().unwrap_or("?"))
+        })
+        .collect();
+    format!("vars:{}", parts.join(","))
 }
 
 /// Identity of the computation at `id`. Positions, labels, marks, and the camera are not part of it.
@@ -709,6 +920,9 @@ pub fn dependency_key(graph: &Graph, id: &str) -> u64 {
                 serde_json::to_string(&node.output).unwrap_or_default(),
                 node.unknown
             ));
+            // The values of variables this node reads are part of the identity
+            // of its computation, so changing one invalidates only its users.
+            parts.push(variable_values_text(node, graph));
         }
     }
     let mut parts = Vec::new();
@@ -730,6 +944,7 @@ pub fn run_fingerprint(graph: &Graph) -> u64 {
                 "added_inputs": node.added_inputs,
                 "wired": node.wired,
                 "output": node.output,
+                "vars": variable_values_text(node, graph),
             })
         })
         .collect();
@@ -819,4 +1034,32 @@ pub fn python_arg_names(code: &str) -> Vec<String> {
         }
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::Point;
+
+    fn node(id: &str, feature: &str) -> Node {
+        Node::new(id, feature, Point::new(0.0, 0.0))
+    }
+
+    #[test]
+    fn a_wired_loop_start_is_not_a_sink_alone() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("n1", "loop_start"));
+        let mut end = node("n2", "loop_end");
+        end.params.insert("pair".to_string(), json!("n1"));
+
+        graph.nodes.push(end);
+        graph.edges.push(Edge::between("n1", "out", "n2", "in"));
+        assert_eq!(sinks(&graph), vec!["n2".to_string()]);
+
+        // With no wires at all the start still announces itself, so a
+        // headless run never guesses its way into a broken body.
+        let mut bare = Graph::default();
+        bare.nodes.push(node("n1", "loop_start"));
+        assert_eq!(sinks(&bare), vec!["n1".to_string()]);
+    }
 }

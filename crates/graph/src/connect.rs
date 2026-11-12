@@ -113,6 +113,18 @@ fn preserves_input(feature: &str) -> bool {
 fn feature_outputs(node: &Node) -> Vec<TypeName> {
     feature(&node.feature)
         .map(|def| {
+            // A multi-output feature lists the types per named output.
+            if !def.outputs.is_empty() {
+                let mut types: Vec<TypeName> = Vec::new();
+                for port in def.outputs {
+                    for ty in port.accepts {
+                        if !types.contains(ty) {
+                            types.push(*ty);
+                        }
+                    }
+                }
+                return types;
+            }
             if let Some(output) = def.output {
                 vec![output]
             } else {
@@ -150,15 +162,7 @@ pub fn output_types(graph: &Graph, node_id: &str) -> Vec<TypeName> {
                 feature_outputs(node)
             }
         }
-        _ => feature(&node.feature)
-            .map(|def| {
-                if let Some(output) = def.output {
-                    vec![output]
-                } else {
-                    def.possible_outputs.to_vec()
-                }
-            })
-            .unwrap_or_default(),
+        _ => feature_outputs(node),
     }
 }
 
@@ -227,10 +231,12 @@ pub fn try_connect(
     if source.unknown || target.unknown {
         return Err(Reject::Type);
     }
-    let Some(output) = source.output_port() else {
-        return Err(Reject::Type);
-    };
-    if output.name != from_port {
+    // A multi-output feature connects from one named output port.
+    if source
+        .output_ports()
+        .into_iter()
+        .all(|port| port.name != from_port)
+    {
         return Err(Reject::Type);
     }
     let Some(input) = target
@@ -523,5 +529,72 @@ mod tests {
             compatible: false,
         }];
         assert!(pick_snap(&candidates).is_none());
+    }
+
+    #[test]
+    fn the_flow_features_have_their_ports() {
+        let switch = node("s", "if_switch");
+        let names: Vec<_> = switch
+            .output_ports()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(names, vec!["true".to_string(), "false".to_string()]);
+        // Single-output features keep working through output_port.
+        let head = node("h", "head");
+        assert_eq!(head.output_port().unwrap().name, "out");
+        assert_eq!(head.output_ports().len(), 1);
+        let end = node("e", "end_if");
+        let inputs: Vec<_> = end.input_ports().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(inputs, vec!["true".to_string(), "false".to_string()]);
+        let start = node("l", "loop_start");
+        assert_eq!(start.output_port().unwrap().name, "out");
+    }
+
+    #[test]
+    fn wires_may_come_from_the_true_and_false_outputs() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("s", "if_switch"));
+        graph.nodes.push(node("t", "head"));
+        graph.nodes.push(node("f", "head"));
+        graph.nodes.push(node("e", "end_if"));
+        assert!(try_connect(&graph, "s", "true", "t", "in").is_ok());
+        assert!(try_connect(&graph, "s", "false", "f", "in").is_ok());
+        assert!(try_connect(&graph, "t", "out", "e", "true").is_ok());
+        assert!(try_connect(&graph, "f", "out", "e", "false").is_ok());
+        // The old single-output name is refused on a multi-output node.
+        assert_eq!(
+            try_connect(&graph, "s", "out", "t", "in").unwrap_err(),
+            Reject::Type
+        );
+        // And the produced type still fits a dataframe input.
+        assert_eq!(produced_type(&graph, "s"), Some(TypeName::Dataframe));
+    }
+
+    #[test]
+    fn an_if_switch_inside_a_loop_wires_like_a_table_step() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("l", "loop_start"));
+        graph.nodes.push(node("r", "read_csv"));
+        graph.nodes.push(node("s", "if_switch"));
+        graph.nodes.push(node("h", "head"));
+        graph.nodes.push(node("e", "loop_end"));
+        assert!(try_connect(&graph, "l", "out", "s", "in").is_ok());
+        assert!(try_connect(&graph, "s", "true", "h", "in").is_ok());
+        assert!(try_connect(&graph, "h", "out", "e", "in").is_ok());
+    }
+
+    #[test]
+    fn a_loop_start_cannot_wire_into_a_port_that_does_not_exist() {
+        let mut graph = Graph::default();
+        graph.nodes.push(node("l", "loop_start"));
+        graph.nodes.push(node("r", "read_csv"));
+        // read_csv has no `in` port, so the canvas must never draw this
+        // wire. A reader joins the loop body through its ${loop_value}
+        // param instead.
+        assert_eq!(
+            try_connect(&graph, "l", "out", "r", "in").unwrap_err(),
+            Reject::Type
+        );
     }
 }
